@@ -1,0 +1,23 @@
+## .NET
+bin/
+obj/
+*.user
+*.suo
+.vs/
+
+## Build output
+publish/
+*.nupkg
+
+## Secrets / local config
+appsettings.json
+!appsettings.example.json
+
+## Database
+*.db
+*.db-shm
+*.db-wal
+
+## Misc
+server-id.txt
+*.log
