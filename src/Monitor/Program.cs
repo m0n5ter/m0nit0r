@@ -54,7 +54,8 @@ builder.Services.AddHostedService<PeerSyncWorker>();
 // ── Web ─────────────────────────────────────────────────────────────────────
 builder.Services.AddRazorPages();
 
-builder.WebHost.UseUrls($"http://0.0.0.0:{opts.ListenPort}");
+if (!builder.Environment.IsDevelopment())
+    builder.WebHost.UseUrls($"http://0.0.0.0:{opts.ListenPort}");
 
 var app = builder.Build();
 
