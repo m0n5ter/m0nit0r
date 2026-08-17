@@ -493,6 +493,23 @@ if ($rule) {
     "firewall rule created: remote = $($remote -join ', ')"
 }
 
+# Read the filter back. These cmdlets have been observed reporting success
+# while leaving the address filter at Any, which silently turns a restricted
+# deployment into an open one — exactly the failure this switch exists to
+# prevent, so it is checked rather than assumed.
+if ($restrict) {
+    $applied = @((Get-NetFirewallRule -DisplayName $ruleName | Get-NetFirewallAddressFilter).RemoteAddress)
+    if ($applied -contains 'Any' -or -not $applied) {
+        # netsh writes the filter directly and is the reliable fallback.
+        & netsh advfirewall firewall set rule name="$ruleName" new remoteip=($remote -join ',') | Out-Null
+        $applied = @((Get-NetFirewallRule -DisplayName $ruleName | Get-NetFirewallAddressFilter).RemoteAddress)
+    }
+    if ($applied -contains 'Any' -or -not $applied) {
+        throw "the firewall rule still admits any source after being restricted to $($remote -join ', ')"
+    }
+    "firewall remote addresses verified: $($applied -join ', ')"
+}
+
 Start-Service $service
 (Get-Service $service).Status.ToString()
 '@
@@ -536,7 +553,7 @@ function Deploy-WindowsLocalNode {
 
     if (Test-Path $logPath) {
         Get-Content $logPath |
-            Where-Object { $_ -match 'service (created|already present)|firewall rule (created|updated)' } |
+            Where-Object { $_ -match 'service (created|already present)|firewall rule (created|updated)|firewall remote addresses verified' } |
             ForEach-Object { Write-Note $_.Trim() }
     }
 
