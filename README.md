@@ -74,6 +74,43 @@ latency and status code become an availability record. The matrix on the dashboa
 therefore genuinely per-direction — it shows how each node sees each other node, not
 one node's opinion broadcast to the rest.
 
+## Deployment
+
+`deploy/Deploy-M0nit0r.ps1` builds and installs the agent across every node in one
+run. It queries each remote host's architecture and cross-compiles to match, uploads
+the binary and a per-node configuration over SSH, installs the systemd unit or Windows
+service, and restarts it. `server-id.txt` and `monitor.db` are never overwritten, so
+nodes keep their identity and history across deployments.
+
+```powershell
+.\deploy\Deploy-M0nit0r.ps1 -Mesh                   # all nodes, then introduce them
+.\deploy\Deploy-M0nit0r.ps1 -Mesh -RestrictFirewall # ...and admit only the nodes
+.\deploy\Deploy-M0nit0r.ps1 -Only home-pc           # one node
+```
+
+`-RestrictFirewall` narrows the listening port to the nodes' own addresses instead of
+leaving it open to any source, which is what actually protects the endpoints the
+shared secret does not cover. It resolves each node's address, then configures ufw or
+firewalld on Linux and the inbound rule on Windows. Add `-AllowFrom <ip>` for an extra
+address you want to reach the dashboards from.
+
+It only ever narrows a firewall that is already running. A host with no active
+firewall manager is reported and left alone, because enabling one over SSH without
+first admitting SSH locks you out of the machine. Note that the allowlist is built
+from the full inventory even on an `-Only` run, and that it has to be reapplied
+whenever one of those addresses changes — otherwise the mesh stops syncing silently.
+
+The shared secret is generated on first run and stored in `deploy/.secret`, which is
+gitignored. Every node is deployed with the same value.
+
+Edit the `$Nodes` block at the top of the script to change the inventory. The
+site-specific addresses sit directly above it: the public address peers use to reach
+the NAT'd node, the LAN address the router forwards to, and the router itself. They
+are declared rather than detected, so update them if the ISP or the LAN changes.
+
+Run the script unelevated: the Linux nodes are reached with your own SSH keys, and
+only the Windows service and firewall steps elevate, in a separate process.
+
 ## Install as a service
 
 **Linux (systemd)**

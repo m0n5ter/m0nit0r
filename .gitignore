@@ -17,6 +17,7 @@ dist/
 ## Secrets / local config
 appsettings.json
 !appsettings.example.json
+deploy/.secret
 
 ## Database
 *.db
