@@ -8,6 +8,11 @@ obj/
 ## Build output
 publish/
 *.nupkg
+dist/
+
+## Go build output at the repo root (leading slash keeps cmd/monitor/ tracked)
+/monitor
+/monitor.exe
 
 ## Secrets / local config
 appsettings.json

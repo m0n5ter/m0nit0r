@@ -1,0 +1,4 @@
+# Vendored dashboard assets are embedded and served byte for byte. Line ending
+# normalisation would make those bytes, and the ETags derived from them, differ
+# depending on which platform checked the repository out.
+internal/web/assets/** -text

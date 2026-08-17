@@ -1,0 +1,479 @@
+<!DOCTYPE html>
+<html lang="en" data-bs-theme="dark">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Dashboard - m0nit0r</title>
+    <link rel="stylesheet" href="/assets/bootstrap.min.css" />
+    <link rel="stylesheet" href="/assets/bootstrap-icons.min.css" />
+    <style>
+        body { background: #0d1117; color: #c9d1d9; }
+        .navbar { background: #161b22 !important; border-bottom: 1px solid #30363d; }
+        .card { background: #161b22; border: 1px solid #30363d; }
+        .card-header { background: #1c2128; border-bottom: 1px solid #30363d; }
+        .table { color: #c9d1d9; }
+        .table-dark { --bs-table-bg: #161b22; --bs-table-border-color: #30363d; }
+        .badge-online { background: #2ea043; }
+        .badge-offline { background: #da3633; }
+        .status-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+        .dot-online { background: #2ea043; box-shadow: 0 0 6px #2ea043; }
+        .dot-offline { background: #da3633; }
+        .dot-unknown { background: #6e7681; }
+        .metric-value { font-size: 1.5rem; font-weight: 600; }
+        .progress { background: #30363d; height: 6px; }
+        .server-card { cursor: pointer; transition: border-color 0.2s; }
+        .server-card:hover, .server-card.active { border-color: #58a6ff !important; }
+        .avail-cell { min-width: 90px; text-align: center; font-size: 0.85rem; }
+        .avail-up { background: rgba(46, 160, 67, 0.2); color: #3fb950; }
+        .avail-down { background: rgba(218, 54, 51, 0.2); color: #f85149; }
+        .avail-unknown { background: rgba(110, 118, 129, 0.15); color: #6e7681; }
+        .chart-container { position: relative; height: 200px; }
+    </style>
+</head>
+<body>
+    <nav class="navbar navbar-expand-lg navbar-dark mb-4">
+        <div class="container-fluid">
+            <a class="navbar-brand fw-bold" href="/">
+                <i class="bi bi-activity text-success me-1"></i>m0nit0r
+            </a>
+            <span class="text-muted small ms-3" id="nav-self-info"></span>
+            <div class="ms-auto">
+                <span class="text-muted small" id="nav-last-update"></span>
+            </div>
+        </div>
+    </nav>
+    <div class="container-fluid px-4">
+
+<div class="row g-3 mb-4" id="server-cards">
+    <div class="col-12 text-muted small">Loading...</div>
+</div>
+
+<div class="row g-3 mb-4">
+    <div class="col-lg-6">
+        <div class="card h-100">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <span><i class="bi bi-grid me-2"></i>Availability Matrix</span>
+                <span class="badge bg-secondary small">last hour</span>
+            </div>
+            <div class="card-body p-0">
+                <div class="table-responsive">
+                    <table class="table table-dark table-sm mb-0" id="avail-table">
+                        <thead><tr><th>From \ To</th></tr></thead>
+                        <tbody></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="col-lg-6">
+        <div class="card h-100" id="detail-card" style="display:none!important">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <span><i class="bi bi-bar-chart me-2"></i><span id="detail-title">Server Detail</span></span>
+                <select class="form-select form-select-sm w-auto bg-dark text-light border-secondary" id="hours-select">
+                    <option value="1">1h</option>
+                    <option value="6">6h</option>
+                    <option value="24" selected>24h</option>
+                    <option value="72">3d</option>
+                    <option value="168">7d</option>
+                </select>
+            </div>
+            <div class="card-body">
+                <div class="mb-3">
+                    <div class="d-flex justify-content-between mb-1">
+                        <small class="text-muted">CPU</small><small id="cpu-current">-</small>
+                    </div>
+                    <div class="chart-container"><canvas id="cpu-chart"></canvas></div>
+                </div>
+                <div>
+                    <div class="d-flex justify-content-between mb-1">
+                        <small class="text-muted">Memory</small><small id="mem-current">-</small>
+                    </div>
+                    <div class="chart-container"><canvas id="mem-chart"></canvas></div>
+                </div>
+            </div>
+        </div>
+        <div class="card h-100" id="no-detail-card">
+            <div class="card-body d-flex align-items-center justify-content-center text-muted">
+                <div class="text-center">
+                    <i class="bi bi-cursor" style="font-size:2rem"></i>
+                    <p class="mt-2 mb-0">Click a server card to view metrics</p>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="row g-3">
+    <div class="col-12">
+        <div class="card">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <span><i class="bi bi-diagram-3 me-2"></i>Peers</span>
+                <button class="btn btn-sm btn-outline-primary" onclick="openAddPeer()">
+                    <i class="bi bi-plus-circle me-1"></i>Add Peer
+                </button>
+            </div>
+            <div class="card-body p-0">
+                <table class="table table-dark table-sm mb-0">
+                    <thead>
+                        <tr>
+                            <th>Name</th>
+                            <th>Location</th>
+                            <th>URL</th>
+                            <th>Server ID</th>
+                            <th>Last seen</th>
+                            <th></th>
+                        </tr>
+                    </thead>
+                    <tbody id="peers-body">
+                        <tr><td colspan="6" class="text-muted small text-center py-3">Loading...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Add peer modal -->
+<div class="modal fade" id="addPeerModal" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content bg-dark border-secondary">
+            <div class="modal-header border-secondary">
+                <h5 class="modal-title"><i class="bi bi-plus-circle me-2"></i>Add Peer</h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <p class="text-muted small">
+                    Enter the URL of the peer agent. Its server ID, name, and location will be
+                    fetched automatically. The peer will also be notified of this server's address
+                    (if <code>PublicUrl</code> is configured) and will add you back.
+                </p>
+                <div class="mb-3">
+                    <label class="form-label small">Peer URL</label>
+                    <input type="text" class="form-control bg-dark text-light border-secondary"
+                           id="input-peer-url" placeholder="http://1.2.3.4:5001"
+                           onkeydown="if(event.key==='Enter') addPeer()" />
+                </div>
+                <div id="add-peer-result" class="p-3 rounded border border-secondary small" style="display:none">
+                    <div class="text-success mb-2"><i class="bi bi-check-circle me-1"></i>Peer added</div>
+                    <table class="table table-dark table-sm mb-0">
+                        <tr><td class="text-muted">Name</td><td id="result-name"></td></tr>
+                        <tr><td class="text-muted">Location</td><td id="result-location"></td></tr>
+                        <tr><td class="text-muted">Server ID</td><td id="result-id" class="font-monospace small"></td></tr>
+                    </table>
+                </div>
+                <div id="add-peer-error" class="alert alert-danger small py-2" style="display:none"></div>
+            </div>
+            <div class="modal-footer border-secondary">
+                <button class="btn btn-secondary btn-sm" data-bs-dismiss="modal">Close</button>
+                <button class="btn btn-primary btn-sm" onclick="addPeer()" id="btn-add-peer">
+                    <i class="bi bi-plus-circle me-1"></i>Add
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+
+    </div>
+    <script src="/assets/bootstrap.bundle.min.js"></script>
+    <script src="/assets/chart.umd.min.js"></script>
+<script>
+const CHART_OPTS = {
+    responsive: true, maintainAspectRatio: false, animation: false,
+    plugins: { legend: { display: false } },
+    scales: {
+        x: { ticks: { color: '#6e7681', maxTicksLimit: 6 }, grid: { color: '#21262d' } },
+        y: { min: 0, max: 100, ticks: { color: '#6e7681', callback: v => v + '%' }, grid: { color: '#21262d' } }
+    },
+    elements: { point: { radius: 0 } }
+};
+
+let cpuChart, memChart, selectedServerId = null, servers = [];
+let addModal;
+
+document.addEventListener('DOMContentLoaded', () => {
+    addModal = new bootstrap.Modal(document.getElementById('addPeerModal'));
+});
+
+function formatUptime(s) {
+    if (!s) return '-';
+    const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60);
+    if (d > 0) return `${d}d ${h}h`;
+    if (h > 0) return `${h}h ${m}m`;
+    return `${m}m`;
+}
+
+function formatTs(iso) {
+    return new Date(iso + 'Z').toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
+function formatRelative(iso) {
+    if (!iso || iso.startsWith('0001')) return 'never';
+    const diff = Date.now() - new Date(iso + 'Z').getTime();
+    const min = Math.floor(diff / 60000);
+    if (min < 1) return 'just now';
+    if (min < 60) return `${min}m ago`;
+    const h = Math.floor(min / 60);
+    if (h < 24) return `${h}h ago`;
+    return `${Math.floor(h / 24)}d ago`;
+}
+
+function pct(val) { return val != null ? val.toFixed(1) + '%' : '-'; }
+function esc(s) {
+    return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// ── Server cards ─────────────────────────────────────────────────────────────
+function renderServerCards(srvList) {
+    const container = document.getElementById('server-cards');
+    if (!srvList.length) { container.innerHTML = '<div class="col-12 text-muted small">No servers yet.</div>'; return; }
+
+    container.innerHTML = srvList.map(s => {
+        const dot = s.isOnline ? 'dot-online' : (s.lastSeen === '0001-01-01T00:00:00' ? 'dot-unknown' : 'dot-offline');
+        const status = s.isOnline
+            ? '<span class="badge badge-online">ONLINE</span>'
+            : '<span class="badge badge-offline">OFFLINE</span>';
+        const l = s.latest;
+        const cpuPct = l ? l.cpuPercent : 0;
+        const memPct = l ? l.memoryPercent : 0;
+        const cpuColor = cpuPct > 90 ? 'danger' : cpuPct > 70 ? 'warning' : 'success';
+        const memColor = memPct > 90 ? 'danger' : memPct > 70 ? 'warning' : 'info';
+
+        let diskHtml = '';
+        if (l && l.disksJson) {
+            try {
+                JSON.parse(l.disksJson).forEach(d => {
+                    diskHtml += `<div class="d-flex justify-content-between small mb-1">
+                        <span class="text-muted">${esc(d.name)}</span>
+                        <span>${d.usagePercent.toFixed(0)}% <span class="text-muted">(${d.freeGb.toFixed(0)}GB free)</span></span>
+                    </div>
+                    <div class="progress mb-2"><div class="progress-bar bg-${d.usagePercent > 90 ? 'danger' : 'primary'}" style="width:${d.usagePercent}%"></div></div>`;
+                });
+            } catch {}
+        }
+
+        return `<div class="col-sm-6 col-xl-3">
+            <div class="card server-card ${selectedServerId === s.id ? 'active' : ''}" onclick="selectServer('${s.id}')" data-id="${s.id}">
+                <div class="card-header d-flex justify-content-between align-items-center py-2">
+                    <span class="fw-semibold"><span class="status-dot ${dot} me-2"></span>${esc(s.name)}</span>
+                    ${status}
+                </div>
+                <div class="card-body pb-2">
+                    <div class="text-muted small mb-2"><i class="bi bi-geo-alt me-1"></i>${esc(s.location || 'Unknown')}</div>
+                    <div class="row g-2 mb-2">
+                        <div class="col-6 text-center">
+                            <div class="metric-value text-${cpuColor}">${pct(l?.cpuPercent)}</div>
+                            <div class="small text-muted">CPU</div>
+                        </div>
+                        <div class="col-6 text-center">
+                            <div class="metric-value text-${memColor}">${pct(l?.memoryPercent)}</div>
+                            <div class="small text-muted">Memory</div>
+                        </div>
+                    </div>
+                    ${diskHtml}
+                    <div class="small text-muted mt-1"><i class="bi bi-clock me-1"></i>Up: ${formatUptime(l?.uptimeSeconds)}</div>
+                    ${s.isSelf ? '<div class="small text-success mt-1"><i class="bi bi-house me-1"></i>This server</div>' : ''}
+                </div>
+            </div>
+        </div>`;
+    }).join('');
+}
+
+// ── Availability matrix ───────────────────────────────────────────────────────
+function renderAvailabilityMatrix(srvList, matrix) {
+    const thead = document.querySelector('#avail-table thead tr');
+    const tbody = document.querySelector('#avail-table tbody');
+    thead.innerHTML = '<th class="text-muted small">From \\ To</th>';
+    tbody.innerHTML = '';
+
+    if (srvList.length < 2) {
+        tbody.innerHTML = '<tr><td colspan="99" class="text-muted small text-center py-3">Add peers to see the availability matrix</td></tr>';
+        return;
+    }
+
+    const ids = srvList.map(s => s.id);
+    const names = Object.fromEntries(srvList.map(s => [s.id, s.name]));
+
+    ids.forEach(id => {
+        const th = document.createElement('th');
+        th.className = 'avail-cell text-muted small';
+        th.textContent = names[id] || id.slice(0, 8);
+        thead.appendChild(th);
+    });
+
+    ids.forEach(fromId => {
+        const tr = document.createElement('tr');
+        const td0 = document.createElement('td');
+        td0.className = 'small text-muted align-middle';
+        td0.textContent = names[fromId] || fromId.slice(0, 8);
+        tr.appendChild(td0);
+
+        ids.forEach(toId => {
+            const td = document.createElement('td');
+            td.className = 'avail-cell align-middle';
+            if (fromId === toId) {
+                td.innerHTML = '<span class="text-muted">—</span>';
+            } else {
+                const e = matrix.find(m => m.fromServerId === fromId && m.toServerId === toId);
+                if (!e) {
+                    td.className += ' avail-unknown'; td.innerHTML = '<span>n/a</span>';
+                } else if (e.isAvailable) {
+                    td.className += ' avail-up';
+                    td.innerHTML = `<i class="bi bi-check-circle me-1"></i>${e.lastLatencyMs ? e.lastLatencyMs.toFixed(0) + 'ms' : 'UP'}`;
+                } else {
+                    td.className += ' avail-down'; td.innerHTML = '<i class="bi bi-x-circle me-1"></i>DOWN';
+                }
+            }
+            tr.appendChild(td);
+        });
+        tbody.appendChild(tr);
+    });
+}
+
+// ── Peers table ───────────────────────────────────────────────────────────────
+async function renderPeersTable() {
+    const peers = await fetch('/api/peers').then(r => r.json());
+    const tbody = document.getElementById('peers-body');
+
+    if (!peers.length) {
+        tbody.innerHTML = '<tr><td colspan="6" class="text-muted small text-center py-3">No peers. Click "Add Peer" to connect to another server.</td></tr>';
+        return;
+    }
+
+    tbody.innerHTML = peers.map(p => {
+        const shortId = p.id.length > 16 ? p.id.slice(0, 8) + '…' + p.id.slice(-4) : p.id;
+        return `<tr>
+            <td>${esc(p.name)}</td>
+            <td class="text-muted small">${esc(p.location || '—')}</td>
+            <td class="text-muted small font-monospace">${esc(p.url || '—')}</td>
+            <td class="text-muted small font-monospace" title="${esc(p.id)}">${shortId}</td>
+            <td class="text-muted small">${formatRelative(p.lastSeen)}</td>
+            <td class="text-end">
+                <button class="btn btn-sm btn-outline-danger py-0 px-2" onclick="removePeer('${p.id}', '${esc(p.name)}')">
+                    <i class="bi bi-trash"></i>
+                </button>
+            </td>
+        </tr>`;
+    }).join('');
+}
+
+// ── Detail charts ─────────────────────────────────────────────────────────────
+async function selectServer(id) {
+    selectedServerId = id;
+    document.querySelectorAll('.server-card').forEach(c => c.classList.toggle('active', c.dataset.id === id));
+    const srv = servers.find(s => s.id === id);
+    if (srv) document.getElementById('detail-title').textContent = srv.name;
+    document.getElementById('detail-card').style.removeProperty('display');
+    document.getElementById('no-detail-card').style.display = 'none';
+    await loadCharts(id);
+}
+
+async function loadCharts(id) {
+    const hours = document.getElementById('hours-select').value;
+    const data = await fetch(`/api/servers/${id}/metrics?hours=${hours}`).then(r => r.json());
+    if (!data.length) return;
+
+    const labels  = data.map(d => formatTs(d.timestamp));
+    const cpuData = data.map(d => d.cpuPercent);
+    const memData = data.map(d => d.memoryPercent);
+    const last = data[data.length - 1];
+    document.getElementById('cpu-current').textContent = pct(last.cpuPercent);
+    document.getElementById('mem-current').textContent = pct(last.memoryPercent);
+
+    if (cpuChart) cpuChart.destroy();
+    if (memChart) memChart.destroy();
+    cpuChart = new Chart(document.getElementById('cpu-chart').getContext('2d'), {
+        type: 'line',
+        data: { labels, datasets: [{ data: cpuData, borderColor: '#58a6ff', backgroundColor: 'rgba(88,166,255,0.1)', fill: true, tension: 0.3 }] },
+        options: CHART_OPTS
+    });
+    memChart = new Chart(document.getElementById('mem-chart').getContext('2d'), {
+        type: 'line',
+        data: { labels, datasets: [{ data: memData, borderColor: '#3fb950', backgroundColor: 'rgba(63,185,80,0.1)', fill: true, tension: 0.3 }] },
+        options: CHART_OPTS
+    });
+}
+
+document.getElementById('hours-select').addEventListener('change', () => {
+    if (selectedServerId) loadCharts(selectedServerId);
+});
+
+// ── Add / remove peer ─────────────────────────────────────────────────────────
+function openAddPeer() {
+    document.getElementById('input-peer-url').value = '';
+    document.getElementById('add-peer-result').style.display = 'none';
+    document.getElementById('add-peer-error').style.display = 'none';
+    document.getElementById('btn-add-peer').disabled = false;
+    addModal.show();
+    setTimeout(() => document.getElementById('input-peer-url').focus(), 300);
+}
+
+async function addPeer() {
+    const url = document.getElementById('input-peer-url').value.trim();
+    if (!url) return;
+
+    const btn = document.getElementById('btn-add-peer');
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>Connecting...';
+    document.getElementById('add-peer-result').style.display = 'none';
+    document.getElementById('add-peer-error').style.display = 'none';
+
+    try {
+        const resp = await fetch('/api/peers', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ url })
+        });
+
+        if (resp.ok) {
+            const peer = await resp.json();
+            document.getElementById('result-name').textContent     = peer.name;
+            document.getElementById('result-location').textContent = peer.location || '—';
+            document.getElementById('result-id').textContent       = peer.id;
+            document.getElementById('add-peer-result').style.display = '';
+            btn.innerHTML = '<i class="bi bi-plus-circle me-1"></i>Add';
+            await refresh();
+        } else {
+            const msg = await resp.text();
+            const el = document.getElementById('add-peer-error');
+            el.textContent = msg || 'Failed to add peer';
+            el.style.display = '';
+            btn.disabled = false;
+            btn.innerHTML = '<i class="bi bi-plus-circle me-1"></i>Add';
+        }
+    } catch {
+        btn.disabled = false;
+        btn.innerHTML = '<i class="bi bi-plus-circle me-1"></i>Add';
+    }
+}
+
+async function removePeer(id, name) {
+    if (!confirm(`Remove peer "${name}"?\n\nHistorical data will be kept.`)) return;
+    const resp = await fetch(`/api/peers/${id}`, { method: 'DELETE' });
+    if (resp.ok) await refresh();
+}
+
+// ── Refresh loop ──────────────────────────────────────────────────────────────
+async function refresh() {
+    const [srvRes, matRes] = await Promise.all([
+        fetch('/api/servers').then(r => r.json()),
+        fetch('/api/availability/matrix').then(r => r.json())
+    ]);
+
+    servers = srvRes;
+    renderServerCards(srvRes);
+    renderAvailabilityMatrix(srvRes, matRes);
+    await renderPeersTable();
+
+    const self = srvRes.find(s => s.isSelf);
+    if (self) document.getElementById('nav-self-info').textContent = `${self.name} · ${self.location}`;
+    document.getElementById('nav-last-update').textContent = 'Updated ' + new Date().toLocaleTimeString();
+
+    if (selectedServerId) loadCharts(selectedServerId);
+}
+
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>
