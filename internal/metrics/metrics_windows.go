@@ -69,6 +69,7 @@ func memoryMb() (usedMb, totalMb float64) {
 
 func diskInfo() []model.Disk {
 	var disks []model.Disk
+	temps := map[uint32]*float64{}
 	for _, root := range driveRoots() {
 		rootPtr, err := windows.UTF16PtrFromString(root)
 		if err != nil {
@@ -89,6 +90,7 @@ func diskInfo() []model.Disk {
 			continue
 		}
 		if disk, ok := makeDisk(root, totalBytes, freeToCaller); ok {
+			disk.TempC = volumeTemp(root, temps)
 			disks = append(disks, disk)
 		}
 	}

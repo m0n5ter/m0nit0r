@@ -59,6 +59,7 @@ func (w *Metrics) collect() error {
 	if _, err := w.Store.InsertMetrics(w.ServerID, []model.Metric{{
 		Timestamp:     now,
 		CpuPercent:    snap.CpuPercent,
+		CpuTempC:      snap.CpuTempC,
 		MemoryPercent: snap.MemoryPercent,
 		MemoryTotalMb: snap.MemoryTotalMb,
 		MemoryUsedMb:  snap.MemoryUsedMb,

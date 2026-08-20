@@ -136,8 +136,11 @@ func runApp(parent context.Context, log *slog.Logger, opts config.Options, baseD
 
 	workers := []func(context.Context){
 		(&worker.Metrics{
-			Store:     st,
-			Collector: metrics.New(),
+			Store: st,
+			Collector: metrics.New(metrics.Options{
+				LibreHardwareMonitorURL: opts.LibreHardwareMonitor,
+				Log:                     log,
+			}),
 			ServerID:  opts.ServerID,
 			Interval:  time.Duration(opts.MetricIntervalSeconds) * time.Second,
 			Retention: time.Duration(opts.RetentionDays) * 24 * time.Hour,

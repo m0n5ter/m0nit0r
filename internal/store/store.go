@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS "MetricSnapshots" (
     "ServerId"      TEXT NOT NULL,
     "Timestamp"     TEXT NOT NULL,
     "CpuPercent"    REAL NOT NULL,
+    "CpuTempC"      REAL NULL,
     "MemoryPercent" REAL NOT NULL,
     "MemoryTotalMb" REAL NOT NULL,
     "MemoryUsedMb"  REAL NOT NULL,
@@ -85,7 +86,46 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("create schema: %w", err)
 	}
 
+	if err := migrate(db); err != nil {
+		db.Close()
+		return nil, err
+	}
+
 	return &Store{db: db}, nil
+}
+
+// migrations are columns added after the schema above was first shipped. A
+// CREATE TABLE IF NOT EXISTS leaves an existing table exactly as it is, so a
+// database created by an earlier build needs them added explicitly. Each is
+// nullable, which is what lets rows recorded before the column existed stay
+// distinguishable from rows whose sensor reported nothing.
+var migrations = []struct{ table, column, ddl string }{
+	{"MetricSnapshots", "CpuTempC", `ALTER TABLE "MetricSnapshots" ADD COLUMN "CpuTempC" REAL NULL`},
+}
+
+func migrate(db *sql.DB) error {
+	for _, m := range migrations {
+		present, err := hasColumn(db, m.table, m.column)
+		if err != nil {
+			return err
+		}
+		if present {
+			continue
+		}
+		if _, err := db.Exec(m.ddl); err != nil {
+			return fmt.Errorf("add %s.%s: %w", m.table, m.column, err)
+		}
+	}
+	return nil
+}
+
+func hasColumn(db *sql.DB, table, column string) (bool, error) {
+	var n int
+	err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info(?) WHERE "name"=?`, table, column).Scan(&n)
+	if err != nil {
+		return false, fmt.Errorf("inspect %s: %w", table, err)
+	}
+	return n > 0, nil
 }
 
 // Close releases the database handle.
@@ -232,8 +272,8 @@ func (s *Store) InsertMetrics(serverID string, metrics []model.Metric) (int, err
 
 	stmt, err := tx.Prepare(`
 		INSERT INTO "MetricSnapshots"
-			("ServerId","Timestamp","CpuPercent","MemoryPercent","MemoryTotalMb","MemoryUsedMb","UptimeSeconds","DisksJson")
-		VALUES (?,?,?,?,?,?,?,?)`)
+			("ServerId","Timestamp","CpuPercent","CpuTempC","MemoryPercent","MemoryTotalMb","MemoryUsedMb","UptimeSeconds","DisksJson")
+		VALUES (?,?,?,?,?,?,?,?,?)`)
 	if err != nil {
 		return 0, fmt.Errorf("prepare metric insert: %w", err)
 	}
@@ -244,7 +284,7 @@ func (s *Store) InsertMetrics(serverID string, metrics []model.Metric) (int, err
 		if disks == "" {
 			disks = "[]"
 		}
-		if _, err := stmt.Exec(serverID, m.Timestamp.DB(), m.CpuPercent, m.MemoryPercent,
+		if _, err := stmt.Exec(serverID, m.Timestamp.DB(), m.CpuPercent, m.CpuTempC, m.MemoryPercent,
 			m.MemoryTotalMb, m.MemoryUsedMb, m.UptimeSeconds, disks); err != nil {
 			return 0, fmt.Errorf("insert metric: %w", err)
 		}
@@ -281,7 +321,7 @@ func (s *Store) MaxMetricTimestamp(serverID string) (model.Time, bool, error) {
 // LatestMetric returns the newest sample for a server, or nil if there is none.
 func (s *Store) LatestMetric(serverID string) (*model.Metric, error) {
 	row := s.db.QueryRow(`
-		SELECT "Timestamp","CpuPercent","MemoryPercent","MemoryTotalMb","MemoryUsedMb","UptimeSeconds","DisksJson"
+		SELECT "Timestamp","CpuPercent","CpuTempC","MemoryPercent","MemoryTotalMb","MemoryUsedMb","UptimeSeconds","DisksJson"
 		FROM "MetricSnapshots" WHERE "ServerId"=?
 		ORDER BY "Timestamp" DESC LIMIT 1`, serverID)
 
@@ -298,7 +338,7 @@ func (s *Store) LatestMetric(serverID string) (*model.Metric, error) {
 // MetricsSince returns a server's samples from since onwards, oldest first.
 func (s *Store) MetricsSince(serverID string, since model.Time) ([]model.Metric, error) {
 	rows, err := s.db.Query(`
-		SELECT "Timestamp","CpuPercent","MemoryPercent","MemoryTotalMb","MemoryUsedMb","UptimeSeconds","DisksJson"
+		SELECT "Timestamp","CpuPercent","CpuTempC","MemoryPercent","MemoryTotalMb","MemoryUsedMb","UptimeSeconds","DisksJson"
 		FROM "MetricSnapshots"
 		WHERE "ServerId"=? AND "Timestamp">=?
 		ORDER BY "Timestamp"`, serverID, since.DB())
@@ -323,7 +363,7 @@ func scanMetric(sc scanner) (model.Metric, error) {
 		m  model.Metric
 		ts string
 	)
-	if err := sc.Scan(&ts, &m.CpuPercent, &m.MemoryPercent, &m.MemoryTotalMb,
+	if err := sc.Scan(&ts, &m.CpuPercent, &m.CpuTempC, &m.MemoryPercent, &m.MemoryTotalMb,
 		&m.MemoryUsedMb, &m.UptimeSeconds, &m.DisksJSON); err != nil {
 		return model.Metric{}, err
 	}

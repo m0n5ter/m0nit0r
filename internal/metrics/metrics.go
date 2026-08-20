@@ -1,7 +1,8 @@
-// Package metrics samples local CPU, memory, disk and uptime.
+// Package metrics samples local CPU, memory, disk, temperature and uptime.
 package metrics
 
 import (
+	"log/slog"
 	"math"
 	"sync"
 	"time"
@@ -21,10 +22,33 @@ type Collector struct {
 	prevIdle  uint64
 	prevTotal uint64
 	primed    bool
+
+	// libre is nil unless an external temperature source is configured.
+	libre *libreSource
+}
+
+// Options configure the optional sources a Collector draws on beyond its
+// built-in probes.
+type Options struct {
+	// LibreHardwareMonitorURL is the address of a LibreHardwareMonitor web
+	// server to take the CPU temperature from, which on Windows is the only way
+	// to get the die temperature rather than an ACPI thermal zone. Empty leaves
+	// the built-in probe in charge.
+	LibreHardwareMonitorURL string
+
+	// Log receives the state changes of those optional sources. A nil logger
+	// discards them.
+	Log *slog.Logger
 }
 
 // New returns a Collector ready for use.
-func New() *Collector { return &Collector{} }
+func New(opts Options) *Collector {
+	log := opts.Log
+	if log == nil {
+		log = slog.New(slog.DiscardHandler)
+	}
+	return &Collector{libre: newLibreSource(opts.LibreHardwareMonitorURL, log)}
+}
 
 // Collect takes one sample. Individual probes that fail degrade to zero rather
 // than failing the whole snapshot, since a host may legitimately expose only
@@ -34,6 +58,13 @@ func (c *Collector) Collect() model.Snapshot {
 	usedMb, totalMb := memoryMb()
 	disks := diskInfo()
 	uptime := uptimeSeconds()
+
+	// The external source is asked first: where one is configured it reads the
+	// die, and the built-in probe is the approximation standing in for it.
+	cpuTemp := c.libre.cpuTemperature()
+	if cpuTemp == nil {
+		cpuTemp = cpuTemperature()
+	}
 
 	memPct := 0.0
 	if totalMb > 0 {
@@ -46,6 +77,7 @@ func (c *Collector) Collect() model.Snapshot {
 
 	return model.Snapshot{
 		CpuPercent:    round1(cpu),
+		CpuTempC:      cpuTemp,
 		MemoryUsedMb:  round1(usedMb),
 		MemoryTotalMb: round1(totalMb),
 		MemoryPercent: memPct,
@@ -104,6 +136,19 @@ func round2(v float64) float64 {
 		return 0
 	}
 	return math.Round(v*100) / 100
+}
+
+// tempC wraps a raw sensor reading for the wire, discarding values no real
+// silicon sensor would report. Every source involved — sysfs, storage IOCTLs,
+// ACPI thermal zones — answers a missing or unsupported sensor with a flat
+// zero far more often than a machine is genuinely sitting at freezing point,
+// so zero is treated as "no reading" rather than as a measurement.
+func tempC(v float64) *float64 {
+	if math.IsNaN(v) || v <= 0 || v >= 150 {
+		return nil
+	}
+	rounded := round1(v)
+	return &rounded
 }
 
 // makeDisk builds a Disk entry from raw byte counts.

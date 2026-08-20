@@ -108,6 +108,7 @@ func diskInfo() []model.Disk {
 
 	var disks []model.Disk
 	seen := make(map[string]bool)
+	temps := diskTemperatures()
 
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
@@ -134,6 +135,7 @@ func diskInfo() []model.Disk {
 		bsize := uint64(st.Bsize)
 		disk, ok := makeDisk(mountPoint, uint64(st.Blocks)*bsize, uint64(st.Bavail)*bsize)
 		if ok {
+			disk.TempC = diskTemp(device, temps)
 			disks = append(disks, disk)
 		}
 	}

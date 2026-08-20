@@ -22,6 +22,7 @@ type Options struct {
 	ListenAddress         string `json:"listenAddress"`
 	SharedSecret          string `json:"sharedSecret"`
 	DatabasePath          string `json:"databasePath"`
+	LibreHardwareMonitor  string `json:"libreHardwareMonitorUrl"`
 	MetricIntervalSeconds int    `json:"metricIntervalSeconds"`
 	SyncIntervalSeconds   int    `json:"syncIntervalSeconds"`
 	RetentionDays         int    `json:"retentionDays"`

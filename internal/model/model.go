@@ -70,23 +70,28 @@ func ParseDB(s string) (Time, error) {
 	return Time{}, fmt.Errorf("model: cannot parse stored time %q", s)
 }
 
-// Disk is one fixed volume in a snapshot.
+// Disk is one fixed volume in a snapshot. TempC is the temperature of the drive
+// backing the volume, nil when the drive exposes no sensor.
 type Disk struct {
-	Name         string  `json:"name"`
-	TotalGb      float64 `json:"totalGb"`
-	UsedGb       float64 `json:"usedGb"`
-	FreeGb       float64 `json:"freeGb"`
-	UsagePercent float64 `json:"usagePercent"`
+	Name         string   `json:"name"`
+	TotalGb      float64  `json:"totalGb"`
+	UsedGb       float64  `json:"usedGb"`
+	FreeGb       float64  `json:"freeGb"`
+	UsagePercent float64  `json:"usagePercent"`
+	TempC        *float64 `json:"tempC"`
 }
 
-// Snapshot is one sample of local system state.
+// Snapshot is one sample of local system state. Temperatures are pointers
+// because a host with no readable sensor has to be distinguishable from one
+// genuinely sitting at zero degrees.
 type Snapshot struct {
-	CpuPercent    float64 `json:"cpuPercent"`
-	MemoryPercent float64 `json:"memoryPercent"`
-	MemoryTotalMb float64 `json:"memoryTotalMb"`
-	MemoryUsedMb  float64 `json:"memoryUsedMb"`
-	UptimeSeconds float64 `json:"uptimeSeconds"`
-	Disks         []Disk  `json:"disks"`
+	CpuPercent    float64  `json:"cpuPercent"`
+	CpuTempC      *float64 `json:"cpuTempC"`
+	MemoryPercent float64  `json:"memoryPercent"`
+	MemoryTotalMb float64  `json:"memoryTotalMb"`
+	MemoryUsedMb  float64  `json:"memoryUsedMb"`
+	UptimeSeconds float64  `json:"uptimeSeconds"`
+	Disks         []Disk   `json:"disks"`
 }
 
 // Server is a node known to this instance, self included.
@@ -99,15 +104,18 @@ type Server struct {
 	LastSeen Time   `json:"lastSeen"`
 }
 
-// Metric is a stored sample, for either this server or a peer.
+// Metric is a stored sample, for either this server or a peer. Disk
+// temperatures travel inside DisksJSON rather than as columns of their own,
+// since the set of drives varies per host.
 type Metric struct {
-	Timestamp     Time    `json:"timestamp"`
-	CpuPercent    float64 `json:"cpuPercent"`
-	MemoryPercent float64 `json:"memoryPercent"`
-	MemoryTotalMb float64 `json:"memoryTotalMb"`
-	MemoryUsedMb  float64 `json:"memoryUsedMb"`
-	UptimeSeconds float64 `json:"uptimeSeconds"`
-	DisksJSON     string  `json:"disksJson"`
+	Timestamp     Time     `json:"timestamp"`
+	CpuPercent    float64  `json:"cpuPercent"`
+	CpuTempC      *float64 `json:"cpuTempC"`
+	MemoryPercent float64  `json:"memoryPercent"`
+	MemoryTotalMb float64  `json:"memoryTotalMb"`
+	MemoryUsedMb  float64  `json:"memoryUsedMb"`
+	UptimeSeconds float64  `json:"uptimeSeconds"`
+	DisksJSON     string   `json:"disksJson"`
 }
 
 // Availability is one reachability observation from one server to another.

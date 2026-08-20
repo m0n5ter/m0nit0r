@@ -19,6 +19,12 @@
     steps are the only ones that need elevation, and they are launched as a
     separate elevated process that prompts once.
 
+    Windows nodes flagged with LibreHardwareMonitor in the inventory also get
+    that tool installed and pointed at by the agent, because Windows exposes no
+    CPU die temperature to user mode and LibreHardwareMonitor carries the kernel
+    driver that reads one. It is installed headless, as a scheduled task running
+    at startup, with its web server on loopback and its port blocked inbound.
+
 .PARAMETER Secret
     Shared secret authenticating the peer protocol. Must be identical on every
     node. When omitted it is read from deploy/.secret, and generated and saved
@@ -59,6 +65,11 @@
     address you want to reach the dashboards from. Only meaningful together
     with -RestrictFirewall.
 
+.PARAMETER SkipLibreHardwareMonitor
+    Leave LibreHardwareMonitor alone instead of installing or updating it. The
+    agent is still configured to read from it, so a node that already has it
+    keeps its die temperature; this only skips the download and the reinstall.
+
 .EXAMPLE
     .\deploy\Deploy-M0nit0r.ps1 -Mesh
 
@@ -76,7 +87,8 @@ param(
     [switch]$MeshOnly,
     [switch]$SkipBuild,
     [switch]$RestrictFirewall,
-    [string[]]$AllowFrom = @()
+    [string[]]$AllowFrom = @(),
+    [switch]$SkipLibreHardwareMonitor
 )
 
 $ErrorActionPreference = 'Stop'
@@ -111,6 +123,25 @@ $MetricIntervalSeconds = 30
 $SyncIntervalSeconds   = 60
 $RetentionDays         = 30
 
+# LibreHardwareMonitor, for the Windows nodes that ask for it. The agent reads
+# the CPU die temperature from its web server, which is the only way to get one
+# without shipping a signed kernel driver of our own.
+#
+# The version is pinned and the archive is checked against the digest GitHub
+# publishes for it, so an upstream release cannot change what lands on a node
+# without this line changing first. The plain archive is the .NET Framework
+# build, which needs no runtime installed; the .NET 10 one would.
+$LhmVersion = 'v0.9.6'
+$LhmAsset   = 'LibreHardwareMonitor.zip'
+$LhmSha256  = '086d9f1b5a99e643edc2cfaaac16051685b551e4c5ac0b32a57c58c0e529c001'
+$LhmPort    = 8085
+$LhmDir     = 'C:\LibreHardwareMonitor'
+# Deliberately not 'LibreHardwareMonitor': that is the name its own "run at
+# startup" option registers, in the same root folder. Sharing it would let a
+# click in its UI replace this task — which runs headless as SYSTEM at boot —
+# with one that runs as whoever is logged in, and only once they log in.
+$LhmTask    = 'm0nit0r LibreHardwareMonitor'
+
 $Nodes = @(
     [ordered]@{
         Name      = 'mouseacceleration'
@@ -135,6 +166,9 @@ $Nodes = @(
         # Reachable only once the router forwards $ListenPort to this machine.
         PublicUrl = "http://${HomePublicAddress}:$ListenPort"
         InstallDir = 'C:\m0nit0r'
+        # Read the CPU die temperature from LibreHardwareMonitor rather than
+        # from the ACPI thermal zone, which on this board reports the chassis.
+        LibreHardwareMonitor = $true
     }
 )
 
@@ -187,6 +221,13 @@ function Resolve-Secret {
 function Get-SshTarget {
     param($Node)
     @('-p', $Node.SshPort, $Node.SshHost)
+}
+
+# The flag is optional, and under Set-StrictMode -Version Latest a missing key
+# read through dot notation is an error rather than a null.
+function Test-NodeUsesLhm {
+    param($Node)
+    $Node.Contains('LibreHardwareMonitor') -and $Node['LibreHardwareMonitor']
 }
 
 # The source addresses that must be able to reach the listening port: every
@@ -279,6 +320,14 @@ function New-NodeConfig {
             SyncIntervalSeconds   = $SyncIntervalSeconds
             RetentionDays         = $RetentionDays
         }
+    }
+
+    # Written whenever the node declares the source, including on a run that
+    # skips installing it: the agent falls back to its own probe by itself when
+    # nothing is listening, so pointing at an absent server costs nothing, while
+    # dropping the key from a node that has one would silently downgrade it.
+    if (Test-NodeUsesLhm $Node) {
+        $config.Monitor['LibreHardwareMonitorUrl'] = "http://127.0.0.1:$LhmPort"
     }
 
     $path = Join-Path $StageDir "appsettings.$($Node.Name).json"
@@ -453,6 +502,14 @@ $installDir = '__DIR__'
 $stage     = '__STAGE__'
 $port      = __PORT__
 
+$installLhm = '__LHM__' -eq '1'
+$lhmVersion = '__LHM_VERSION__'
+$lhmAsset   = '__LHM_ASSET__'
+$lhmSha256  = '__LHM_SHA256__'
+$lhmPort    = __LHM_PORT__
+$lhmDir     = '__LHM_DIR__'
+$lhmTask    = '__LHM_TASK__'
+
 $existing = Get-Service $service -ErrorAction SilentlyContinue
 if ($existing -and $existing.Status -ne 'Stopped') {
     Stop-Service $service -Force
@@ -511,6 +568,202 @@ if ($restrict) {
 }
 
 Start-Service $service
+
+# ── LibreHardwareMonitor ────────────────────────────────────────────────────
+# The agent reads the CPU die temperature from this. Everything below is
+# idempotent: a node already carrying the pinned version is left alone apart
+# from having its settings, task and firewall rule reasserted.
+
+function Get-CpuTemperatureSensor {
+    param($Node)
+
+    # The document is one shape all the way down: hardware, sensor type and
+    # sensor are all nodes carrying Children. Initialised explicitly, because
+    # PowerShell resolves an unassigned variable against the caller's scope,
+    # which in a recursive function is another invocation's answer.
+    $best = $null
+
+    # "Distance to TjMax" is typed as a temperature and sits under the
+    # processor, but it measures headroom: a cool chip reports a large number,
+    # so reporting one as the CPU temperature inverts the reading.
+    if ($Node.SensorId -match '^/(intel|amd)cpu/' -and $Node.Type -eq 'Temperature' -and
+        $Node.Text -notmatch 'Distance to TjMax') {
+        return $Node
+    }
+
+    foreach ($child in $Node.Children) {
+        $found = Get-CpuTemperatureSensor $child
+        if ($found) {
+            # A package sensor answers for the whole processor; anything else is
+            # one core, worth reporting only for lack of a package sensor.
+            if ($found.Text -eq 'CPU Package') { return $found }
+            if (-not $best) { $best = $found }
+        }
+    }
+    return $best
+}
+
+if ($installLhm) {
+    $lhmExe    = Join-Path $lhmDir 'LibreHardwareMonitor.exe'
+    $stampFile = Join-Path $lhmDir '.deployed-version'
+    $stamp     = if (Test-Path $stampFile) { (Get-Content -Raw $stampFile).Trim() } else { '' }
+
+    # Stopped before anything is written, and not only to free its files: it
+    # saves its settings from memory on the way out, so a copy left running
+    # would overwrite the configuration below the next time it exited.
+    if (Get-ScheduledTask -TaskName $lhmTask -ErrorAction SilentlyContinue) {
+        Stop-ScheduledTask -TaskName $lhmTask -ErrorAction SilentlyContinue
+    }
+    Get-Process LibreHardwareMonitor -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    # It holds a kernel driver open, so give it time to unload cleanly.
+    $stopBy = (Get-Date).AddSeconds(30)
+    while ((Get-Process LibreHardwareMonitor -ErrorAction SilentlyContinue) -and (Get-Date) -lt $stopBy) {
+        Start-Sleep -Milliseconds 200
+    }
+
+    if ((Test-Path $lhmExe) -and $stamp -eq $lhmVersion) {
+        "lhm: $lhmVersion already installed"
+    } else {
+        $url = "https://github.com/LibreHardwareMonitor/LibreHardwareMonitor/releases/download/$lhmVersion/$lhmAsset"
+        $zip = Join-Path $env:TEMP "$lhmAsset.$lhmVersion"
+
+        $previous = $ProgressPreference
+        $ProgressPreference = 'SilentlyContinue'   # the progress bar makes this crawl
+        try {
+            Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+        } finally {
+            $ProgressPreference = $previous
+        }
+
+        # Checked against the digest published for the release, so a tampered or
+        # truncated download never reaches the node.
+        $actual = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($actual -ne $lhmSha256) {
+            Remove-Item $zip -Force -ErrorAction SilentlyContinue
+            throw "$lhmAsset does not match the pinned digest (got $actual, expected $lhmSha256)"
+        }
+        "lhm: downloaded $lhmAsset $lhmVersion, digest verified"
+
+        $unpack = Join-Path $env:TEMP "lhm-unpack-$([guid]::NewGuid().ToString('N').Substring(0,8))"
+        Expand-Archive -Path $zip -DestinationPath $unpack -Force
+        # Releases have shipped both flat and inside a folder, so the executable
+        # is located rather than assumed.
+        $found = Get-ChildItem $unpack -Recurse -Filter 'LibreHardwareMonitor.exe' | Select-Object -First 1
+        if (-not $found) { throw "$lhmAsset contains no LibreHardwareMonitor.exe" }
+
+        New-Item -ItemType Directory -Force $lhmDir | Out-Null
+        Copy-Item (Join-Path $found.Directory.FullName '*') $lhmDir -Recurse -Force
+        Remove-Item $unpack -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item $zip -Force -ErrorAction SilentlyContinue
+        Set-Content -Path $stampFile -Value $lhmVersion -Encoding ascii
+        "lhm: installed $lhmVersion to $lhmDir"
+    }
+
+    # Its settings file is a plain appSettings document, and the web server is
+    # off by default. Writing the key here is enough to start it: the option's
+    # change handler runs as the handler is attached at load, so no one has to
+    # touch the UI on the node.
+    #
+    # Existing keys are merged rather than overwritten, so a config already on
+    # the machine keeps its window layout and sensor choices.
+    $configPath = Join-Path $lhmDir 'LibreHardwareMonitor.config'
+    $desired = [ordered]@{
+        runWebServerMenuItem  = 'true'
+        listenerPort          = "$lhmPort"
+        authenticationEnabled = 'false'
+        cpuMenuItem           = 'true'   # the sensors we are here for
+        startMinMenuItem      = 'true'
+        minTrayMenuItem       = 'true'
+    }
+
+    $doc = New-Object System.Xml.XmlDocument
+    $loaded = $false
+    if (Test-Path $configPath) {
+        try { $doc.Load($configPath); $loaded = $true } catch { $loaded = $false }
+    }
+    if (-not $loaded -or -not $doc.DocumentElement -or $doc.DocumentElement.Name -ne 'configuration') {
+        $doc = New-Object System.Xml.XmlDocument
+        $doc.AppendChild($doc.CreateXmlDeclaration('1.0', 'utf-8', $null)) | Out-Null
+        $doc.AppendChild($doc.CreateElement('configuration')) | Out-Null
+    }
+
+    $appSettings = $doc.DocumentElement.SelectSingleNode('appSettings')
+    if (-not $appSettings) {
+        $appSettings = $doc.DocumentElement.AppendChild($doc.CreateElement('appSettings'))
+    }
+    foreach ($key in $desired.Keys) {
+        $entry = $appSettings.SelectSingleNode("add[@key='$key']")
+        if (-not $entry) {
+            $entry = $appSettings.AppendChild($doc.CreateElement('add'))
+            $entry.SetAttribute('key', $key)
+        }
+        $entry.SetAttribute('value', $desired[$key])
+    }
+    $doc.Save($configPath)
+    "lhm: web server configured on 127.0.0.1:$lhmPort"
+
+    # There is no service mode: it is a WinForms application. A startup task
+    # running as SYSTEM is what keeps it up on a node nobody logs into.
+    Register-ScheduledTask -TaskName $lhmTask -Force `
+        -Action (New-ScheduledTaskAction -Execute $lhmExe -WorkingDirectory $lhmDir) `
+        -Trigger (New-ScheduledTaskTrigger -AtStartup) `
+        -Principal (New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest) `
+        -Settings (New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+            -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 `
+            -RestartInterval (New-TimeSpan -Minutes 1) -MultipleInstances IgnoreNew) | Out-Null
+
+    Start-ScheduledTask -TaskName $lhmTask
+    "lhm: scheduled task '$lhmTask' registered and running at startup"
+
+    # Its listener binds every interface: the setting that would confine it to
+    # loopback is rejected unless the address is one of the host's own, and
+    # loopback is not. So the port is closed inbound explicitly rather than left
+    # to the default policy, which a later prompt or rule could open.
+    $lhmRule = "LibreHardwareMonitor ($lhmPort/tcp) blocked"
+    if (Get-NetFirewallRule -DisplayName $lhmRule -ErrorAction SilentlyContinue) {
+        Set-NetFirewallRule -DisplayName $lhmRule -Action Block -Enabled True | Out-Null
+    } else {
+        New-NetFirewallRule -DisplayName $lhmRule -Direction Inbound -Action Block `
+            -Protocol TCP -LocalPort $lhmPort -Profile Any | Out-Null
+    }
+    "lhm: inbound $lhmPort/tcp blocked; the agent reads it over loopback"
+
+    # Enumerating the hardware takes a while on some machines, so the check
+    # waits rather than declaring failure on the first refusal. What it proves
+    # is the part that actually matters: that a CPU sensor is really there. A
+    # blocked or missing driver produces a server that answers with everything
+    # except the processor, and the agent would quietly fall back to the ACPI
+    # zone without this saying so.
+    # The two ways this fails need telling apart: a server that never answers is
+    # a process that is not running, while one that answers without a processor
+    # among its sensors is a driver problem. Reporting both as "no CPU sensor"
+    # sends whoever reads this at the wrong half of the system.
+    $deadline = (Get-Date).AddSeconds(90)
+    $sensor = $null
+    $answered = $false
+    while (-not $sensor -and (Get-Date) -lt $deadline) {
+        try {
+            $data = Invoke-RestMethod -Uri "http://127.0.0.1:$lhmPort/data.json" -TimeoutSec 5
+            $answered = $true
+            $sensor = Get-CpuTemperatureSensor $data
+        } catch { }
+        if (-not $sensor) { Start-Sleep -Seconds 3 }
+    }
+
+    if ($sensor) {
+        "lhm: CPU sensor '$($sensor.Text)' reads $($sensor.Value)"
+    } elseif ($answered) {
+        "lhm: WARNING the web server answers but reports no CPU temperature. The agent " +
+        "will fall back to the ACPI thermal zone. LibreHardwareMonitor needs PawnIO " +
+        "installed to read the processor's own sensor on recent Windows; see https://pawnio.eu"
+    } else {
+        $running = [bool](Get-Process LibreHardwareMonitor -ErrorAction SilentlyContinue)
+        "lhm: WARNING nothing answered on 127.0.0.1:$lhmPort within 90s " +
+        "(LibreHardwareMonitor process running: $running). The agent will fall back to the " +
+        "ACPI thermal zone. Check the '$lhmTask' scheduled task's last result."
+    }
+}
+
 (Get-Service $service).Status.ToString()
 '@
 
@@ -527,13 +780,22 @@ function Deploy-WindowsLocalNode {
     Copy-Item $binary (Join-Path $stage 'monitor.exe') -Force
     Copy-Item $config (Join-Path $stage 'appsettings.json') -Force
 
+    $withLhm = (Test-NodeUsesLhm $Node) -and -not $SkipLibreHardwareMonitor
+
     $installer = $WindowsInstaller `
         -replace '__SERVICE__', $ServiceName `
         -replace '__DIR__', $Node.InstallDir `
         -replace '__STAGE__', $stage `
         -replace '__PORT__', $ListenPort `
         -replace '__RESTRICT__', $(if ($RestrictFirewall) { '1' } else { '0' }) `
-        -replace '__ALLOW__', (($Allowed | ForEach-Object { "'$_'" }) -join ',')
+        -replace '__ALLOW__', (($Allowed | ForEach-Object { "'$_'" }) -join ',') `
+        -replace '__LHM_VERSION__', $LhmVersion `
+        -replace '__LHM_ASSET__', $LhmAsset `
+        -replace '__LHM_SHA256__', $LhmSha256 `
+        -replace '__LHM_PORT__', $LhmPort `
+        -replace '__LHM_DIR__', $LhmDir `
+        -replace '__LHM_TASK__', $LhmTask `
+        -replace '__LHM__', $(if ($withLhm) { '1' } else { '0' })
 
     $installerPath = Join-Path $StageDir 'install-windows.ps1'
     $logPath       = Join-Path $StageDir 'install-windows.log'
@@ -553,8 +815,11 @@ function Deploy-WindowsLocalNode {
 
     if (Test-Path $logPath) {
         Get-Content $logPath |
-            Where-Object { $_ -match 'service (created|already present)|firewall rule (created|updated)|firewall remote addresses verified' } |
-            ForEach-Object { Write-Note $_.Trim() }
+            Where-Object { $_ -match 'service (created|already present)|firewall rule (created|updated)|firewall remote addresses verified|lhm:' } |
+            ForEach-Object {
+                if ($_ -match 'WARNING') { Write-Host "  ! $($_.Trim())" -ForegroundColor Yellow }
+                else { Write-Note $_.Trim() }
+            }
     }
 
     $status = (Get-Service $ServiceName -ErrorAction SilentlyContinue).Status

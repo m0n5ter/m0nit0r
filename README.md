@@ -51,12 +51,69 @@ launches it.
 | `ListenPort` | `5001` | HTTP port for dashboard and peer API |
 | `SharedSecret` | empty | Shared secret authenticating the peer protocol. Must be identical on every node. Empty disables authentication |
 | `DatabasePath` | `monitor.db` | SQLite file path, relative to the executable |
-| `MetricIntervalSeconds` | `5` | How often to sample CPU, memory and disk |
+| `LibreHardwareMonitorUrl` | empty | Address of a LibreHardwareMonitor web server to read the CPU die temperature from, e.g. `http://127.0.0.1:8085`. Windows only in practice; empty uses the built-in probe |
+| `MetricIntervalSeconds` | `5` | How often to sample CPU, memory, disk and temperature |
 | `SyncIntervalSeconds` | `10` | How often to push data to peers |
 | `RetentionDays` | `30` | How long to keep history |
 
 Peers are not configured in this file. Add them at runtime from the dashboard, or by
 posting to `/api/peers`.
+
+## Temperature
+
+CPU and drive temperatures are sampled with the rest of the metrics, shown on the server
+cards and plotted on a chart of their own. There is nothing to configure: sensors are
+read where they exist and reported as absent where they do not, so a host that exposes
+none renders without them rather than as a row of zeroes. Readings turn amber then red
+at 70 and 85 °C for processors, 45 and 55 °C for drives.
+
+**Linux** takes the CPU package sensor from hwmon — `coretemp` on Intel, `k10temp` on
+AMD, the SoC sensor on ARM — and falls back to the thermal zone where there is no hwmon
+node. Drive temperatures come from the `nvme` driver and, for SATA, from `drivetemp`,
+which most distributions do not load by default:
+
+```bash
+modprobe drivetemp
+echo drivetemp > /etc/modules-load.d/drivetemp.conf
+```
+
+**Windows** reads drive temperatures from the drives themselves through the storage
+stack's temperature query — the same SMART and NVMe data a SMART utility shows, and it
+needs no elevation. The CPU figure is the ACPI thermal zone, which is as close as
+Windows gets without a kernel driver: it arrives in whole Kelvin, and the zone many
+desktop firmwares declare is a board-level one reading well below the actual die, when
+one is declared at all. Treat it as a trend rather than as a die temperature.
+
+Each node reports its own sensors, so a mixed mesh shows whatever every host can see
+about itself.
+
+### Die temperature on Windows
+
+Reading the processor's own sensor means executing `RDMSR`, which is a ring-0
+instruction: no user-mode API exposes it, and every tool that shows a real die
+temperature — HWMonitor, HWiNFO, LibreHardwareMonitor — ships a signed kernel driver to
+get at it. This agent does not, deliberately. Signing and installing a driver on every
+node would cost more than the metric is worth, and reusing a general-purpose one such as
+WinRing0 would hand any local process a read-write primitive over MSRs and physical
+memory — on a machine with memory integrity enabled it will not even load.
+
+So the real reading is borrowed instead. Point `LibreHardwareMonitorUrl` at a
+LibreHardwareMonitor instance with its web server switched on, and the agent takes the
+CPU package temperature from it, falling back to the ACPI zone whenever that server is
+not answering. Nothing else is taken from it: drive temperatures already come from the
+drives themselves.
+
+The address may be written as a bare `host:port`; `/data.json` is appended when no path
+is given, and credentials embedded in the URL are sent as basic authentication if the
+server is configured to want them. State changes are logged once each — one line when
+the source stops answering, one when it comes back — rather than once per sample.
+
+`deploy/Deploy-M0nit0r.ps1` installs and configures all of this on any Windows node
+flagged for it in the inventory. Two things are worth knowing if you set it up by hand:
+LibreHardwareMonitor has no service mode, so it wants a scheduled task running as SYSTEM
+at startup to stay up on a machine nobody logs into; and its listener binds every
+interface, because the setting that would confine it to loopback is rejected unless the
+address is one of the host's own. Block the port inbound.
 
 ## Multi-server setup
 
@@ -99,6 +156,16 @@ firewall manager is reported and left alone, because enabling one over SSH witho
 first admitting SSH locks you out of the machine. Note that the allowlist is built
 from the full inventory even on an `-Only` run, and that it has to be reapplied
 whenever one of those addresses changes — otherwise the mesh stops syncing silently.
+
+Windows nodes carrying `LibreHardwareMonitor = $true` in the inventory also get that
+tool installed, at a pinned version whose archive is checked against the digest GitHub
+publishes for it. It is registered as a startup task running as SYSTEM, its web server
+is switched on through its settings file, its port is blocked inbound, and the installer
+then waits for the server to answer and reports which CPU sensor it actually found —
+because a missing kernel driver produces a server that answers with everything except
+the processor, and the agent would otherwise fall back to the ACPI zone silently. Add
+`-SkipLibreHardwareMonitor` to leave it untouched on a run; the agent stays configured to
+read from it either way.
 
 The shared secret is generated on first run and stored in `deploy/.secret`, which is
 gitignored. Every node is deployed with the same value.
