@@ -1,479 +1,1641 @@
 <!DOCTYPE html>
-<html lang="en" data-bs-theme="dark">
+<html lang="en" data-bs-theme="dark" data-theme="dark">
 <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark light" />
     <title>Dashboard - m0nit0r</title>
     <link rel="stylesheet" href="/assets/bootstrap.min.css" />
     <link rel="stylesheet" href="/assets/bootstrap-icons.min.css" />
     <style>
-        body { background: #0d1117; color: #c9d1d9; }
-        .navbar { background: #161b22 !important; border-bottom: 1px solid #30363d; }
-        .card { background: #161b22; border: 1px solid #30363d; }
-        .card-header { background: #1c2128; border-bottom: 1px solid #30363d; }
-        .table { color: #c9d1d9; }
-        .table-dark { --bs-table-bg: #161b22; --bs-table-border-color: #30363d; }
-        .badge-online { background: #2ea043; }
-        .badge-offline { background: #da3633; }
-        .status-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
-        .dot-online { background: #2ea043; box-shadow: 0 0 6px #2ea043; }
-        .dot-offline { background: #da3633; }
-        .dot-unknown { background: #6e7681; }
-        .metric-value { font-size: 1.5rem; font-weight: 600; }
-        .progress { background: #30363d; height: 6px; }
-        .server-card { cursor: pointer; transition: border-color 0.2s; }
-        .server-card:hover, .server-card.active { border-color: #58a6ff !important; }
-        .avail-cell { min-width: 90px; text-align: center; font-size: 0.85rem; }
-        .avail-up { background: rgba(46, 160, 67, 0.2); color: #3fb950; }
-        .avail-down { background: rgba(218, 54, 51, 0.2); color: #f85149; }
-        .avail-unknown { background: rgba(110, 118, 129, 0.15); color: #6e7681; }
-        .chart-container { position: relative; height: 200px; }
+/* ── Design tokens ───────────────────────────────────────────────────────────
+   Every colour the dashboard draws comes from here, so the light theme is a
+   matter of redefining the same names rather than duplicating rules. Chart.js
+   cannot read custom properties, so the script resolves them at render time. */
+:root {
+    --bg:          #0b0f15;
+    --surface:     #12181f;
+    --surface-2:   #171f28;
+    --surface-3:   #1e2732;
+    --border:      #262f3b;
+    --border-soft: #1c242e;
+    --text:        #e6edf3;
+    --text-dim:    #93a1b1;
+    --text-faint:  #6b7889;
+
+    --accent:  #58a6ff;
+    --ok:      #3fb950;
+    --warn:    #d9a218;
+    --danger:  #f85149;
+    --info:    #56d4dd;
+    --purple:  #a371f7;
+    --pink:    #f778ba;
+
+    --ok-soft:      rgba(63, 185, 80, 0.14);
+    --warn-soft:    rgba(217, 162, 24, 0.16);
+    --danger-soft:  rgba(248, 81, 73, 0.16);
+    --accent-soft:  rgba(88, 166, 255, 0.14);
+    --neutral-soft: rgba(139, 148, 158, 0.10);
+
+    --shadow: 0 1px 2px rgba(0,0,0,.4), 0 8px 24px rgba(0,0,0,.28);
+    --radius: 12px;
+    --mono: ui-monospace, "SFMono-Regular", "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+}
+
+[data-theme="light"] {
+    --bg:          #f2f4f8;
+    --surface:     #ffffff;
+    --surface-2:   #f6f8fa;
+    --surface-3:   #eceff3;
+    --border:      #d5dae1;
+    --border-soft: #e4e8ed;
+    --text:        #1c2128;
+    --text-dim:    #57606a;
+    --text-faint:  #7d8590;
+
+    --accent:  #0969da;
+    --ok:      #1a7f37;
+    --warn:    #9a6700;
+    --danger:  #cf222e;
+    --info:    #1b7c83;
+    --purple:  #8250df;
+    --pink:    #bf3989;
+
+    --ok-soft:      rgba(26, 127, 55, 0.12);
+    --warn-soft:    rgba(154, 103, 0, 0.14);
+    --danger-soft:  rgba(207, 34, 46, 0.12);
+    --accent-soft:  rgba(9, 105, 218, 0.10);
+    --neutral-soft: rgba(87, 96, 106, 0.08);
+
+    --shadow: 0 1px 2px rgba(31,35,40,.06), 0 6px 18px rgba(31,35,40,.08);
+}
+
+/* ── Base ────────────────────────────────────────────────────────────────── */
+/* Every size below is expressed in rem, so the whole interface scales from
+   this one number rather than from a table of hand-tuned pixel values. */
+html { font-size: 17px; }
+html, body { min-height: 100%; }
+body {
+    background: var(--bg);
+    color: var(--text);
+    -webkit-font-smoothing: antialiased;
+}
+/* Live numbers change every few seconds; tabular figures keep them from
+   twitching sideways as digits swap width. */
+.num  { font-variant-numeric: tabular-nums; }
+.mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.text-dim   { color: var(--text-dim)   !important; }
+.text-faint { color: var(--text-faint) !important; }
+.eyebrow {
+    font-size: .76rem; font-weight: 600; letter-spacing: .08em;
+    text-transform: uppercase; color: var(--text-faint);
+}
+::selection { background: var(--accent-soft); }
+
+/* Bootstrap surfaces, retinted onto the token palette. */
+.card, .modal-content {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text);
+}
+.card-header {
+    background: transparent;
+    border-bottom: 1px solid var(--border-soft);
+    padding: .8rem 1.1rem;
+    font-size: 1rem;
+    font-weight: 600;
+    display: flex; align-items: center; gap: .5rem;
+}
+/* The reachability card leads the page, so its header carries more weight
+   than the ones on the cards below it. */
+.card-header.lg { font-size: 1.15rem; padding: 1rem 1.25rem; }
+.card-header.lg .bi { font-size: 1.1rem; }
+.card-header .bi { color: var(--text-faint); }
+.form-control, .form-select {
+    background: var(--surface-2); border-color: var(--border); color: var(--text);
+}
+.form-control:focus, .form-select:focus {
+    background: var(--surface-2); color: var(--text);
+    border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft);
+}
+.form-control::placeholder { color: var(--text-faint); }
+.modal-header, .modal-footer { border-color: var(--border-soft); }
+.table { color: var(--text); --bs-table-bg: transparent; --bs-table-color: var(--text); }
+code { color: var(--pink); }
+
+/* ── Top bar ─────────────────────────────────────────────────────────────── */
+.topbar {
+    position: sticky; top: 0; z-index: 1020;
+    background: color-mix(in srgb, var(--bg) 86%, transparent);
+    backdrop-filter: blur(12px);
+    border-bottom: 1px solid var(--border);
+}
+.topbar-inner {
+    display: flex; align-items: center; gap: .85rem;
+    padding: .6rem 1.25rem; flex-wrap: wrap;
+}
+.brand {
+    display: flex; align-items: center; gap: .55rem;
+    font-weight: 700; font-size: 1.05rem; letter-spacing: -.01em;
+    color: var(--text); text-decoration: none;
+}
+.brand-mark {
+    width: 26px; height: 26px; border-radius: 8px;
+    display: grid; place-items: center;
+    background: linear-gradient(140deg, var(--ok), var(--accent));
+    color: #06121d; font-size: .85rem;
+}
+.self-chip {
+    font-size: .86rem; color: var(--text-dim);
+    padding: .2rem .6rem; border-radius: 999px;
+    background: var(--surface-2); border: 1px solid var(--border-soft);
+    white-space: nowrap;
+}
+.icon-btn {
+    width: 32px; height: 32px; border-radius: 8px; flex: none;
+    display: grid; place-items: center;
+    background: var(--surface-2); border: 1px solid var(--border);
+    color: var(--text-dim); transition: .15s;
+}
+.icon-btn:hover { color: var(--text); border-color: var(--accent); }
+.icon-btn.on { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
+.icon-btn:focus-visible { outline: none; box-shadow: 0 0 0 3px var(--accent-soft); }
+
+/* The live indicator doubles as the connection state: it stops pulsing and
+   turns red when a poll fails, so a stalled page is obvious at a glance. */
+.live {
+    display: flex; align-items: center; gap: .45rem;
+    font-size: .85rem; color: var(--text-dim); white-space: nowrap;
+}
+.live-dot {
+    width: 7px; height: 7px; border-radius: 50%; background: var(--ok);
+    animation: pulse 2.4s infinite;
+}
+.live.stale  { color: var(--danger); }
+.live.stale  .live-dot { background: var(--danger); animation: none; }
+.live.paused .live-dot { background: var(--text-faint); animation: none; }
+@keyframes pulse {
+    0%   { box-shadow: 0 0 0 0 color-mix(in srgb, var(--ok) 55%, transparent); }
+    70%  { box-shadow: 0 0 0 6px transparent; }
+    100% { box-shadow: 0 0 0 0 transparent; }
+}
+@media (prefers-reduced-motion: reduce) {
+    .live-dot { animation: none; }
+    *, *::before, *::after { transition: none !important; }
+}
+
+/* ── Fleet summary tiles ─────────────────────────────────────────────────── */
+.stat-strip {
+    display: grid; gap: .75rem;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+}
+.stat {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: .75rem .95rem;
+    display: flex; flex-direction: column; gap: .35rem;
+}
+.stat-value {
+    font-size: 1.85rem; font-weight: 650; line-height: 1;
+    font-variant-numeric: tabular-nums; letter-spacing: -.02em;
+}
+.stat-sub { font-size: .82rem; color: var(--text-faint); }
+.stat-meter { height: 4px; border-radius: 999px; background: var(--surface-3); overflow: hidden; }
+.stat-meter > i { display: block; height: 100%; border-radius: 999px; transition: width .4s ease; }
+
+/* ── Server cards ────────────────────────────────────────────────────────── */
+.grid-servers {
+    display: grid; gap: .9rem;
+    grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+}
+/* display:flex overrides the centring a button applies to its own content:
+   without it a host with fewer disks has shorter content, which the button
+   centres in the stretched card, leaving headers at different heights across
+   a row. The footer is then pushed down so it lines up too. */
+.node {
+    position: relative; text-align: left; width: 100%;
+    display: flex; flex-direction: column; align-items: stretch;
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 0; color: inherit;
+    overflow: hidden; transition: border-color .15s, transform .15s, box-shadow .15s;
+}
+.node:hover { border-color: color-mix(in srgb, var(--accent) 55%, var(--border)); transform: translateY(-1px); }
+.node:focus-visible { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.node.selected { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+/* A thin rail carries the node's worst-metric state, so severity reads from
+   the edge of the card before any number is parsed. */
+.node::before {
+    content: ""; position: absolute; inset: 0 auto 0 0; width: 3px;
+    background: var(--rail, transparent);
+}
+.node.offline { opacity: .72; }
+.node-head {
+    display: flex; align-items: center; gap: .55rem;
+    padding: .9rem 1.2rem; border-bottom: 1px solid var(--border-soft);
+}
+.node-name {
+    font-weight: 600; font-size: 1.1rem; letter-spacing: -.01em;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.node-body { padding: 1.2rem; display: flex; flex-direction: column; flex: 1; }
+.dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+.dot.up      { background: var(--ok); box-shadow: 0 0 7px color-mix(in srgb, var(--ok) 70%, transparent); }
+.dot.down    { background: var(--danger); }
+.dot.unknown { background: var(--text-faint); }
+.pill {
+    font-size: .7rem; font-weight: 700; letter-spacing: .06em;
+    padding: .16rem .45rem; border-radius: 999px; text-transform: uppercase;
+    white-space: nowrap;
+}
+.pill.up      { background: var(--ok-soft); color: var(--ok); }
+.pill.down    { background: var(--danger-soft); color: var(--danger); }
+.pill.unknown { background: var(--neutral-soft); color: var(--text-faint); }
+.pill.self    { background: var(--accent-soft); color: var(--accent); }
+
+/* Two or three gauges, depending on whether the host reports a CPU sensor;
+   auto-fit divides whatever is present into equal columns. */
+.gauges { display: grid; grid-template-columns: repeat(auto-fit, minmax(0, 1fr)); gap: 1rem; }
+.gauge-value { font-size: 1.75rem; font-weight: 650; line-height: 1.05; letter-spacing: -.02em; }
+.gauge-label {
+    display: flex; align-items: baseline; gap: .3rem;
+    font-size: .8rem; color: var(--text-faint); margin-bottom: .3rem;
+}
+.gauge-sub { font-size: .78rem; color: var(--text-faint); margin-top: .3rem; }
+.meter { height: 5px; border-radius: 999px; background: var(--surface-3); overflow: hidden; margin-top: .5rem; }
+.meter > i { display: block; height: 100%; border-radius: 999px; transition: width .4s ease; }
+
+.disk-row {
+    display: flex; align-items: center; gap: .55rem;
+    font-size: .82rem; color: var(--text-dim); margin-top: .55rem;
+}
+.disk-name { font-family: var(--mono); font-size: .8rem; flex: none; min-width: 2.2rem; }
+.disk-bar { flex: 1; height: 5px; border-radius: 999px; background: var(--surface-3); overflow: hidden; }
+.disk-bar > i { display: block; height: 100%; border-radius: 999px; }
+.disk-num { flex: none; font-variant-numeric: tabular-nums; }
+.node-foot {
+    display: flex; align-items: center; justify-content: space-between; gap: .5rem;
+    margin-top: auto; padding-top: 1rem; border-top: 1px solid var(--border-soft);
+    font-size: .8rem; color: var(--text-faint);
+}
+.temp { font-variant-numeric: tabular-nums; }
+.temp.warn   { color: var(--warn); }
+.temp.danger { color: var(--danger); }
+
+/* ── Segmented range control ─────────────────────────────────────────────── */
+.segmented {
+    display: inline-flex; padding: 2px; gap: 2px;
+    background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px;
+}
+.segmented button {
+    border: 0; background: transparent; color: var(--text-dim);
+    font-size: .82rem; font-weight: 600; padding: .25rem .6rem; border-radius: 6px;
+    transition: .15s;
+}
+.segmented button:hover { color: var(--text); }
+.segmented button[aria-pressed="true"] { background: var(--surface); color: var(--accent); }
+.segmented button:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--accent-soft); }
+
+/* ── Charts ──────────────────────────────────────────────────────────────── */
+.chart-box { position: relative; height: 175px; }
+
+/* Lightbox summary: current state above the history, so the dialog answers
+   "what is this node" as well as "what has it been doing". */
+.detail-head {
+    display: flex; align-items: center; gap: .55rem; flex-wrap: wrap;
+    padding-bottom: .9rem; margin-bottom: 1.1rem;
+    border-bottom: 1px solid var(--border-soft);
+}
+.detail-meta { font-size: .85rem; color: var(--text-faint); }
+.detail-split {
+    display: grid; gap: 1.5rem; align-items: start;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    padding: 1.2rem 0; margin-top: .4rem;
+    border-top: 1px solid var(--border-soft);
+}
+@media (max-width: 767px) { .detail-split { grid-template-columns: minmax(0, 1fr); } }
+.facts { margin: 0; display: flex; flex-direction: column; gap: .55rem; }
+.fact { display: flex; align-items: baseline; gap: .75rem; }
+.fact dt {
+    flex: none; width: 6.5rem; font-weight: 500;
+    font-size: .8rem; color: var(--text-faint);
+}
+.fact dd {
+    margin: 0; min-width: 0; font-size: .88rem; color: var(--text-dim);
+    overflow-wrap: anywhere;
+}
+/* Side by side rather than stacked: three full-width plots turned the dialog
+   into something you had to scroll, and the series are read against each other
+   anyway. A hidden series is display:none, so auto-fit lays out however many
+   the host actually reports. */
+#detail-charts {
+    display: grid; gap: 1.4rem; align-items: start;
+    grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+}
+.series { min-width: 0; }
+.series-head {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: .5rem; margin-bottom: .4rem; flex-wrap: wrap;
+    /* Pinned height, and centred rather than baseline-aligned: baseline lets
+       two differently sized labels push the line box taller than either of
+       them, which left one plot a pixel out of line with the others. */
+    line-height: 1.3rem; min-height: 1.3rem;
+}
+.series-stats { display: flex; gap: .9rem; font-size: .8rem; color: var(--text-faint); }
+.series-stats b { color: var(--text-dim); font-weight: 600; font-variant-numeric: tabular-nums; }
+.swatch { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: .3rem; }
+.series-key {
+    display: flex; flex-wrap: wrap; gap: .3rem .9rem; margin-top: .55rem;
+    font-size: .8rem; color: var(--text-faint);
+}
+.series-key b { color: var(--text-dim); font-weight: 600; font-variant-numeric: tabular-nums; }
+
+/* ── Availability matrix ─────────────────────────────────────────────────── */
+.matrix-wrap { overflow-x: auto; padding: .9rem; }
+/* A big fleet makes the matrix wider than its column. A visible, slim
+   scrollbar is the affordance that says so; the default overlay one on
+   Windows appears only once the pointer is already moving. */
+.matrix-wrap, .table-responsive { scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
+.matrix-wrap::-webkit-scrollbar, .table-responsive::-webkit-scrollbar { height: 8px; }
+.matrix-wrap::-webkit-scrollbar-thumb, .table-responsive::-webkit-scrollbar-thumb {
+    background: var(--border); border-radius: 999px;
+}
+.matrix-wrap::-webkit-scrollbar-track, .table-responsive::-webkit-scrollbar-track { background: transparent; }
+table.matrix {
+    /* Both are set from fitMatrix: the type has to grow with the square, or a
+       cell sized for a wide card reads as a small label adrift in a big box. */
+    --cell: 64px;
+    --cell-font: .84rem;
+    border-collapse: separate; border-spacing: 3px; margin: 0 auto;
+    font-size: var(--cell-font);
+}
+table.matrix th {
+    color: var(--text-dim); font-weight: 600; font-size: var(--cell-font);
+    padding: .2rem .4rem; white-space: nowrap; text-align: center;
+}
+/* Node names are arbitrarily long but the matrix is quadratic, so headers are
+   clipped to a fixed extent and carry the full name as a tooltip. The wrapper
+   is what actually ellipsises: a th cannot without becoming a block. */
+table.matrix th.row-head { text-align: right; }
+table.matrix th.row-head span {
+    display: block; max-width: 10rem; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap;
+}
+/* Header names open the node, so they are real buttons stripped back to look
+   like the labels they replaced. */
+table.matrix th .node-link {
+    background: none; border: 0; padding: 0; margin: 0;
+    color: inherit; font: inherit; cursor: pointer; border-radius: 4px;
+    max-width: 10rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+table.matrix th .node-link:hover { color: var(--accent); text-decoration: underline; }
+table.matrix th .node-link:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--accent-soft); }
+table.matrix th.row-head .node-link { display: block; margin-left: auto; text-align: right; }
+/* Column labels are turned on their side so that a header never sets the
+   column width — the square cell does. vertical-rl plus a half turn is what
+   makes the text read bottom-to-top rather than top-to-bottom; the clipping
+   then works off max-height, the vertical counterpart of max-width. */
+table.matrix th.col-head { vertical-align: bottom; padding-bottom: .35rem; }
+table.matrix th.col-head .node-link {
+    display: inline-block; writing-mode: vertical-rl; transform: rotate(180deg);
+    max-width: none; max-height: 8rem;
+}
+table.matrix td {
+    padding: 0; text-align: center;
+    border-radius: 9px; font-variant-numeric: tabular-nums; color: var(--text-dim);
+    background: var(--surface-2); transition: .15s;
+}
+/* The square is the box, not the cell: max-width on a table-cell is advisory,
+   so a long latency reading would otherwise stretch its column and break the
+   grid. Anything that does not fit is clipped rather than allowed to widen. */
+.cell-box {
+    width: var(--cell); height: var(--cell);
+    display: grid; place-content: center;
+    overflow: hidden; padding: 0 2px;
+}
+table.matrix td.cell { cursor: pointer; }
+table.matrix td.cell:hover { outline: 1px solid var(--accent); }
+table.matrix td.self { background: transparent; color: var(--text-faint); }
+table.matrix td.na   { color: var(--text-faint); }
+table.matrix td.up   { background: var(--ok-soft); color: var(--ok); }
+table.matrix td.deg  { background: var(--warn-soft); color: var(--warn); }
+table.matrix td.down { background: var(--danger-soft); color: var(--danger); }
+.cell-sub { display: block; font-size: .78em; opacity: .75; margin-top: .15em; }
+
+/* ── Peers table ─────────────────────────────────────────────────────────── */
+.peers th {
+    font-size: .76rem; letter-spacing: .06em; text-transform: uppercase;
+    color: var(--text-faint); font-weight: 600; border-color: var(--border-soft);
+}
+.peers td { border-color: var(--border-soft); vertical-align: middle; font-size: .93rem; padding: .6rem .5rem; }
+/* The URL is the one unbounded column, so it is what gives way first; the full
+   value stays available as a tooltip. */
+.peers .col-url { max-width: 11rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* The table shares a column with the matrix, so how much room it has depends on
+   the fleet, not the viewport. Below the width where all six columns fit, the
+   location drops — every node card already carries it. */
+.peers-card { container-type: inline-size; }
+@container (max-width: 545px) {
+    .peers th:nth-child(2), .peers td:nth-child(2) { display: none; }
+}
+.peers tbody tr:last-child td { border-bottom: 0; }
+.peers tbody tr:hover td { background: var(--surface-2); }
+
+/* ── Misc ────────────────────────────────────────────────────────────────── */
+.empty {
+    display: grid; place-items: center; gap: .4rem;
+    padding: 2.25rem 1rem; color: var(--text-faint); text-align: center;
+}
+.empty .bi { font-size: 1.6rem; opacity: .5; }
+.skeleton {
+    border-radius: var(--radius); background: var(--surface);
+    border: 1px solid var(--border); height: 250px;
+    animation: shimmer 1.4s ease-in-out infinite;
+}
+@keyframes shimmer { 0%,100% { opacity: .5; } 50% { opacity: .85; } }
+.banner {
+    display: none; align-items: center; gap: .55rem;
+    background: var(--danger-soft); border: 1px solid color-mix(in srgb, var(--danger) 40%, transparent);
+    color: var(--danger); border-radius: var(--radius);
+    padding: .55rem .85rem; font-size: .83rem;
+}
+.banner.show { display: flex; }
+main { padding: 1.1rem 1.25rem 3rem; display: flex; flex-direction: column; gap: 1.1rem; }
+@media (max-width: 575px) {
+    .topbar-inner { padding: .5rem .8rem; gap: .6rem; }
+    main { padding: .8rem .8rem 2rem; }
+    .grid-servers { grid-template-columns: minmax(0, 1fr); }
+    /* Keeping the bar to one row matters more on a phone than repeating the
+       host name, which the "this host" card already carries. */
+    .self-chip { display: none; }
+    .stat-value { font-size: 1.3rem; }
+}
     </style>
 </head>
 <body>
-    <nav class="navbar navbar-expand-lg navbar-dark mb-4">
-        <div class="container-fluid">
-            <a class="navbar-brand fw-bold" href="/">
-                <i class="bi bi-activity text-success me-1"></i>m0nit0r
-            </a>
-            <span class="text-muted small ms-3" id="nav-self-info"></span>
-            <div class="ms-auto">
-                <span class="text-muted small" id="nav-last-update"></span>
-            </div>
-        </div>
-    </nav>
-    <div class="container-fluid px-4">
 
-<div class="row g-3 mb-4" id="server-cards">
-    <div class="col-12 text-muted small">Loading...</div>
-</div>
-
-<div class="row g-3 mb-4">
-    <div class="col-lg-6">
-        <div class="card h-100">
-            <div class="card-header d-flex justify-content-between align-items-center">
-                <span><i class="bi bi-grid me-2"></i>Availability Matrix</span>
-                <span class="badge bg-secondary small">last hour</span>
-            </div>
-            <div class="card-body p-0">
-                <div class="table-responsive">
-                    <table class="table table-dark table-sm mb-0" id="avail-table">
-                        <thead><tr><th>From \ To</th></tr></thead>
-                        <tbody></tbody>
-                    </table>
-                </div>
-            </div>
+<header class="topbar">
+    <div class="topbar-inner">
+        <a class="brand" href="/">
+            <span class="brand-mark"><i class="bi bi-activity"></i></span>m0nit0r
+        </a>
+        <span class="self-chip" id="self-chip" hidden></span>
+        <div class="ms-auto d-flex align-items-center gap-2">
+            <span class="live" id="live" title="Data refreshes every 5 seconds">
+                <span class="live-dot"></span><span id="live-text">connecting…</span>
+            </span>
+            <button class="icon-btn" id="btn-pause" title="Pause auto-refresh" aria-label="Pause auto-refresh">
+                <i class="bi bi-pause-fill"></i>
+            </button>
+            <button class="icon-btn" id="btn-theme" title="Toggle theme" aria-label="Toggle colour theme">
+                <i class="bi bi-sun"></i>
+            </button>
         </div>
     </div>
+</header>
 
-    <div class="col-lg-6">
-        <div class="card h-100" id="detail-card" style="display:none!important">
-            <div class="card-header d-flex justify-content-between align-items-center">
-                <span><i class="bi bi-bar-chart me-2"></i><span id="detail-title">Server Detail</span></span>
-                <select class="form-select form-select-sm w-auto bg-dark text-light border-secondary" id="hours-select">
-                    <option value="1">1h</option>
-                    <option value="6">6h</option>
-                    <option value="24" selected>24h</option>
-                    <option value="72">3d</option>
-                    <option value="168">7d</option>
-                </select>
-            </div>
-            <div class="card-body">
-                <div class="mb-3">
-                    <div class="d-flex justify-content-between mb-1">
-                        <small class="text-muted">CPU</small><small id="cpu-current">-</small>
-                    </div>
-                    <div class="chart-container"><canvas id="cpu-chart"></canvas></div>
-                </div>
-                <div>
-                    <div class="d-flex justify-content-between mb-1">
-                        <small class="text-muted">Memory</small><small id="mem-current">-</small>
-                    </div>
-                    <div class="chart-container"><canvas id="mem-chart"></canvas></div>
-                </div>
-            </div>
-        </div>
-        <div class="card h-100" id="no-detail-card">
-            <div class="card-body d-flex align-items-center justify-content-center text-muted">
-                <div class="text-center">
-                    <i class="bi bi-cursor" style="font-size:2rem"></i>
-                    <p class="mt-2 mb-0">Click a server card to view metrics</p>
-                </div>
-            </div>
-        </div>
+<main>
+    <div class="banner" id="banner">
+        <i class="bi bi-exclamation-triangle-fill"></i><span id="banner-text"></span>
     </div>
-</div>
 
-<div class="row g-3">
-    <div class="col-12">
-        <div class="card">
-            <div class="card-header d-flex justify-content-between align-items-center">
-                <span><i class="bi bi-diagram-3 me-2"></i>Peers</span>
-                <button class="btn btn-sm btn-outline-primary" onclick="openAddPeer()">
-                    <i class="bi bi-plus-circle me-1"></i>Add Peer
-                </button>
-            </div>
-            <div class="card-body p-0">
-                <table class="table table-dark table-sm mb-0">
-                    <thead>
-                        <tr>
-                            <th>Name</th>
-                            <th>Location</th>
-                            <th>URL</th>
-                            <th>Server ID</th>
-                            <th>Last seen</th>
-                            <th></th>
-                        </tr>
-                    </thead>
-                    <tbody id="peers-body">
-                        <tr><td colspan="6" class="text-muted small text-center py-3">Loading...</td></tr>
-                    </tbody>
-                </table>
-            </div>
+    <section class="stat-strip" id="fleet-stats" aria-label="Fleet summary"></section>
+
+    <!-- The matrix leads: it is the one view that answers "is the fleet
+         talking to itself", which no single node card can. -->
+    <section class="card" aria-label="Reachability">
+        <div class="card-header lg">
+            <i class="bi bi-diagram-3"></i>Reachability
+            <span class="eyebrow ms-auto">last hour</span>
         </div>
-    </div>
-</div>
+        <div class="matrix-wrap" id="matrix-wrap"></div>
+    </section>
 
-<!-- Add peer modal -->
-<div class="modal fade" id="addPeerModal" tabindex="-1">
-    <div class="modal-dialog">
-        <div class="modal-content bg-dark border-secondary">
-            <div class="modal-header border-secondary">
-                <h5 class="modal-title"><i class="bi bi-plus-circle me-2"></i>Add Peer</h5>
-                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+    <section aria-label="Servers">
+        <div class="d-flex align-items-center justify-content-between mb-2">
+            <span class="eyebrow">Nodes</span>
+            <span class="eyebrow" id="nodes-hint"></span>
+        </div>
+        <div class="grid-servers" id="server-cards">
+            <div class="skeleton"></div><div class="skeleton"></div>
+            <div class="skeleton"></div><div class="skeleton"></div>
+        </div>
+    </section>
+
+    <section class="card peers-card">
+        <div class="card-header">
+            <i class="bi bi-hdd-network"></i>Peers
+            <button class="btn btn-sm btn-primary ms-auto" id="btn-open-add">
+                <i class="bi bi-plus-lg me-1"></i>Add peer
+            </button>
+        </div>
+        <div class="table-responsive">
+            <table class="table table-sm peers mb-0">
+                <thead>
+                    <tr>
+                        <th class="ps-3">Name</th>
+                        <th>Location</th>
+                        <th>URL</th>
+                        <th>Server ID</th>
+                        <th>Last seen</th>
+                        <th></th>
+                    </tr>
+                </thead>
+                <tbody id="peers-body">
+                    <tr><td colspan="6" class="text-faint text-center py-3">Loading…</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </section>
+</main>
+
+<!-- Metrics lightbox -->
+<div class="modal fade" id="metricsModal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog modal-xl modal-dialog-centered">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title"><i class="bi bi-graph-up me-2"></i><span id="detail-title">Metrics</span></h5>
+                <span class="segmented ms-3" id="range-picker" role="group" aria-label="Time range">
+                    <button type="button" data-hours="1">1h</button>
+                    <button type="button" data-hours="6">6h</button>
+                    <button type="button" data-hours="24" aria-pressed="true">24h</button>
+                    <button type="button" data-hours="72">3d</button>
+                    <button type="button" data-hours="168">7d</button>
+                </span>
+                <button type="button" class="btn-close ms-auto" data-bs-dismiss="modal" aria-label="Close"></button>
             </div>
             <div class="modal-body">
-                <p class="text-muted small">
-                    Enter the URL of the peer agent. Its server ID, name, and location will be
-                    fetched automatically. The peer will also be notified of this server's address
-                    (if <code>PublicUrl</code> is configured) and will add you back.
-                </p>
-                <div class="mb-3">
-                    <label class="form-label small">Peer URL</label>
-                    <input type="text" class="form-control bg-dark text-light border-secondary"
-                           id="input-peer-url" placeholder="http://1.2.3.4:5001"
-                           onkeydown="if(event.key==='Enter') addPeer()" />
+                <div id="detail-summary"></div>
+                <div class="empty" id="detail-empty"><i class="bi bi-hourglass"></i><div>Loading…</div></div>
+                <div id="detail-charts" hidden>
+                    <div class="series">
+                        <div class="series-head">
+                            <span class="eyebrow">CPU</span>
+                            <span class="series-stats" id="cpu-stats"></span>
+                        </div>
+                        <div class="chart-box"><canvas id="cpu-chart"></canvas></div>
+                    </div>
+                    <div class="series">
+                        <div class="series-head">
+                            <span class="eyebrow">Memory</span>
+                            <span class="series-stats" id="mem-stats"></span>
+                        </div>
+                        <div class="chart-box"><canvas id="mem-chart"></canvas></div>
+                    </div>
+                    <div class="series" id="temp-series" hidden>
+                        <div class="series-head">
+                            <span class="eyebrow">Temperature</span>
+                        </div>
+                        <div class="chart-box"><canvas id="temp-chart"></canvas></div>
+                        <!-- The key lives under the plot, not in the header: a host
+                             can report any number of drives, and a header wide
+                             enough for five of them would wrap and push this
+                             chart out of line with the other two. -->
+                        <div class="series-key" id="temp-stats"></div>
+                    </div>
                 </div>
-                <div id="add-peer-result" class="p-3 rounded border border-secondary small" style="display:none">
-                    <div class="text-success mb-2"><i class="bi bi-check-circle me-1"></i>Peer added</div>
-                    <table class="table table-dark table-sm mb-0">
-                        <tr><td class="text-muted">Name</td><td id="result-name"></td></tr>
-                        <tr><td class="text-muted">Location</td><td id="result-location"></td></tr>
-                        <tr><td class="text-muted">Server ID</td><td id="result-id" class="font-monospace small"></td></tr>
-                    </table>
-                </div>
-                <div id="add-peer-error" class="alert alert-danger small py-2" style="display:none"></div>
-            </div>
-            <div class="modal-footer border-secondary">
-                <button class="btn btn-secondary btn-sm" data-bs-dismiss="modal">Close</button>
-                <button class="btn btn-primary btn-sm" onclick="addPeer()" id="btn-add-peer">
-                    <i class="bi bi-plus-circle me-1"></i>Add
-                </button>
             </div>
         </div>
     </div>
 </div>
 
+<!-- Add peer -->
+<div class="modal fade" id="addPeerModal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title fs-6"><i class="bi bi-plus-circle me-2"></i>Add peer</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body">
+                <p class="text-dim small">
+                    Enter the URL of the peer agent. Its server ID, name and location are fetched
+                    automatically. The peer is also told this server's address (when
+                    <code>PublicUrl</code> is configured) and will add it back.
+                </p>
+                <label class="form-label small text-dim" for="input-peer-url">Peer URL</label>
+                <input type="text" class="form-control" id="input-peer-url" placeholder="http://1.2.3.4:5001" />
+                <div id="add-peer-result" class="mt-3 p-3 rounded small" style="display:none; background: var(--surface-2)">
+                    <div class="mb-2" style="color: var(--ok)"><i class="bi bi-check-circle me-1"></i>Peer added</div>
+                    <div class="d-flex justify-content-between"><span class="text-faint">Name</span><span id="result-name"></span></div>
+                    <div class="d-flex justify-content-between"><span class="text-faint">Location</span><span id="result-location"></span></div>
+                    <div class="d-flex justify-content-between"><span class="text-faint">Server ID</span><span id="result-id" class="mono"></span></div>
+                </div>
+                <div id="add-peer-error" class="banner mt-3"></div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-sm btn-outline-secondary" data-bs-dismiss="modal">Close</button>
+                <button class="btn btn-sm btn-primary" id="btn-add-peer"><i class="bi bi-plus-lg me-1"></i>Add</button>
+            </div>
+        </div>
     </div>
-    <script src="/assets/bootstrap.bundle.min.js"></script>
-    <script src="/assets/chart.umd.min.js"></script>
+</div>
+
+<!-- Link latency -->
+<div class="modal fade" id="linkModal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog modal-lg modal-dialog-centered">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title fs-6"><i class="bi bi-arrow-left-right me-2"></i><span id="link-title"></span></h5>
+                <span class="segmented ms-3" id="link-range" role="group" aria-label="Time range">
+                    <button type="button" data-hours="1">1h</button>
+                    <button type="button" data-hours="6" aria-pressed="true">6h</button>
+                    <button type="button" data-hours="24">24h</button>
+                    <button type="button" data-hours="72">3d</button>
+                </span>
+                <button type="button" class="btn-close ms-auto" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body">
+                <div class="series-head">
+                    <span class="eyebrow">Latency</span>
+                    <span class="series-stats" id="link-stats"></span>
+                </div>
+                <div class="chart-box" style="height:220px"><canvas id="link-chart"></canvas></div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script src="/assets/bootstrap.bundle.min.js"></script>
+<script src="/assets/chart.umd.min.js"></script>
 <script>
-const CHART_OPTS = {
-    responsive: true, maintainAspectRatio: false, animation: false,
-    plugins: { legend: { display: false } },
-    scales: {
-        x: { ticks: { color: '#6e7681', maxTicksLimit: 6 }, grid: { color: '#21262d' } },
-        y: { min: 0, max: 100, ticks: { color: '#6e7681', callback: v => v + '%' }, grid: { color: '#21262d' } }
-    },
-    elements: { point: { radius: 0 } }
-};
+"use strict";
 
-let cpuChart, memChart, selectedServerId = null, servers = [];
-let addModal;
+// ── Constants ────────────────────────────────────────────────────────────────
 
-document.addEventListener('DOMContentLoaded', () => {
-    addModal = new bootstrap.Modal(document.getElementById('addPeerModal'));
-});
+const POLL_MS = 5000;
 
-function formatUptime(s) {
-    if (!s) return '-';
-    const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60);
-    if (d > 0) return `${d}d ${h}h`;
-    if (h > 0) return `${h}h ${m}m`;
-    return `${m}m`;
+// Thresholds at which a reading is worth noticing. Drives run cooler than
+// processors and fail sooner for it, hence the lower pair.
+const CPU_TEMP  = { warn: 70, danger: 85 };
+const DISK_TEMP = { warn: 45, danger: 55 };
+
+// Load percentages shade the same way everywhere: cards, tiles and rails.
+const LOAD = { warn: 70, danger: 90 };
+
+// Bounds for the reachability squares. The floor is what a cell needs to hold
+// a latency reading and an uptime percentage; the ceiling stops a two-node
+// fleet from rendering as a pair of billboards.
+const MIN_CELL = 56;
+const MAX_CELL = 112;
+
+// ── Theme ────────────────────────────────────────────────────────────────────
+
+// Chart.js takes concrete colours, so every token it needs is resolved from the
+// stylesheet once per theme rather than hard-coded a second time here.
+let C = {};
+
+function readTokens() {
+    const s = getComputedStyle(document.documentElement);
+    const get = n => s.getPropertyValue(n).trim();
+    C = {
+        text: get('--text'), dim: get('--text-dim'), faint: get('--text-faint'),
+        grid: get('--border-soft'), surface: get('--surface'), border: get('--border'),
+        accent: get('--accent'), ok: get('--ok'), warn: get('--warn'),
+        danger: get('--danger'), info: get('--info'), purple: get('--purple'), pink: get('--pink'),
+    };
 }
 
-function formatTs(iso) {
-    return new Date(iso + 'Z').toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+function applyTheme(theme) {
+    document.documentElement.dataset.theme = theme;
+    document.documentElement.dataset.bsTheme = theme;
+    document.querySelector('#btn-theme i').className = theme === 'dark' ? 'bi bi-sun' : 'bi bi-moon-stars';
+    readTokens();
+}
+
+// ── Formatting ───────────────────────────────────────────────────────────────
+
+function pct(v) { return v != null ? v.toFixed(1) + '%' : '—'; }
+function deg(v) { return v != null ? v.toFixed(1) + '°C' : '—'; }
+function ms(v)  { return v != null ? v.toFixed(0) + ' ms' : '—'; }
+
+function gb(mb) {
+    if (mb == null) return '—';
+    return mb >= 1024 ? (mb / 1024).toFixed(1) + ' GB' : mb.toFixed(0) + ' MB';
+}
+
+function formatUptime(s) {
+    if (!s) return '—';
+    const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60);
+    if (d > 0) return d + 'd ' + h + 'h';
+    if (h > 0) return h + 'h ' + m + 'm';
+    return m + 'm';
 }
 
 function formatRelative(iso) {
     if (!iso || iso.startsWith('0001')) return 'never';
-    const diff = Date.now() - new Date(iso + 'Z').getTime();
-    const min = Math.floor(diff / 60000);
+    const min = Math.floor((Date.now() - parseTs(iso)) / 60000);
     if (min < 1) return 'just now';
-    if (min < 60) return `${min}m ago`;
+    if (min < 60) return min + 'm ago';
     const h = Math.floor(min / 60);
-    if (h < 24) return `${h}h ago`;
-    return `${Math.floor(h / 24)}d ago`;
+    if (h < 24) return h + 'h ago';
+    return Math.floor(h / 24) + 'd ago';
 }
 
-function pct(val) { return val != null ? val.toFixed(1) + '%' : '-'; }
+// Timestamps arrive without a zone but are always UTC, so the suffix is added
+// before parsing rather than letting the browser assume local time.
+function parseTs(iso) { return new Date(iso + 'Z').getTime(); }
+
+// Axis labels drop the date on short ranges, where it is the same all the way
+// across, and carry it on long ones, where the time alone is ambiguous.
+function axisLabel(iso, hours) {
+    const d = new Date(parseTs(iso));
+    const hm = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    if (hours <= 24) return hm;
+    return d.toLocaleDateString([], { day: '2-digit', month: 'short' }) + ' ' + hm;
+}
+
+function fullLabel(iso) {
+    return new Date(parseTs(iso)).toLocaleString([], {
+        day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit', second: '2-digit',
+    });
+}
+
+function plural(n, word) { return n + ' ' + word + (n === 1 ? '' : 's'); }
+
 function esc(s) {
-    return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+    return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function loadColor(v) {
+    if (v == null) return C.faint;
+    return v >= LOAD.danger ? C.danger : v >= LOAD.warn ? C.warn : C.ok;
+}
+
+// tempClass grades a reading against its sensor's thresholds. A host or drive
+// with no sensor grades as nothing at all, so the layout of a machine that
+// reports no temperature is unchanged.
+function tempClass(v, limits) {
+    if (v == null) return null;
+    return v >= limits.danger ? 'danger' : v >= limits.warn ? 'warn' : '';
+}
+
+function tempTag(v, limits) {
+    const cls = tempClass(v, limits);
+    if (cls === null) return '';
+    return ' <span class="temp ' + cls + '">' + v.toFixed(0) + '°</span>';
+}
+
+function parseDisks(metric) {
+    try { return JSON.parse(metric?.disksJson || '[]'); } catch { return []; }
+}
+
+function stats(values) {
+    const nums = values.filter(v => v != null);
+    if (!nums.length) return null;
+    const sum = nums.reduce((a, b) => a + b, 0);
+    return { min: Math.min(...nums), max: Math.max(...nums), avg: sum / nums.length, last: nums[nums.length - 1] };
+}
+
+function statLine(s, fmt) {
+    if (!s) return '';
+    return '<span>now <b>' + fmt(s.last) + '</b></span><span>avg <b>' + fmt(s.avg) +
+           '</b></span><span>peak <b>' + fmt(s.max) + '</b></span>';
+}
+
+// ── State ────────────────────────────────────────────────────────────────────
+
+let servers = [];
+let selectedId = null;
+let rangeHours = 24;
+let paused = false;
+let pollTimer = null;
+let lastOk = 0;
+let healthy = true;
+let addModal, linkModal, metricsModal;
+let metricsOpen = false;
+let cpuChart, memChart, tempChart, linkChart;
+let linkEdge = null, linkHours = 6;
+
+// ── Fetch helper ─────────────────────────────────────────────────────────────
+
+async function getJSON(url) {
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(url + ' → ' + r.status);
+    return r.json();
 }
 
 // ── Server cards ─────────────────────────────────────────────────────────────
-function renderServerCards(srvList) {
-    const container = document.getElementById('server-cards');
-    if (!srvList.length) { container.innerHTML = '<div class="col-12 text-muted small">No servers yet.</div>'; return; }
 
-    container.innerHTML = srvList.map(s => {
-        const dot = s.isOnline ? 'dot-online' : (s.lastSeen === '0001-01-01T00:00:00' ? 'dot-unknown' : 'dot-offline');
-        const status = s.isOnline
-            ? '<span class="badge badge-online">ONLINE</span>'
-            : '<span class="badge badge-offline">OFFLINE</span>';
-        const l = s.latest;
-        const cpuPct = l ? l.cpuPercent : 0;
-        const memPct = l ? l.memoryPercent : 0;
-        const cpuColor = cpuPct > 90 ? 'danger' : cpuPct > 70 ? 'warning' : 'success';
-        const memColor = memPct > 90 ? 'danger' : memPct > 70 ? 'warning' : 'info';
+// Nodes are ordered so that the ones needing attention surface first: this
+// server, then anything offline, then the busiest.
+function sortServers(list) {
+    return list.slice().sort((a, b) => {
+        if (a.isSelf !== b.isSelf) return a.isSelf ? -1 : 1;
+        if (a.isOnline !== b.isOnline) return a.isOnline ? 1 : -1;
+        const load = s => s.latest ? Math.max(s.latest.cpuPercent, s.latest.memoryPercent) : -1;
+        const d = load(b) - load(a);
+        return d !== 0 ? d : a.name.localeCompare(b.name);
+    });
+}
 
-        let diskHtml = '';
-        if (l && l.disksJson) {
-            try {
-                JSON.parse(l.disksJson).forEach(d => {
-                    diskHtml += `<div class="d-flex justify-content-between small mb-1">
-                        <span class="text-muted">${esc(d.name)}</span>
-                        <span>${d.usagePercent.toFixed(0)}% <span class="text-muted">(${d.freeGb.toFixed(0)}GB free)</span></span>
-                    </div>
-                    <div class="progress mb-2"><div class="progress-bar bg-${d.usagePercent > 90 ? 'danger' : 'primary'}" style="width:${d.usagePercent}%"></div></div>`;
-                });
-            } catch {}
-        }
+function nodeState(s) {
+    if (s.isOnline) return 'up';
+    return s.lastSeen && s.lastSeen.startsWith('0001') ? 'unknown' : 'down';
+}
 
-        return `<div class="col-sm-6 col-xl-3">
-            <div class="card server-card ${selectedServerId === s.id ? 'active' : ''}" onclick="selectServer('${s.id}')" data-id="${s.id}">
-                <div class="card-header d-flex justify-content-between align-items-center py-2">
-                    <span class="fw-semibold"><span class="status-dot ${dot} me-2"></span>${esc(s.name)}</span>
-                    ${status}
-                </div>
-                <div class="card-body pb-2">
-                    <div class="text-muted small mb-2"><i class="bi bi-geo-alt me-1"></i>${esc(s.location || 'Unknown')}</div>
-                    <div class="row g-2 mb-2">
-                        <div class="col-6 text-center">
-                            <div class="metric-value text-${cpuColor}">${pct(l?.cpuPercent)}</div>
-                            <div class="small text-muted">CPU</div>
-                        </div>
-                        <div class="col-6 text-center">
-                            <div class="metric-value text-${memColor}">${pct(l?.memoryPercent)}</div>
-                            <div class="small text-muted">Memory</div>
-                        </div>
-                    </div>
-                    ${diskHtml}
-                    <div class="small text-muted mt-1"><i class="bi bi-clock me-1"></i>Up: ${formatUptime(l?.uptimeSeconds)}</div>
-                    ${s.isSelf ? '<div class="small text-success mt-1"><i class="bi bi-house me-1"></i>This server</div>' : ''}
-                </div>
-            </div>
-        </div>`;
+// railColor reports the worst thing about a node in one colour: unreachable
+// first, then saturation, then heat.
+function railColor(s) {
+    if (!s.isOnline) return nodeState(s) === 'unknown' ? 'transparent' : C.danger;
+    const l = s.latest;
+    if (!l) return 'transparent';
+    const worst = Math.max(l.cpuPercent, l.memoryPercent, ...parseDisks(l).map(d => d.usagePercent));
+    if (worst >= LOAD.danger) return C.danger;
+    if (tempClass(l.cpuTempC, CPU_TEMP) === 'danger') return C.danger;
+    if (worst >= LOAD.warn) return C.warn;
+    if (tempClass(l.cpuTempC, CPU_TEMP) === 'warn') return C.warn;
+    return 'transparent';
+}
+
+// gaugesHTML and disksHTML are shared by the node card and the lightbox, so the
+// two cannot drift apart as thresholds or formatting change.
+//
+// The CPU sensor gets the same weight as load: a machine that is cool and busy
+// is healthy, one that is hot and idle is not, and an inline tag was too small
+// to make that comparison at a glance. Its meter is scaled across the range a
+// processor realistically occupies, not 0-100.
+function gaugesHTML(l) {
+    const cpu = l?.cpuPercent, mem = l?.memoryPercent, temp = l?.cpuTempC;
+    const tempCls = tempClass(temp, CPU_TEMP);
+    const tempColor = tempCls === 'danger' ? C.danger : tempCls === 'warn' ? C.warn : C.info;
+
+    const tempGauge = temp == null ? '' :
+        '<div>' +
+            '<div class="gauge-label">CPU temp</div>' +
+            '<div class="gauge-value num" style="color:' + tempColor + '">' + temp.toFixed(0) +
+                '<span style="font-size:.6em">°C</span></div>' +
+            '<div class="meter"><i style="width:' +
+                Math.max(0, Math.min(100, ((temp - 20) / 70) * 100)).toFixed(1) +
+                '%;background:' + tempColor + '"></i></div>' +
+        '</div>';
+
+    return '<div class="gauges">' +
+        '<div>' +
+            '<div class="gauge-label">CPU</div>' +
+            '<div class="gauge-value num" style="color:' + loadColor(cpu) + '">' + pct(cpu) + '</div>' +
+            '<div class="meter"><i style="width:' + (cpu ?? 0).toFixed(1) + '%;background:' + loadColor(cpu) + '"></i></div>' +
+        '</div>' +
+        '<div>' +
+            '<div class="gauge-label">Memory</div>' +
+            '<div class="gauge-value num" style="color:' + loadColor(mem) + '">' + pct(mem) + '</div>' +
+            '<div class="meter"><i style="width:' + (mem ?? 0).toFixed(1) + '%;background:' + loadColor(mem) + '"></i></div>' +
+            '<div class="gauge-sub num">' + gb(l?.memoryUsedMb) + ' / ' + gb(l?.memoryTotalMb) + '</div>' +
+        '</div>' +
+        tempGauge +
+    '</div>';
+}
+
+function disksHTML(l) {
+    return parseDisks(l).map(d => {
+        const color = d.usagePercent >= LOAD.danger ? C.danger : d.usagePercent >= LOAD.warn ? C.warn : C.accent;
+        return '<div class="disk-row" title="' + esc(d.name) + ' — ' + d.usedGb.toFixed(0) + ' of ' +
+            d.totalGb.toFixed(0) + ' GB used">' +
+            '<span class="disk-name">' + esc(d.name) + '</span>' +
+            '<span class="disk-bar"><i style="width:' + d.usagePercent.toFixed(1) + '%;background:' + color + '"></i></span>' +
+            '<span class="disk-num">' + d.usagePercent.toFixed(0) + '%</span>' +
+            '<span class="disk-num text-faint">' + d.freeGb.toFixed(0) + 'G free</span>' +
+            tempTag(d.tempC, DISK_TEMP) + '</div>';
     }).join('');
 }
 
-// ── Availability matrix ───────────────────────────────────────────────────────
-function renderAvailabilityMatrix(srvList, matrix) {
-    const thead = document.querySelector('#avail-table thead tr');
-    const tbody = document.querySelector('#avail-table tbody');
-    thead.innerHTML = '<th class="text-muted small">From \\ To</th>';
-    tbody.innerHTML = '';
+// statusLabel names the state the dot and pill are showing.
+function statusLabel(state) {
+    return state === 'up' ? 'online' : state === 'down' ? 'offline' : 'no data';
+}
 
-    if (srvList.length < 2) {
-        tbody.innerHTML = '<tr><td colspan="99" class="text-muted small text-center py-3">Add peers to see the availability matrix</td></tr>';
+// uptimeHTML reports how long the node has been up, or, when it is not
+// answering, how long ago it last was.
+function uptimeHTML(s) {
+    const l = s.latest;
+    if (!s.isOnline) return '<i class="bi bi-eye-slash me-1"></i>seen ' + formatRelative(s.lastSeen);
+    if (!l) return '<i class="bi bi-hourglass me-1"></i>no samples yet';
+    return '<i class="bi bi-clock me-1"></i>up ' + formatUptime(l.uptimeSeconds);
+}
+
+function nodeInner(s) {
+    const state = nodeState(s);
+
+    return '' +
+    '<div class="node-head">' +
+        '<span class="dot ' + state + '"></span>' +
+        '<span class="node-name" title="' + esc(s.name) + '">' + esc(s.name) + '</span>' +
+        (s.isSelf ? '<span class="pill self">this host</span>' : '') +
+        '<span class="pill ' + state + ' ms-auto">' + statusLabel(state) + '</span>' +
+    '</div>' +
+    '<div class="node-body">' +
+        gaugesHTML(s.latest) +
+        disksHTML(s.latest) +
+        '<div class="node-foot">' +
+            '<span title="' + esc(s.location || 'Unknown location') + '"><i class="bi bi-geo-alt me-1"></i>' +
+                esc(s.location || 'Unknown') + '</span>' +
+            '<span>' + uptimeHTML(s) + '</span>' +
+        '</div>' +
+    '</div>';
+}
+
+// Cards are updated in place and keyed by server id: a wholesale innerHTML
+// rewrite every five seconds would drop focus, kill :hover and restart every
+// transition mid-flight.
+function renderServerCards(list) {
+    const container = document.getElementById('server-cards');
+    const ordered = sortServers(list);
+
+    if (!ordered.length) {
+        container.innerHTML = '<div class="empty" style="grid-column:1/-1">' +
+            '<i class="bi bi-hdd-rack"></i><div>No servers yet — add a peer to get started.</div></div>';
         return;
     }
 
-    const ids = srvList.map(s => s.id);
-    const names = Object.fromEntries(srvList.map(s => [s.id, s.name]));
-
-    ids.forEach(id => {
-        const th = document.createElement('th');
-        th.className = 'avail-cell text-muted small';
-        th.textContent = names[id] || id.slice(0, 8);
-        thead.appendChild(th);
+    const seen = new Set();
+    ordered.forEach((s, i) => {
+        seen.add(s.id);
+        let el = container.querySelector('[data-id="' + CSS.escape(s.id) + '"]');
+        if (!el) {
+            el = document.createElement('button');
+            el.type = 'button';
+            el.className = 'node';
+            el.dataset.id = s.id;
+            el.addEventListener('click', () => selectServer(s.id));
+            container.appendChild(el);
+        }
+        el.style.setProperty('--rail', railColor(s));
+        el.classList.toggle('offline', !s.isOnline);
+        el.classList.toggle('selected', selectedId === s.id);
+        el.setAttribute('aria-pressed', String(selectedId === s.id));
+        el.setAttribute('aria-label', s.name + ', ' + (s.isOnline ? 'online' : 'offline'));
+        el.innerHTML = nodeInner(s);
+        // Reordering by assignment keeps the DOM in sort order without
+        // detaching nodes that are already in the right place.
+        if (container.children[i] !== el) container.insertBefore(el, container.children[i]);
     });
 
-    ids.forEach(fromId => {
-        const tr = document.createElement('tr');
-        const td0 = document.createElement('td');
-        td0.className = 'small text-muted align-middle';
-        td0.textContent = names[fromId] || fromId.slice(0, 8);
-        tr.appendChild(td0);
-
-        ids.forEach(toId => {
-            const td = document.createElement('td');
-            td.className = 'avail-cell align-middle';
-            if (fromId === toId) {
-                td.innerHTML = '<span class="text-muted">—</span>';
-            } else {
-                const e = matrix.find(m => m.fromServerId === fromId && m.toServerId === toId);
-                if (!e) {
-                    td.className += ' avail-unknown'; td.innerHTML = '<span>n/a</span>';
-                } else if (e.isAvailable) {
-                    td.className += ' avail-up';
-                    td.innerHTML = `<i class="bi bi-check-circle me-1"></i>${e.lastLatencyMs ? e.lastLatencyMs.toFixed(0) + 'ms' : 'UP'}`;
-                } else {
-                    td.className += ' avail-down'; td.innerHTML = '<i class="bi bi-x-circle me-1"></i>DOWN';
-                }
-            }
-            tr.appendChild(td);
-        });
-        tbody.appendChild(tr);
+    Array.from(container.children).forEach(el => {
+        if (!el.dataset.id || !seen.has(el.dataset.id)) el.remove();
     });
 }
 
-// ── Peers table ───────────────────────────────────────────────────────────────
-async function renderPeersTable() {
-    const peers = await fetch('/api/peers').then(r => r.json());
+// ── Fleet summary ────────────────────────────────────────────────────────────
+
+function tile(label, value, sub, meterPct, color) {
+    return '<div class="stat">' +
+        '<span class="eyebrow">' + label + '</span>' +
+        '<span class="stat-value" style="color:' + (color || 'inherit') + '">' + value + '</span>' +
+        (meterPct != null
+            ? '<div class="stat-meter"><i style="width:' + meterPct.toFixed(1) + '%;background:' + (color || C.accent) + '"></i></div>'
+            : '') +
+        '<span class="stat-sub">' + sub + '</span>' +
+    '</div>';
+}
+
+function renderFleet(list, matrix) {
+    const online = list.filter(s => s.isOnline).length;
+    const withMetrics = list.filter(s => s.latest);
+    const avg = key => withMetrics.length
+        ? withMetrics.reduce((a, s) => a + s.latest[key], 0) / withMetrics.length : null;
+
+    const avgCpu = avg('cpuPercent'), avgMem = avg('memoryPercent');
+
+    // Only the edges this server can actually see count as links; an edge with
+    // no observation in the window is unknown, not down.
+    const links = matrix.length;
+    const linksUp = matrix.filter(e => e.isAvailable).length;
+
+    const hottest = withMetrics
+        .map(s => ({ name: s.name, t: s.latest.cpuTempC }))
+        .filter(x => x.t != null)
+        .sort((a, b) => b.t - a.t)[0];
+
+    const alerts = list.filter(s => railColor(s) === C.danger).length;
+
+    const sampled = plural(withMetrics.length, 'node') + ' sampled';
+
+    const html = [
+        tile('Nodes online', online + ' <span class="text-faint" style="font-size:1rem">/ ' + list.length + '</span>',
+            !list.length ? 'waiting for the first sample'
+                : list.length - online > 0 ? plural(list.length - online, 'node') + ' unreachable'
+                : 'all reporting',
+            list.length ? (online / list.length) * 100 : 0,
+            list.length && online === list.length ? C.ok : C.danger),
+        tile('Avg CPU', pct(avgCpu), sampled, avgCpu ?? 0, loadColor(avgCpu)),
+        tile('Avg memory', pct(avgMem), sampled, avgMem ?? 0, loadColor(avgMem)),
+        links
+            ? tile('Links up', linksUp + ' <span class="text-faint" style="font-size:1rem">/ ' + links + '</span>',
+                linksUp === links ? 'every peer sees every peer' : plural(links - linksUp, 'link') + ' failing',
+                (linksUp / links) * 100, linksUp === links ? C.ok : C.warn)
+            : tile('Hottest CPU', hottest ? hottest.t.toFixed(0) + '°C' : '—',
+                hottest ? hottest.name : 'no sensors reporting', null,
+                hottest && hottest.t >= CPU_TEMP.warn ? C.warn : null),
+    ].join('');
+
+    document.getElementById('fleet-stats').innerHTML = html;
+    document.getElementById('nodes-hint').textContent =
+        alerts ? plural(alerts, 'node') + ' needing attention' : 'click a node for history';
+}
+
+// ── Availability matrix ──────────────────────────────────────────────────────
+
+function renderMatrix(list, matrix) {
+    const wrap = document.getElementById('matrix-wrap');
+
+    if (list.length < 2) {
+        wrap.innerHTML = '<div class="empty"><i class="bi bi-diagram-3"></i>' +
+            '<div>Add a peer to see how the fleet sees itself</div></div>';
+        return;
+    }
+
+    const byEdge = new Map(matrix.map(e => [e.fromServerId + '>' + e.toServerId, e]));
+    const nodes = sortServers(list);
+
+    // The headers are buttons, not labels: a node name is the most direct way
+    // into that node's detail, and a real button gets keyboard access for free.
+    const nameButton = s =>
+        '<button type="button" class="node-link" data-node="' + esc(s.id) + '" title="' +
+        esc(s.name) + '">' + esc(s.name) + '</button>';
+
+    let html = '<table class="matrix"><thead><tr><th class="row-head"><span>from \\ to</span></th>';
+    for (const s of nodes) {
+        html += '<th class="col-head">' + nameButton(s) + '</th>';
+    }
+    html += '</tr></thead><tbody>';
+
+    for (const from of nodes) {
+        html += '<tr><th class="row-head">' + nameButton(from) + '</th>';
+        for (const to of nodes) {
+            if (from.id === to.id) { html += '<td class="self"><div class="cell-box">·</div></td>'; continue; }
+
+            const e = byEdge.get(from.id + '>' + to.id);
+            if (!e) {
+                html += '<td class="na" title="no checks recorded in the last hour">' +
+                    '<div class="cell-box">n/a</div></td>';
+                continue;
+            }
+
+            // A link that is up right now but has been flapping is worth
+            // distinguishing from one that has been solid all hour.
+            const cls = !e.isAvailable ? 'down' : e.availabilityPercent < 100 ? 'deg' : 'up';
+            const main = e.isAvailable ? ms(e.lastLatencyMs) : 'down';
+            const sub = e.availabilityPercent < 100 ? e.availabilityPercent.toFixed(0) + '% up' : '';
+            const title = from.name + ' → ' + to.name + ' · ' + e.availabilityPercent.toFixed(0) +
+                '% of recent checks succeeded · last check ' + formatRelative(e.lastCheck);
+
+            html += '<td class="cell ' + cls + '" title="' + esc(title) + '" ' +
+                'data-from="' + esc(from.id) + '" data-to="' + esc(to.id) + '" ' +
+                'data-label="' + esc(from.name + ' → ' + to.name) + '"><div class="cell-box">' +
+                main + (sub ? '<span class="cell-sub">' + sub + '</span>' : '') + '</div></td>';
+        }
+        html += '</tr>';
+    }
+    wrap.innerHTML = html + '</tbody></table>';
+    fitMatrix();
+}
+
+// fitMatrix grows the square cells to fill the card. The matrix is the first
+// thing on the page now, and a small fleet rendered at a fixed cell size would
+// leave it marooned in whitespace; a large one still hits the floor and scrolls.
+function fitMatrix() {
+    const wrap = document.getElementById('matrix-wrap');
+    const table = wrap.querySelector('table.matrix');
+    if (!table) return;
+
+    const columns = table.tHead.rows[0].cells.length - 1;
+    if (columns < 1) return;
+
+    const style = getComputedStyle(wrap);
+    const padding = parseFloat(style.paddingLeft) + parseFloat(style.paddingRight);
+    const spacing = 3 * (columns + 2);
+
+    // Two passes, because the sizing feeds back on itself: the type scales with
+    // the square, and larger type widens the row-header column, which leaves
+    // less room than the first measurement assumed. The second pass measures
+    // the header at the size it actually ended up.
+    for (let pass = 0; pass < 2; pass++) {
+        const rowHead = table.tHead.rows[0].cells[0].offsetWidth;
+        const room = wrap.clientWidth - padding - rowHead - spacing;
+        const cell = Math.max(MIN_CELL, Math.min(MAX_CELL, Math.floor(room / columns)));
+
+        // Type tracks the square across the same range, so the reading stays
+        // proportionate to the box whether the fleet is two nodes or twenty.
+        const t = (cell - MIN_CELL) / (MAX_CELL - MIN_CELL);
+        table.style.setProperty('--cell', cell + 'px');
+        table.style.setProperty('--cell-font', (0.84 + t * 0.26).toFixed(3) + 'rem');
+    }
+}
+
+// ── Peers table ──────────────────────────────────────────────────────────────
+
+async function renderPeers() {
+    const peers = await getJSON('/api/peers');
     const tbody = document.getElementById('peers-body');
 
     if (!peers.length) {
-        tbody.innerHTML = '<tr><td colspan="6" class="text-muted small text-center py-3">No peers. Click "Add Peer" to connect to another server.</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="6"><div class="empty"><i class="bi bi-hdd-network"></i>' +
+            '<div>No peers yet. Add one to start exchanging metrics.</div></div></td></tr>';
         return;
     }
 
     tbody.innerHTML = peers.map(p => {
         const shortId = p.id.length > 16 ? p.id.slice(0, 8) + '…' + p.id.slice(-4) : p.id;
-        return `<tr>
-            <td>${esc(p.name)}</td>
-            <td class="text-muted small">${esc(p.location || '—')}</td>
-            <td class="text-muted small font-monospace">${esc(p.url || '—')}</td>
-            <td class="text-muted small font-monospace" title="${esc(p.id)}">${shortId}</td>
-            <td class="text-muted small">${formatRelative(p.lastSeen)}</td>
-            <td class="text-end">
-                <button class="btn btn-sm btn-outline-danger py-0 px-2" onclick="removePeer('${p.id}', '${esc(p.name)}')">
-                    <i class="bi bi-trash"></i>
-                </button>
-            </td>
-        </tr>`;
+        return '<tr>' +
+            '<td class="ps-3 fw-semibold">' + esc(p.name) + '</td>' +
+            '<td class="text-dim">' + esc(p.location || '—') + '</td>' +
+            '<td class="text-dim mono small col-url" title="' + esc(p.url) + '">' +
+                esc(p.url || '—') + '</td>' +
+            '<td class="text-faint mono small" title="' + esc(p.id) + '">' + esc(shortId) + '</td>' +
+            '<td class="text-dim">' + formatRelative(p.lastSeen) + '</td>' +
+            '<td class="text-end pe-3">' +
+                '<button class="btn btn-sm btn-outline-danger py-0 px-2" data-remove="' + esc(p.id) +
+                '" data-name="' + esc(p.name) + '" aria-label="Remove ' + esc(p.name) + '">' +
+                '<i class="bi bi-trash"></i></button></td>' +
+        '</tr>';
     }).join('');
 }
 
-// ── Detail charts ─────────────────────────────────────────────────────────────
-async function selectServer(id) {
-    selectedServerId = id;
-    document.querySelectorAll('.server-card').forEach(c => c.classList.toggle('active', c.dataset.id === id));
+// ── Detail charts ────────────────────────────────────────────────────────────
+
+// deepMerge is what layers a chart's overrides onto the shared options. A flat
+// assign would not do: the callers only ever override one axis or one plugin,
+// and replacing the whole `scales` or `plugins` object silently drops the rest
+// of the styling back to the library's own defaults.
+function deepMerge(base, extra) {
+    if (!extra) return base;
+    const out = Array.isArray(base) ? base.slice() : Object.assign({}, base);
+    for (const [k, v] of Object.entries(extra)) {
+        const plain = x => x && typeof x === 'object' && !Array.isArray(x) && typeof x !== 'function';
+        out[k] = plain(v) && plain(out[k]) ? deepMerge(out[k], v) : v;
+    }
+    return out;
+}
+
+function baseOptions(unit, extra) {
+    return deepMerge({
+        responsive: true, maintainAspectRatio: false, animation: false, spanGaps: true,
+        interaction: { mode: 'index', intersect: false },
+        plugins: {
+            legend: { display: false },
+            tooltip: {
+                backgroundColor: C.surface, borderColor: C.border, borderWidth: 1,
+                titleColor: C.text, bodyColor: C.dim, padding: 10, displayColors: true,
+                boxWidth: 8, boxHeight: 8, cornerRadius: 8,
+                callbacks: {
+                    title: items => items[0].dataset.stamps?.[items[0].dataIndex] ?? items[0].label,
+                    label: ctx => (ctx.dataset.label ? ctx.dataset.label + ': ' : '') +
+                        (ctx.parsed.y == null ? '—' : ctx.parsed.y.toFixed(1) + unit),
+                },
+            },
+        },
+        scales: {
+            x: {
+                ticks: { color: C.faint, maxTicksLimit: 5, maxRotation: 0, autoSkip: true, font: { size: 10 } },
+                grid: { color: C.grid, drawTicks: false },
+                border: { color: C.grid },
+            },
+            y: {
+                ticks: { color: C.faint, font: { size: 10 }, maxTicksLimit: 6, callback: v => v + unit },
+                grid: { color: C.grid, drawTicks: false },
+                border: { display: false },
+            },
+        },
+        elements: { point: { radius: 0, hitRadius: 12, hoverRadius: 4 }, line: { borderWidth: 1.75 } },
+    }, extra);
+}
+
+// A vertical wash under the line reads as volume without competing with it.
+// Chart.js needs a real gradient object rather than a colour string, and the
+// gradient has to span the canvas it is painted on — a fixed stop height would
+// leave the taller charts with a fill that fades out halfway down.
+function fillFor(canvasId, color) {
+    const canvas = document.getElementById(canvasId);
+    const height = canvas.getBoundingClientRect().height || 150;
+    const g = canvas.getContext('2d').createLinearGradient(0, 0, 0, height);
+    g.addColorStop(0, color + '4d');
+    g.addColorStop(1, color + '00');
+    return g;
+}
+
+// Chart.js keeps a live reference to its canvas; replacing a chart without
+// destroying the old one leaks the instance and doubles the tooltips.
+function swap(chart, canvasId, config) {
+    if (chart) chart.destroy();
+    return new Chart(document.getElementById(canvasId).getContext('2d'), config);
+}
+
+function lineConfig(labels, stamps, series, unit, opts) {
+    return {
+        type: 'line',
+        data: {
+            labels,
+            datasets: series.map(s => ({
+                label: s.label, data: s.data, stamps,
+                borderColor: s.color, backgroundColor: s.fill || 'transparent',
+                fill: !!s.fill, tension: 0.28,
+            })),
+        },
+        options: baseOptions(unit, opts),
+    };
+}
+
+async function loadDetail(id) {
+    renderDetailSummary(servers.find(s => s.id === id));
+    const data = await getJSON('/api/servers/' + encodeURIComponent(id) + '/metrics?hours=' + rangeHours);
+    const empty = document.getElementById('detail-empty');
+    const charts = document.getElementById('detail-charts');
+
+    if (!data.length) {
+        empty.innerHTML = '<i class="bi bi-hourglass"></i><div>No samples in this range</div>';
+        empty.hidden = false; charts.hidden = true;
+        return;
+    }
+    empty.hidden = true; charts.hidden = false;
+
+    const labels = data.map(d => axisLabel(d.timestamp, rangeHours));
+    const stamps = data.map(d => fullLabel(d.timestamp));
+    const cpu = data.map(d => d.cpuPercent);
+    const mem = data.map(d => d.memoryPercent);
+
+    // Percentages are pinned to a full 0–100 axis: an auto-fitted one rescales
+    // between polls, which makes an idle machine's noise look like a spike.
+    const pctScale = { scales: { y: { min: 0, max: 100 } } };
+
+    cpuChart = swap(cpuChart, 'cpu-chart', lineConfig(labels, stamps,
+        [{ label: 'CPU', data: cpu, color: C.accent, fill: fillFor('cpu-chart', C.accent) }], '%', pctScale));
+    memChart = swap(memChart, 'mem-chart', lineConfig(labels, stamps,
+        [{ label: 'Memory', data: mem, color: C.purple, fill: fillFor('mem-chart', C.purple) }], '%', pctScale));
+
+    document.getElementById('cpu-stats').innerHTML = statLine(stats(cpu), pct);
+    document.getElementById('mem-stats').innerHTML = statLine(stats(mem), pct);
+
+    renderTemperatures(labels, stamps, data);
+}
+
+// renderTemperatures draws the CPU sensor and every drive that reports one on a
+// single axis. Samples taken before a sensor appeared — or on a host that has
+// none — are nulls the chart spans over, so history recorded by an older build
+// leaves a gap rather than a drop to zero.
+function renderTemperatures(labels, stamps, data) {
+    const block = document.getElementById('temp-series');
+    const disks = data.map(parseDisks);
+    const series = [];
+
+    const cpu = data.map(d => d.cpuTempC ?? null);
+    if (cpu.some(v => v != null)) series.push({ label: 'CPU', data: cpu, color: C.pink });
+
+    const palette = [C.warn, C.info, C.ok, C.purple, C.accent];
+    const names = [];
+    disks.forEach(list => list.forEach(d => {
+        if (d.tempC != null && !names.includes(d.name)) names.push(d.name);
+    }));
+    names.forEach((name, i) => {
+        series.push({
+            label: name, color: palette[i % palette.length],
+            data: disks.map(list => list.find(d => d.name === name)?.tempC ?? null),
+        });
+    });
+
+    if (tempChart) { tempChart.destroy(); tempChart = null; }
+    if (!series.length) { block.hidden = true; return; }
+    block.hidden = false;
+
+    // No chart legend: it would cost a third of a plot that is now one of three
+    // across. The summary line below carries the same key, colour and all.
+    tempChart = swap(null, 'temp-chart', lineConfig(labels, stamps, series, '°C', {
+        scales: { y: { suggestedMin: 20, suggestedMax: 80 } },
+    }));
+
+    // The summary reports the latest sample, like the CPU and memory ones do, so
+    // a sensor that has stopped answering reads as absent instead of frozen at
+    // whatever it last said.
+    document.getElementById('temp-stats').innerHTML = series.map(s => {
+        const last = [...s.data].reverse().find(v => v != null);
+        const cls = tempClass(last, s.label === 'CPU' ? CPU_TEMP : DISK_TEMP);
+        return '<span><i class="swatch" style="background:' + s.color + '"></i>' + esc(s.label) +
+            ' <b class="temp ' + (cls || '') + '">' + deg(last) + '</b></span>';
+    }).join('');
+}
+
+// renderDetailSummary fills the top of the lightbox with the node's current
+// state and identity. The charts alone answered "what has it been doing" but
+// not "what is it" — the URL and server id were only ever visible in the peer
+// table, and never at all for this host.
+function renderDetailSummary(s) {
+    const state = nodeState(s);
+    const box = document.getElementById('detail-summary');
+    if (!s) { box.innerHTML = ''; return; }
+
+    const facts = [
+        ['Location', esc(s.location || '\u2014')],
+        ['URL', s.url ? '<span class="mono">' + esc(s.url) + '</span>' : '<span class="text-faint">not advertised</span>'],
+        ['Server ID', '<span class="mono">' + esc(s.id) + '</span>'],
+        ['Last seen', s.isSelf ? 'this host' : esc(formatRelative(s.lastSeen))],
+    ].map(([k, v]) => '<div class="fact"><dt>' + k + '</dt><dd>' + v + '</dd></div>').join('');
+
+    const disks = disksHTML(s.latest);
+
+    box.innerHTML =
+        '<div class="detail-head">' +
+            '<span class="dot ' + state + '"></span>' +
+            '<span class="pill ' + state + '">' + statusLabel(state) + '</span>' +
+            (s.isSelf ? '<span class="pill self">this host</span>' : '') +
+            '<span class="detail-meta ms-auto">' + uptimeHTML(s) + '</span>' +
+        '</div>' +
+        gaugesHTML(s.latest) +
+        '<div class="detail-split">' +
+            '<div>' +
+                '<div class="eyebrow mb-2">Disks</div>' +
+                (disks || '<div class="text-faint">No fixed volumes reported</div>') +
+            '</div>' +
+            '<dl class="facts">' + facts + '</dl>' +
+        '</div>';
+}
+
+// The charts open over the page rather than in it. Same reason the link
+// latency does: they are a drill-down on one node, not fleet state, and giving
+// them a permanent panel pushed everything else below the fold. loadDetail
+// runs from the shown event, since Chart.js measures a hidden dialog as zero.
+function selectServer(id) {
+    selectedId = id;
+    document.querySelectorAll('.node').forEach(el => {
+        const on = el.dataset.id === id;
+        el.classList.toggle('selected', on);
+        el.setAttribute('aria-pressed', String(on));
+    });
     const srv = servers.find(s => s.id === id);
-    if (srv) document.getElementById('detail-title').textContent = srv.name;
-    document.getElementById('detail-card').style.removeProperty('display');
-    document.getElementById('no-detail-card').style.display = 'none';
-    await loadCharts(id);
+    document.getElementById('detail-title').textContent = srv ? srv.name : 'Metrics';
+    renderDetailSummary(srv);
+    metricsModal.show();
 }
 
-async function loadCharts(id) {
-    const hours = document.getElementById('hours-select').value;
-    const data = await fetch(`/api/servers/${id}/metrics?hours=${hours}`).then(r => r.json());
-    if (!data.length) return;
+// ── Link latency modal ───────────────────────────────────────────────────────
 
-    const labels  = data.map(d => formatTs(d.timestamp));
-    const cpuData = data.map(d => d.cpuPercent);
-    const memData = data.map(d => d.memoryPercent);
-    const last = data[data.length - 1];
-    document.getElementById('cpu-current').textContent = pct(last.cpuPercent);
-    document.getElementById('mem-current').textContent = pct(last.memoryPercent);
+async function loadLink() {
+    if (!linkEdge) return;
+    const url = '/api/availability/history/' + encodeURIComponent(linkEdge.from) +
+        '/' + encodeURIComponent(linkEdge.to) + '?hours=' + linkHours;
+    const rows = await getJSON(url).catch(() => []);
 
-    if (cpuChart) cpuChart.destroy();
-    if (memChart) memChart.destroy();
-    cpuChart = new Chart(document.getElementById('cpu-chart').getContext('2d'), {
-        type: 'line',
-        data: { labels, datasets: [{ data: cpuData, borderColor: '#58a6ff', backgroundColor: 'rgba(88,166,255,0.1)', fill: true, tension: 0.3 }] },
-        options: CHART_OPTS
-    });
-    memChart = new Chart(document.getElementById('mem-chart').getContext('2d'), {
-        type: 'line',
-        data: { labels, datasets: [{ data: memData, borderColor: '#3fb950', backgroundColor: 'rgba(63,185,80,0.1)', fill: true, tension: 0.3 }] },
-        options: CHART_OPTS
-    });
+    const labels = rows.map(r => axisLabel(r.timestamp, linkHours));
+    const stamps = rows.map(r => fullLabel(r.timestamp));
+    // A failed check has no latency; plotting it as zero would read as an
+    // impossibly fast round trip, so the line breaks instead.
+    const values = rows.map(r => (r.isAvailable ? r.latencyMs : null));
+
+    linkChart = swap(linkChart, 'link-chart', lineConfig(labels, stamps,
+        [{ label: 'Latency', data: values, color: C.info,
+           fill: fillFor('link-chart', C.info) }],
+        // spanGaps is off here, unlike the metric charts: a bridged gap would
+        // draw a continuous line straight through an outage.
+        ' ms', { spanGaps: false, scales: { y: { beginAtZero: true } } }));
+
+    const s = stats(values);
+    const fails = rows.filter(r => !r.isAvailable).length;
+    document.getElementById('link-stats').innerHTML =
+        (s ? statLine(s, v => v.toFixed(0) + ' ms') : '<span>no successful checks</span>') +
+        '<span>failed <b class="' + (fails ? 'temp danger' : '') + '">' + fails + '</b> / ' + rows.length + '</span>';
 }
 
-document.getElementById('hours-select').addEventListener('change', () => {
-    if (selectedServerId) loadCharts(selectedServerId);
-});
+// The chart is drawn from the modal's shown event, not here: Chart.js measures
+// its container on construction, and a dialog that has not finished opening
+// still measures zero, leaving a canvas that never grows back.
+function openLink(from, to, label) {
+    linkEdge = { from, to };
+    document.getElementById('link-title').textContent = label;
+    linkModal.show();
+}
 
-// ── Add / remove peer ─────────────────────────────────────────────────────────
+// ── Peer management ──────────────────────────────────────────────────────────
+
 function openAddPeer() {
     document.getElementById('input-peer-url').value = '';
     document.getElementById('add-peer-result').style.display = 'none';
-    document.getElementById('add-peer-error').style.display = 'none';
-    document.getElementById('btn-add-peer').disabled = false;
+    document.getElementById('add-peer-error').classList.remove('show');
+    const btn = document.getElementById('btn-add-peer');
+    btn.disabled = false;
+    btn.innerHTML = '<i class="bi bi-plus-lg me-1"></i>Add';
     addModal.show();
-    setTimeout(() => document.getElementById('input-peer-url').focus(), 300);
 }
 
 async function addPeer() {
-    const url = document.getElementById('input-peer-url').value.trim();
-    if (!url) return;
+    const input = document.getElementById('input-peer-url');
+    const url = input.value.trim();
+    if (!url) { input.focus(); return; }
 
     const btn = document.getElementById('btn-add-peer');
+    const err = document.getElementById('add-peer-error');
     btn.disabled = true;
-    btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>Connecting...';
+    btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>Connecting…';
     document.getElementById('add-peer-result').style.display = 'none';
-    document.getElementById('add-peer-error').style.display = 'none';
+    err.classList.remove('show');
+
+    const done = () => {
+        btn.disabled = false;
+        btn.innerHTML = '<i class="bi bi-plus-lg me-1"></i>Add';
+    };
 
     try {
         const resp = await fetch('/api/peers', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ url })
+            body: JSON.stringify({ url }),
         });
 
         if (resp.ok) {
             const peer = await resp.json();
-            document.getElementById('result-name').textContent     = peer.name;
+            document.getElementById('result-name').textContent = peer.name;
             document.getElementById('result-location').textContent = peer.location || '—';
-            document.getElementById('result-id').textContent       = peer.id;
+            document.getElementById('result-id').textContent = peer.id;
             document.getElementById('add-peer-result').style.display = '';
-            btn.innerHTML = '<i class="bi bi-plus-circle me-1"></i>Add';
+            done();
             await refresh();
         } else {
-            const msg = await resp.text();
-            const el = document.getElementById('add-peer-error');
-            el.textContent = msg || 'Failed to add peer';
-            el.style.display = '';
-            btn.disabled = false;
-            btn.innerHTML = '<i class="bi bi-plus-circle me-1"></i>Add';
+            err.textContent = (await resp.text()) || 'Failed to add peer';
+            err.classList.add('show');
+            done();
         }
-    } catch {
-        btn.disabled = false;
-        btn.innerHTML = '<i class="bi bi-plus-circle me-1"></i>Add';
+    } catch (e) {
+        err.textContent = 'Could not reach this server: ' + e.message;
+        err.classList.add('show');
+        done();
     }
 }
 
 async function removePeer(id, name) {
-    if (!confirm(`Remove peer "${name}"?\n\nHistorical data will be kept.`)) return;
-    const resp = await fetch(`/api/peers/${id}`, { method: 'DELETE' });
-    if (resp.ok) await refresh();
+    if (!confirm('Remove peer "' + name + '"?\n\nHistorical data will be kept.')) return;
+    const resp = await fetch('/api/peers/' + encodeURIComponent(id), { method: 'DELETE' });
+    if (resp.ok) {
+        if (selectedId === id) selectedId = null;
+        await refresh();
+    }
 }
 
-// ── Refresh loop ──────────────────────────────────────────────────────────────
+// ── Refresh loop ─────────────────────────────────────────────────────────────
+
+function setLive(state, text) {
+    const el = document.getElementById('live');
+    el.classList.toggle('stale', state === 'stale');
+    el.classList.toggle('paused', state === 'paused');
+    document.getElementById('live-text').textContent = text;
+}
+
+function tickClock() {
+    if (!lastOk) return;
+    const secs = Math.round((Date.now() - lastOk) / 1000);
+    if (paused) { setLive('paused', 'paused · ' + secs + 's ago'); return; }
+    // A failed poll is known to be bad immediately. The age threshold catches
+    // the other case — a request that neither answers nor fails — at two
+    // missed rounds, the point where the numbers stop being worth trusting.
+    if (!healthy) { setLive('stale', 'disconnected · ' + secs + 's ago'); return; }
+    if (secs > (POLL_MS / 1000) * 2 + 2) setLive('stale', 'stale · ' + secs + 's ago');
+    else setLive('live', secs <= 1 ? 'live' : 'live · ' + secs + 's ago');
+}
+
 async function refresh() {
-    const [srvRes, matRes] = await Promise.all([
-        fetch('/api/servers').then(r => r.json()),
-        fetch('/api/availability/matrix').then(r => r.json())
-    ]);
+    try {
+        const [srv, matrix] = await Promise.all([
+            getJSON('/api/servers'),
+            getJSON('/api/availability/matrix'),
+        ]);
 
-    servers = srvRes;
-    renderServerCards(srvRes);
-    renderAvailabilityMatrix(srvRes, matRes);
-    await renderPeersTable();
+        servers = srv;
 
-    const self = srvRes.find(s => s.isSelf);
-    if (self) document.getElementById('nav-self-info').textContent = `${self.name} · ${self.location}`;
-    document.getElementById('nav-last-update').textContent = 'Updated ' + new Date().toLocaleTimeString();
+        renderFleet(srv, matrix);
+        renderServerCards(srv);
+        renderMatrix(srv, matrix);
+        await renderPeers();
 
-    if (selectedServerId) loadCharts(selectedServerId);
+        // An open lightbox keeps following the poll; a closed one has nothing
+        // to update.
+        if (metricsOpen && selectedId) await loadDetail(selectedId);
+
+        const self = srv.find(s => s.isSelf);
+        const chip = document.getElementById('self-chip');
+        if (self) {
+            chip.textContent = self.name + (self.location ? ' · ' + self.location : '');
+            chip.hidden = false;
+        }
+
+        document.getElementById('banner').classList.remove('show');
+        healthy = true;
+        lastOk = Date.now();
+        tickClock();
+    } catch (e) {
+        document.getElementById('banner-text').textContent =
+            'Cannot reach the agent — showing the last data received. (' + e.message + ')';
+        document.getElementById('banner').classList.add('show');
+        healthy = false;
+        tickClock();
+    }
 }
 
-refresh();
-setInterval(refresh, 5000);
+function schedule() {
+    clearInterval(pollTimer);
+    if (!paused) pollTimer = setInterval(refresh, POLL_MS);
+}
+
+// ── Wiring ───────────────────────────────────────────────────────────────────
+
+document.addEventListener('DOMContentLoaded', () => {
+    applyTheme(localStorage.getItem('m0nit0r-theme') || 'dark');
+
+    addModal = new bootstrap.Modal(document.getElementById('addPeerModal'));
+    linkModal = new bootstrap.Modal(document.getElementById('linkModal'));
+    metricsModal = new bootstrap.Modal(document.getElementById('metricsModal'));
+
+    const metricsEl = document.getElementById('metricsModal');
+    metricsEl.addEventListener('shown.bs.modal', () => {
+        metricsOpen = true;
+        if (selectedId) loadDetail(selectedId).catch(() => {});
+    });
+    metricsEl.addEventListener('hidden.bs.modal', () => {
+        metricsOpen = false;
+        selectedId = null;
+        document.getElementById('detail-summary').innerHTML = '';
+        for (const chart of [cpuChart, memChart, tempChart]) if (chart) chart.destroy();
+        cpuChart = memChart = tempChart = null;
+        document.querySelectorAll('.node.selected').forEach(el => {
+            el.classList.remove('selected');
+            el.setAttribute('aria-pressed', 'false');
+        });
+    });
+
+    document.getElementById('addPeerModal').addEventListener('shown.bs.modal',
+        () => document.getElementById('input-peer-url').focus());
+    document.getElementById('linkModal').addEventListener('shown.bs.modal', loadLink);
+    document.getElementById('linkModal').addEventListener('hidden.bs.modal', () => {
+        if (linkChart) { linkChart.destroy(); linkChart = null; }
+        linkEdge = null;
+    });
+    document.getElementById('input-peer-url').addEventListener('keydown',
+        e => { if (e.key === 'Enter') addPeer(); });
+    document.getElementById('btn-open-add').addEventListener('click', openAddPeer);
+    document.getElementById('btn-add-peer').addEventListener('click', addPeer);
+
+    document.getElementById('btn-theme').addEventListener('click', () => {
+        const next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
+        localStorage.setItem('m0nit0r-theme', next);
+        applyTheme(next);
+        // Cards and charts bake in resolved colours, so they are redrawn
+        // rather than restyled.
+        renderServerCards(servers);
+        if (metricsOpen && selectedId) loadDetail(selectedId).catch(() => {});
+        if (linkEdge) loadLink();
+    });
+
+    const pauseBtn = document.getElementById('btn-pause');
+    pauseBtn.addEventListener('click', () => {
+        paused = !paused;
+        pauseBtn.classList.toggle('on', paused);
+        pauseBtn.innerHTML = '<i class="bi bi-' + (paused ? 'play-fill' : 'pause-fill') + '"></i>';
+        pauseBtn.title = paused ? 'Resume auto-refresh' : 'Pause auto-refresh';
+        schedule();
+        if (!paused) refresh();
+        tickClock();
+    });
+
+    // Range picker, shared shape between the detail card and the link modal.
+    const bindRange = (id, onPick) => {
+        const group = document.getElementById(id);
+        group.addEventListener('click', e => {
+            const btn = e.target.closest('button[data-hours]');
+            if (!btn) return;
+            group.querySelectorAll('button').forEach(b => b.setAttribute('aria-pressed', String(b === btn)));
+            onPick(Number(btn.dataset.hours));
+        });
+    };
+    bindRange('range-picker', h => { rangeHours = h; if (selectedId) loadDetail(selectedId).catch(() => {}); });
+
+    // Only the cell size depends on the viewport, so a resize re-fits the
+    // matrix rather than rebuilding it.
+    let fitPending = false;
+    window.addEventListener('resize', () => {
+        if (fitPending) return;
+        fitPending = true;
+        requestAnimationFrame(() => { fitPending = false; fitMatrix(); });
+    });
+    bindRange('link-range', h => { linkHours = h; loadLink(); });
+
+    // Matrix cells and peer buttons are rebuilt on every poll, so their
+    // handlers live on the containers that survive.
+    document.getElementById('matrix-wrap').addEventListener('click', e => {
+        const name = e.target.closest('.node-link');
+        if (name) { selectServer(name.dataset.node); return; }
+        const td = e.target.closest('td.cell');
+        if (td) openLink(td.dataset.from, td.dataset.to, td.dataset.label);
+    });
+    document.getElementById('peers-body').addEventListener('click', e => {
+        const btn = e.target.closest('button[data-remove]');
+        if (btn) removePeer(btn.dataset.remove, btn.dataset.name);
+    });
+
+    // Polling a hidden tab keeps a laptop awake for data nobody is reading.
+    document.addEventListener('visibilitychange', () => {
+        if (document.hidden) { clearInterval(pollTimer); pollTimer = null; }
+        else if (!paused) { refresh(); schedule(); }
+    });
+
+    setInterval(tickClock, 1000);
+    refresh();
+    schedule();
+});
 </script>
 </body>
 </html>
