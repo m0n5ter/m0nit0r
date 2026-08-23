@@ -526,9 +526,23 @@ fi
 
 case "$FIREWALL:$RESTRICT" in
     ufw:1)
-        # Drop any blanket rule first, so narrowing actually narrows rather
-        # than leaving the permissive rule shadowing the specific ones.
-        ufw --force delete allow "$PORT"/tcp >/dev/null 2>&1 || true
+        # Every existing rule for the port goes, not just a blanket allow.
+        # A per-source rule left by an earlier run names an address that is
+        # no longer in the allowlist - a decommissioned node, a node whose
+        # address changed, or one that was wrong when it was written - and
+        # adding the current list back cannot remove it. Nothing else ever
+        # would, so the hole it holds open outlives every later deployment,
+        # while the run that leaves it reports the port as restricted.
+        #
+        # Deleted highest number first: ufw renumbers the rules below each
+        # one it removes, so ascending order would skip every other match.
+        ufw status numbered 2>/dev/null \
+            | grep -E "^\[[ ]*[0-9]+\][ ]+$PORT(/tcp)?([ ]|\()" \
+            | sed -E 's/^\[[ ]*([0-9]+)\].*/\1/' \
+            | sort -rn \
+            | while read -r rule_number; do
+                ufw --force delete "$rule_number" >/dev/null 2>&1 || true
+            done
         for ip in $ALLOW; do
             ufw allow from "$ip" to any port "$PORT" proto tcp >/dev/null 2>&1 || true
         done
@@ -540,6 +554,15 @@ case "$FIREWALL:$RESTRICT" in
         ;;
     firewalld:1)
         firewall-cmd --permanent --remove-port="$PORT"/tcp >/dev/null 2>&1 || true
+        # Stale rich rules go for the same reason they do under ufw above:
+        # --add-rich-rule cannot displace one naming an address that has
+        # since left the allowlist. Removed by the exact text firewalld
+        # prints, which is the only form --remove-rich-rule matches.
+        firewall-cmd --permanent --list-rich-rules 2>/dev/null \
+            | grep "port=\"$PORT\"" \
+            | while read -r stale_rule; do
+                firewall-cmd --permanent --remove-rich-rule="$stale_rule" >/dev/null 2>&1 || true
+            done
         for ip in $ALLOW; do
             firewall-cmd --permanent --add-rich-rule="rule family=ipv4 source address=$ip port port=$PORT protocol=tcp accept" >/dev/null 2>&1 || true
         done
