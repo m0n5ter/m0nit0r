@@ -248,7 +248,7 @@ to write to, so logs go to `monitor.log` beside the executable instead, rotated 
 | POST | `/api/introduce` | Exchange identities with a peer; records the caller |
 | POST | `/api/sync` | Receive metrics and availability records from a peer |
 | GET | `/api/servers` | All servers with their latest metrics |
-| GET | `/api/servers/{id}/metrics?hours=24` | Time-series metrics |
+| GET | `/api/servers/{id}/metrics?hours=24` | Time-series metrics. Raw samples for an hour; longer windows come back averaged into buckets wide enough to keep the series around 360 points |
 | GET | `/api/availability/matrix` | Availability matrix, last hour |
 | GET | `/api/availability/history/{from}/{to}?hours=24` | Availability history for one edge |
 | GET | `/api/peers` | Configured peers |

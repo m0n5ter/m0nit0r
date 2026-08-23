@@ -561,6 +561,7 @@ main { padding: 1.1rem 1.25rem 3rem; display: flex; flex-direction: column; gap:
                     <button type="button" data-hours="72">3d</button>
                     <button type="button" data-hours="168">7d</button>
                 </span>
+                <span class="text-faint ms-2" style="font-size:.8rem" id="detail-resolution"></span>
                 <button type="button" class="btn-close ms-auto" data-bs-dismiss="modal" aria-label="Close"></button>
             </div>
             <div class="modal-body">
@@ -748,6 +749,21 @@ function fullLabel(iso) {
     return new Date(parseTs(iso)).toLocaleString([], {
         day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit', second: '2-digit',
     });
+}
+
+// What one point on the chart covers. Measured off the data rather than
+// recomputed from the range, so this cannot drift away from the bucketing the
+// server actually applied - or misreport a node whose sampling interval is not
+// what this one's happens to be. The median gap, not the mean: a stretch where
+// the node was down would drag an average up.
+function resolutionLabel(data) {
+    if (data.length < 2) return '';
+    const gaps = [];
+    for (let i = 1; i < data.length; i++) gaps.push((parseTs(data[i].timestamp) - parseTs(data[i - 1].timestamp)) / 1000);
+    gaps.sort((a, b) => a - b);
+    const secs = Math.round(gaps[Math.floor(gaps.length / 2)]);
+    if (secs < 60) return secs + ' s samples';
+    return Math.round(secs / 60) + ' min averages';
 }
 
 function plural(n, word) { return n + ' ' + word + (n === 1 ? '' : 's'); }
@@ -1240,6 +1256,8 @@ async function loadDetail(id) {
     const data = await getJSON('/api/servers/' + encodeURIComponent(id) + '/metrics?hours=' + rangeHours);
     const empty = document.getElementById('detail-empty');
     const charts = document.getElementById('detail-charts');
+
+    document.getElementById('detail-resolution').textContent = resolutionLabel(data);
 
     if (!data.length) {
         empty.innerHTML = '<i class="bi bi-hourglass"></i><div>No samples in this range</div>';

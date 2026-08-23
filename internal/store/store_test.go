@@ -2,6 +2,7 @@ package store
 
 import (
 	"database/sql"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -106,5 +107,78 @@ func TestOpenIsIdempotent(t *testing.T) {
 	}
 	if !present {
 		t.Error("CpuTempC missing after reopen")
+	}
+}
+
+// A bucketed query is the dashboard's wide ranges, where the point of the
+// aggregate is that some columns cannot be averaged: a JSON document of drives
+// and a monotonic uptime counter have to come from one real sample, and the
+// query leans on a SQLite rule about bare columns to get them from the newest
+// one in the bucket. That rule is what this covers.
+func TestMetricsBucketedAveragesAndKeepsTheNewestSample(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "monitor.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	base := time.Date(2026, 8, 1, 10, 0, 0, 0, time.UTC)
+	samples := make([]model.Metric, 0, 24)
+	for i := range 24 {
+		m := model.Metric{
+			Timestamp:     model.At(base.Add(time.Duration(i) * 5 * time.Second)),
+			CpuPercent:    float64(i),
+			UptimeSeconds: float64(100 + i),
+			DisksJSON:     fmt.Sprintf(`[{"name":"/","tempC":%d}]`, i),
+		}
+		// Only the first minute has a temperature, so the second bucket covers
+		// the host that reports none: averaging nothing has to stay nil rather
+		// than become a zero the chart would draw as a cold drive.
+		if i < 12 {
+			temp := float64(50 + i)
+			m.CpuTempC = &temp
+		}
+		samples = append(samples, m)
+	}
+	if _, err := s.InsertMetrics("node-1", samples); err != nil {
+		t.Fatal(err)
+	}
+
+	since := model.At(base.Add(-time.Hour))
+
+	raw, err := s.MetricsBucketed("node-1", since, 0)
+	if err != nil {
+		t.Fatalf("bucket of zero: %v", err)
+	}
+	if len(raw) != 24 {
+		t.Errorf("bucket of zero returned %d samples, want the 24 stored", len(raw))
+	}
+
+	got, err := s.MetricsBucketed("node-1", since, time.Minute)
+	if err != nil {
+		t.Fatalf("one-minute buckets: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d buckets over two minutes of samples, want 2", len(got))
+	}
+
+	// Twelve samples numbered 0..11, then 12..23.
+	if got[0].CpuPercent != 5.5 || got[1].CpuPercent != 17.5 {
+		t.Errorf("bucket averages are %v and %v, want 5.5 and 17.5", got[0].CpuPercent, got[1].CpuPercent)
+	}
+	if got[0].UptimeSeconds != 111 {
+		t.Errorf("uptime is %v, want 111 from the newest sample in the bucket", got[0].UptimeSeconds)
+	}
+	if want := `[{"name":"/","tempC":11}]`; got[0].DisksJSON != want {
+		t.Errorf("disks are %s, want %s from the newest sample in the bucket", got[0].DisksJSON, want)
+	}
+	if want := base.Add(55 * time.Second); !got[0].Timestamp.Equal(want) {
+		t.Errorf("bucket is stamped %s, want %s, its newest sample", got[0].Timestamp, want)
+	}
+	if got[0].CpuTempC == nil || *got[0].CpuTempC != 55.5 {
+		t.Errorf("temperature is %v, want the 55.5 average", got[0].CpuTempC)
+	}
+	if got[1].CpuTempC != nil {
+		t.Errorf("temperature is %v over samples that reported none, want nil", *got[1].CpuTempC)
 	}
 }

@@ -266,9 +266,10 @@ func (s *Server) handleServers(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleServerMetrics(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	since := model.At(time.Now().Add(-hoursParam(r)))
+	window := hoursParam(r)
+	since := model.At(time.Now().Add(-window))
 
-	metrics, err := s.Store.MetricsSince(id, since)
+	metrics, err := s.Store.MetricsBucketed(id, since, bucketFor(window))
 	if err != nil {
 		s.fail(w, "server metrics", err)
 		return
@@ -513,6 +514,29 @@ func hoursParam(r *http.Request) time.Duration {
 		hours = 24
 	}
 	return time.Duration(max(1, min(hours, 168))) * time.Hour
+}
+
+// maxPoints is roughly how many samples a chart in the dashboard should have
+// to draw. Chosen for the eye rather than the renderer: past a few hundred
+// points a line is denser than the plot is wide, so the extra samples cost
+// time without showing anything.
+const maxPoints = 360
+
+// bucketFor picks how wide a metric bucket has to be for a window of this
+// length to stay that size. An hour is served raw, because the live view is
+// the one place the five-second cadence is the point; every longer window is
+// rounded up to a bucket a person can name, so the tooltip reads as "one of
+// the fifteen-minute averages" rather than an arbitrary span.
+func bucketFor(window time.Duration) time.Duration {
+	if window <= time.Hour {
+		return 0
+	}
+	for _, bucket := range []time.Duration{time.Minute, 5 * time.Minute, 15 * time.Minute, 30 * time.Minute} {
+		if window/maxPoints <= bucket {
+			return bucket
+		}
+	}
+	return time.Hour
 }
 
 func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {

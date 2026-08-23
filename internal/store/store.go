@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/m0n5ter/m0nit0r/internal/model"
 	_ "modernc.org/sqlite" // pure-Go driver, registered as "sqlite"
@@ -352,6 +353,47 @@ func (s *Store) MetricsSince(serverID string, since model.Time) ([]model.Metric,
 		m, err := scanMetric(rows)
 		if err != nil {
 			return nil, fmt.Errorf("scan metric: %w", err)
+		}
+		metrics = append(metrics, m)
+	}
+	return metrics, rows.Err()
+}
+
+// MetricsBucketed returns a server's samples from since onwards, oldest first,
+// averaged into buckets of the given width. A bucket of zero returns the raw
+// samples. It exists because the wide ranges are otherwise unusable: a week of
+// five-second samples is over a hundred thousand points per chart, which the
+// browser spends its time drawing and no eye can read.
+//
+// Readings worth averaging are averaged; the rest come from the newest sample
+// in the bucket, which is what the bare "UptimeSeconds" and "DisksJson"
+// columns select. SQLite fills a bare column from the row that produced the
+// query's single min() or max() aggregate - here MAX("Timestamp"). A second
+// min() or max() would leave which row that is undefined, so the uptime has to
+// stay a bare column rather than becoming a MAX of its own.
+func (s *Store) MetricsBucketed(serverID string, since model.Time, bucket time.Duration) ([]model.Metric, error) {
+	seconds := int64(bucket / time.Second)
+	if seconds <= 0 {
+		return s.MetricsSince(serverID, since)
+	}
+
+	rows, err := s.db.Query(`
+		SELECT MAX("Timestamp"),AVG("CpuPercent"),AVG("CpuTempC"),AVG("MemoryPercent"),
+		       AVG("MemoryTotalMb"),AVG("MemoryUsedMb"),"UptimeSeconds","DisksJson"
+		FROM "MetricSnapshots"
+		WHERE "ServerId"=? AND "Timestamp">=?
+		GROUP BY CAST(strftime('%s',"Timestamp") AS INTEGER)/?
+		ORDER BY 1`, serverID, since.DB(), seconds)
+	if err != nil {
+		return nil, fmt.Errorf("metrics bucketed: %w", err)
+	}
+	defer rows.Close()
+
+	metrics := []model.Metric{}
+	for rows.Next() {
+		m, err := scanMetric(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan bucketed metric: %w", err)
 		}
 		metrics = append(metrics, m)
 	}
