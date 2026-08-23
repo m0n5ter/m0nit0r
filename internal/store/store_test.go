@@ -2,18 +2,19 @@ package store
 
 import (
 	"database/sql"
-	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/m0n5ter/m0nit0r/internal/model"
 )
 
-// preTemperatureSchema is MetricSnapshots as an earlier build created it. A
-// deployed node opens the database it already has, so the upgrade path over a
-// table without the temperature column is the one that has to keep working.
-const preTemperatureSchema = `
+// legacySchema is MetricSnapshots as builds before the disk split created it:
+// the volumes of a sample encoded as a JSON document in a column that is NOT
+// NULL. Nothing fills that column now, so every insert against such a database
+// would fail, and a node would keep running while storing nothing.
+const legacySchema = `
 CREATE TABLE "MetricSnapshots" (
     "Id"            INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
     "ServerId"      TEXT NOT NULL,
@@ -26,19 +27,16 @@ CREATE TABLE "MetricSnapshots" (
     "DisksJson"     TEXT NOT NULL
 );`
 
-func TestOpenMigratesExistingDatabase(t *testing.T) {
+// There is no migration off that schema by design, so the contract is that the
+// file is refused, loudly, and left untouched for its owner to delete.
+func TestOpenRefusesADatabaseThatStoresDisksAsJSON(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "monitor.db")
 
 	existing, err := sql.Open("sqlite", path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := existing.Exec(preTemperatureSchema); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := existing.Exec(`INSERT INTO "MetricSnapshots"
-		("ServerId","Timestamp","CpuPercent","MemoryPercent","MemoryTotalMb","MemoryUsedMb","UptimeSeconds","DisksJson")
-		VALUES ('node-1','2026-08-01 10:00:00.0000000',11.5,40,1000,400,3600,'[]')`); err != nil {
+	if _, err := existing.Exec(legacySchema); err != nil {
 		t.Fatal(err)
 	}
 	if err := existing.Close(); err != nil {
@@ -46,44 +44,34 @@ func TestOpenMigratesExistingDatabase(t *testing.T) {
 	}
 
 	s, err := Open(path)
-	if err != nil {
-		t.Fatalf("Open on a pre-temperature database: %v", err)
+	if err == nil {
+		s.Close()
+		t.Fatal("Open accepted a database whose MetricSnapshots still carries DisksJson")
 	}
-	defer s.Close()
-
-	temp := 61.5
-	if _, err := s.InsertMetrics("node-1", []model.Metric{{
-		Timestamp:  model.Now(),
-		CpuPercent: 22,
-		CpuTempC:   &temp,
-		DisksJSON:  `[{"name":"/","tempC":38}]`,
-	}}); err != nil {
-		t.Fatalf("insert after migration: %v", err)
+	if !strings.Contains(err.Error(), "MetricDisks") {
+		t.Errorf("error is %q, want it to name the table that replaced the column", err)
 	}
 
-	metrics, err := s.MetricsSince("node-1", model.At(time.Now().Add(-30*24*time.Hour)))
+	// Refused, not rewritten: an operator who reads the message and decides to
+	// keep the file has to still have it.
+	reopened, err := sql.Open("sqlite", path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(metrics) != 2 {
-		t.Fatalf("got %d metrics, want the pre-existing row and the new one", len(metrics))
-	}
+	defer reopened.Close()
 
-	// The row written before the column existed reads back as no measurement
-	// rather than as zero degrees.
-	if metrics[0].CpuTempC != nil {
-		t.Errorf("pre-existing row: CpuTempC = %v, want nil", *metrics[0].CpuTempC)
+	var n int
+	if err := reopened.QueryRow(
+		`SELECT COUNT(*) FROM "sqlite_master" WHERE "type"='table' AND "name"='MetricDisks'`).Scan(&n); err != nil {
+		t.Fatal(err)
 	}
-	if metrics[1].CpuTempC == nil {
-		t.Fatal("new row: CpuTempC = nil, want 61.5")
-	}
-	if *metrics[1].CpuTempC != temp {
-		t.Errorf("new row: CpuTempC = %v, want %v", *metrics[1].CpuTempC, temp)
+	if n != 0 {
+		t.Error("the refused database was given a MetricDisks table anyway")
 	}
 }
 
-// TestOpenIsIdempotent covers the ordinary restart, where the column the
-// migration adds is already there.
+// TestOpenIsIdempotent covers the ordinary restart, where every table the
+// schema declares is already there.
 func TestOpenIsIdempotent(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "monitor.db")
 
@@ -129,7 +117,7 @@ func TestMetricsBucketedAveragesAndKeepsTheNewestSample(t *testing.T) {
 			Timestamp:     model.At(base.Add(time.Duration(i) * 5 * time.Second)),
 			CpuPercent:    float64(i),
 			UptimeSeconds: float64(100 + i),
-			DisksJSON:     fmt.Sprintf(`[{"name":"/","tempC":%d}]`, i),
+			Disks:         []model.Disk{{Name: "/", TotalGb: 100, UsedGb: float64(i), UsagePercent: float64(i)}},
 		}
 		// Only the first minute has a temperature, so the second bucket covers
 		// the host that reports none: averaging nothing has to stay nil rather
@@ -169,8 +157,8 @@ func TestMetricsBucketedAveragesAndKeepsTheNewestSample(t *testing.T) {
 	if got[0].UptimeSeconds != 111 {
 		t.Errorf("uptime is %v, want 111 from the newest sample in the bucket", got[0].UptimeSeconds)
 	}
-	if want := `[{"name":"/","tempC":11}]`; got[0].DisksJSON != want {
-		t.Errorf("disks are %s, want %s from the newest sample in the bucket", got[0].DisksJSON, want)
+	if len(got[0].Disks) != 1 || got[0].Disks[0].UsedGb != 11 {
+		t.Errorf("disks are %+v, want the single volume of the newest sample in the bucket, at 11 GB used", got[0].Disks)
 	}
 	if want := base.Add(55 * time.Second); !got[0].Timestamp.Equal(want) {
 		t.Errorf("bucket is stamped %s, want %s, its newest sample", got[0].Timestamp, want)

@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/m0n5ter/m0nit0r/internal/model"
@@ -32,12 +33,31 @@ CREATE TABLE IF NOT EXISTS "MetricSnapshots" (
     "MemoryPercent" REAL NOT NULL,
     "MemoryTotalMb" REAL NOT NULL,
     "MemoryUsedMb"  REAL NOT NULL,
-    "UptimeSeconds" REAL NOT NULL,
-    "DisksJson"     TEXT NOT NULL
+    "UptimeSeconds" REAL NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS "IX_MetricSnapshots_ServerId_Timestamp"
     ON "MetricSnapshots" ("ServerId", "Timestamp");
+
+-- One row per volume in a snapshot. A host's drives come and go - a USB disk
+-- appears, an array is unmounted - so they cannot be columns on the snapshot,
+-- and a JSON blob in one made them unqueryable and unaggregatable. The
+-- reference is declarative: nothing enables foreign_keys, and Prune deletes
+-- these rows itself rather than relying on a pragma that a reconnect would
+-- silently drop.
+CREATE TABLE IF NOT EXISTS "MetricDisks" (
+    "Id"           INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+    "MetricId"     INTEGER NOT NULL REFERENCES "MetricSnapshots"("Id") ON DELETE CASCADE,
+    "Name"         TEXT NOT NULL,
+    "TotalGb"      REAL NOT NULL,
+    "UsedGb"       REAL NOT NULL,
+    "FreeGb"       REAL NOT NULL,
+    "UsagePercent" REAL NOT NULL,
+    "TempC"        REAL NULL
+);
+
+CREATE INDEX IF NOT EXISTS "IX_MetricDisks_MetricId"
+    ON "MetricDisks" ("MetricId");
 
 CREATE TABLE IF NOT EXISTS "AvailabilityRecords" (
     "Id"           INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
@@ -82,44 +102,37 @@ func Open(path string) (*Store, error) {
 		}
 	}
 
+	// Checked before the schema is touched, so a database this build cannot
+	// use is left exactly as it was found. One written before the disks moved
+	// into their own table still carries them as a NOT NULL column that
+	// nothing here fills, and every insert would fail against it - one sample
+	// at a time, every few seconds, while the node went on looking healthy.
+	//
+	// There is deliberately no migration: retention keeps a week at most, so
+	// the history is cheap to lose and not worth the code to carry across.
+	// Dropping the tables unasked would be worse than refusing, though, so
+	// this says what it found and leaves the file for its owner to remove.
+	legacy, err := hasColumn(db, "MetricSnapshots", "DisksJson")
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	if legacy {
+		db.Close()
+		return nil, fmt.Errorf("%s stores disks as JSON, which this build replaced with the "+
+			"MetricDisks table; delete the file (and its -wal and -shm) to start clean", path)
+	}
+
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("create schema: %w", err)
 	}
 
-	if err := migrate(db); err != nil {
-		db.Close()
-		return nil, err
-	}
-
 	return &Store{db: db}, nil
 }
 
-// migrations are columns added after the schema above was first shipped. A
-// CREATE TABLE IF NOT EXISTS leaves an existing table exactly as it is, so a
-// database created by an earlier build needs them added explicitly. Each is
-// nullable, which is what lets rows recorded before the column existed stay
-// distinguishable from rows whose sensor reported nothing.
-var migrations = []struct{ table, column, ddl string }{
-	{"MetricSnapshots", "CpuTempC", `ALTER TABLE "MetricSnapshots" ADD COLUMN "CpuTempC" REAL NULL`},
-}
-
-func migrate(db *sql.DB) error {
-	for _, m := range migrations {
-		present, err := hasColumn(db, m.table, m.column)
-		if err != nil {
-			return err
-		}
-		if present {
-			continue
-		}
-		if _, err := db.Exec(m.ddl); err != nil {
-			return fmt.Errorf("add %s.%s: %w", m.table, m.column, err)
-		}
-	}
-	return nil
-}
-
+// hasColumn reports whether a table already carries a column, which is how a
+// database written by an earlier build is recognised.
 func hasColumn(db *sql.DB, table, column string) (bool, error) {
 	var n int
 	err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info(?) WHERE "name"=?`, table, column).Scan(&n)
@@ -259,7 +272,9 @@ func scanServer(sc scanner) (model.Server, error) {
 
 // ── Metrics ─────────────────────────────────────────────────────────────────
 
-// InsertMetrics appends samples for serverID and reports how many were written.
+// InsertMetrics appends samples for serverID and reports how many were
+// written. A sample's volumes go in the same transaction, so a snapshot never
+// exists without the disks it reported.
 func (s *Store) InsertMetrics(serverID string, metrics []model.Metric) (int, error) {
 	if len(metrics) == 0 {
 		return 0, nil
@@ -271,23 +286,39 @@ func (s *Store) InsertMetrics(serverID string, metrics []model.Metric) (int, err
 	}
 	defer tx.Rollback()
 
-	stmt, err := tx.Prepare(`
+	snapshots, err := tx.Prepare(`
 		INSERT INTO "MetricSnapshots"
-			("ServerId","Timestamp","CpuPercent","CpuTempC","MemoryPercent","MemoryTotalMb","MemoryUsedMb","UptimeSeconds","DisksJson")
-		VALUES (?,?,?,?,?,?,?,?,?)`)
+			("ServerId","Timestamp","CpuPercent","CpuTempC","MemoryPercent","MemoryTotalMb","MemoryUsedMb","UptimeSeconds")
+		VALUES (?,?,?,?,?,?,?,?)`)
 	if err != nil {
 		return 0, fmt.Errorf("prepare metric insert: %w", err)
 	}
-	defer stmt.Close()
+	defer snapshots.Close()
+
+	volumes, err := tx.Prepare(`
+		INSERT INTO "MetricDisks"
+			("MetricId","Name","TotalGb","UsedGb","FreeGb","UsagePercent","TempC")
+		VALUES (?,?,?,?,?,?,?)`)
+	if err != nil {
+		return 0, fmt.Errorf("prepare disk insert: %w", err)
+	}
+	defer volumes.Close()
 
 	for _, m := range metrics {
-		disks := m.DisksJSON
-		if disks == "" {
-			disks = "[]"
-		}
-		if _, err := stmt.Exec(serverID, m.Timestamp.DB(), m.CpuPercent, m.CpuTempC, m.MemoryPercent,
-			m.MemoryTotalMb, m.MemoryUsedMb, m.UptimeSeconds, disks); err != nil {
+		res, err := snapshots.Exec(serverID, m.Timestamp.DB(), m.CpuPercent, m.CpuTempC, m.MemoryPercent,
+			m.MemoryTotalMb, m.MemoryUsedMb, m.UptimeSeconds)
+		if err != nil {
 			return 0, fmt.Errorf("insert metric: %w", err)
+		}
+		id, err := res.LastInsertId()
+		if err != nil {
+			return 0, fmt.Errorf("metric id: %w", err)
+		}
+		for _, disk := range m.Disks {
+			if _, err := volumes.Exec(id, disk.Name, disk.TotalGb, disk.UsedGb, disk.FreeGb,
+				disk.UsagePercent, disk.TempC); err != nil {
+				return 0, fmt.Errorf("insert disk %q: %w", disk.Name, err)
+			}
 		}
 	}
 
@@ -321,42 +352,30 @@ func (s *Store) MaxMetricTimestamp(serverID string) (model.Time, bool, error) {
 
 // LatestMetric returns the newest sample for a server, or nil if there is none.
 func (s *Store) LatestMetric(serverID string) (*model.Metric, error) {
-	row := s.db.QueryRow(`
-		SELECT "Timestamp","CpuPercent","CpuTempC","MemoryPercent","MemoryTotalMb","MemoryUsedMb","UptimeSeconds","DisksJson"
+	metrics, err := s.queryMetrics(`
+		SELECT "Id","Timestamp","CpuPercent","CpuTempC","MemoryPercent","MemoryTotalMb","MemoryUsedMb","UptimeSeconds"
 		FROM "MetricSnapshots" WHERE "ServerId"=?
 		ORDER BY "Timestamp" DESC LIMIT 1`, serverID)
-
-	m, err := scanMetric(row)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
-	}
 	if err != nil {
 		return nil, fmt.Errorf("latest metric %s: %w", serverID, err)
 	}
-	return &m, nil
+	if len(metrics) == 0 {
+		return nil, nil
+	}
+	return &metrics[0], nil
 }
 
 // MetricsSince returns a server's samples from since onwards, oldest first.
 func (s *Store) MetricsSince(serverID string, since model.Time) ([]model.Metric, error) {
-	rows, err := s.db.Query(`
-		SELECT "Timestamp","CpuPercent","CpuTempC","MemoryPercent","MemoryTotalMb","MemoryUsedMb","UptimeSeconds","DisksJson"
+	metrics, err := s.queryMetrics(`
+		SELECT "Id","Timestamp","CpuPercent","CpuTempC","MemoryPercent","MemoryTotalMb","MemoryUsedMb","UptimeSeconds"
 		FROM "MetricSnapshots"
 		WHERE "ServerId"=? AND "Timestamp">=?
 		ORDER BY "Timestamp"`, serverID, since.DB())
 	if err != nil {
 		return nil, fmt.Errorf("metrics since: %w", err)
 	}
-	defer rows.Close()
-
-	metrics := []model.Metric{}
-	for rows.Next() {
-		m, err := scanMetric(rows)
-		if err != nil {
-			return nil, fmt.Errorf("scan metric: %w", err)
-		}
-		metrics = append(metrics, m)
-	}
-	return metrics, rows.Err()
+	return metrics, nil
 }
 
 // MetricsBucketed returns a server's samples from since onwards, oldest first,
@@ -366,55 +385,132 @@ func (s *Store) MetricsSince(serverID string, since model.Time) ([]model.Metric,
 // browser spends its time drawing and no eye can read.
 //
 // Readings worth averaging are averaged; the rest come from the newest sample
-// in the bucket, which is what the bare "UptimeSeconds" and "DisksJson"
-// columns select. SQLite fills a bare column from the row that produced the
-// query's single min() or max() aggregate - here MAX("Timestamp"). A second
-// min() or max() would leave which row that is undefined, so the uptime has to
-// stay a bare column rather than becoming a MAX of its own.
+// in the bucket, which is what the bare "UptimeSeconds" and "Id" columns
+// select. SQLite fills a bare column from the row that produced the query's
+// single min() or max() aggregate - here MAX("Timestamp"). A second min() or
+// max() would leave which row that is undefined, so the uptime has to stay a
+// bare column rather than becoming a MAX of its own. The id carries that same
+// row's volumes, so the disks reported for a bucket are one real reading
+// rather than a blend of drives that were never mounted at the same time.
 func (s *Store) MetricsBucketed(serverID string, since model.Time, bucket time.Duration) ([]model.Metric, error) {
 	seconds := int64(bucket / time.Second)
 	if seconds <= 0 {
 		return s.MetricsSince(serverID, since)
 	}
 
-	rows, err := s.db.Query(`
-		SELECT MAX("Timestamp"),AVG("CpuPercent"),AVG("CpuTempC"),AVG("MemoryPercent"),
-		       AVG("MemoryTotalMb"),AVG("MemoryUsedMb"),"UptimeSeconds","DisksJson"
+	metrics, err := s.queryMetrics(`
+		SELECT "Id",MAX("Timestamp"),AVG("CpuPercent"),AVG("CpuTempC"),AVG("MemoryPercent"),
+		       AVG("MemoryTotalMb"),AVG("MemoryUsedMb"),"UptimeSeconds"
 		FROM "MetricSnapshots"
 		WHERE "ServerId"=? AND "Timestamp">=?
 		GROUP BY CAST(strftime('%s',"Timestamp") AS INTEGER)/?
-		ORDER BY 1`, serverID, since.DB(), seconds)
+		ORDER BY MAX("Timestamp")`, serverID, since.DB(), seconds)
 	if err != nil {
 		return nil, fmt.Errorf("metrics bucketed: %w", err)
 	}
-	defer rows.Close()
-
-	metrics := []model.Metric{}
-	for rows.Next() {
-		m, err := scanMetric(rows)
-		if err != nil {
-			return nil, fmt.Errorf("scan bucketed metric: %w", err)
-		}
-		metrics = append(metrics, m)
-	}
-	return metrics, rows.Err()
+	return metrics, nil
 }
 
-func scanMetric(sc scanner) (model.Metric, error) {
+// queryMetrics runs a statement selecting the columns scanMetric expects, the
+// row id first, and fills in each sample's volumes.
+func (s *Store) queryMetrics(query string, args ...any) ([]model.Metric, error) {
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	ids := []int64{}
+	metrics := []model.Metric{}
+	for rows.Next() {
+		id, m, err := scanMetric(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan metric: %w", err)
+		}
+		ids = append(ids, id)
+		metrics = append(metrics, m)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := s.attachDisks(ids, metrics); err != nil {
+		return nil, err
+	}
+	return metrics, nil
+}
+
+// diskBatch caps how many ids go into one IN clause. SQLite's older default
+// parameter limit is 999, and a raw hour of five-second samples already spends
+// most of that.
+const diskBatch = 500
+
+// attachDisks fills in the volumes of each sample, where ids[i] identifies
+// metrics[i]. Batched rather than queried per sample: a chart's range is
+// hundreds of samples, and asking for each one's disks separately is the usual
+// N+1.
+func (s *Store) attachDisks(ids []int64, metrics []model.Metric) error {
+	byMetric := make(map[int64][]model.Disk, len(ids))
+
+	for start := 0; start < len(ids); start += diskBatch {
+		batch := ids[start:min(start+diskBatch, len(ids))]
+
+		args := make([]any, len(batch))
+		for i, id := range batch {
+			args[i] = id
+		}
+
+		rows, err := s.db.Query(`
+			SELECT "MetricId","Name","TotalGb","UsedGb","FreeGb","UsagePercent","TempC"
+			FROM "MetricDisks"
+			WHERE "MetricId" IN (`+strings.TrimPrefix(strings.Repeat(",?", len(batch)), ",")+`)
+			ORDER BY "Id"`, args...)
+		if err != nil {
+			return fmt.Errorf("query disks: %w", err)
+		}
+
+		for rows.Next() {
+			var (
+				metricID int64
+				disk     model.Disk
+			)
+			if err := rows.Scan(&metricID, &disk.Name, &disk.TotalGb, &disk.UsedGb,
+				&disk.FreeGb, &disk.UsagePercent, &disk.TempC); err != nil {
+				rows.Close()
+				return fmt.Errorf("scan disk: %w", err)
+			}
+			byMetric[metricID] = append(byMetric[metricID], disk)
+		}
+		// Closed here rather than deferred: this runs once per batch, and a
+		// deferred close would hold every batch open until the function ended.
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			return fmt.Errorf("read disks: %w", err)
+		}
+	}
+
+	for i, id := range ids {
+		metrics[i].Disks = byMetric[id]
+	}
+	return nil
+}
+
+func scanMetric(sc scanner) (int64, model.Metric, error) {
 	var (
 		m  model.Metric
+		id int64
 		ts string
 	)
-	if err := sc.Scan(&ts, &m.CpuPercent, &m.CpuTempC, &m.MemoryPercent, &m.MemoryTotalMb,
-		&m.MemoryUsedMb, &m.UptimeSeconds, &m.DisksJSON); err != nil {
-		return model.Metric{}, err
+	if err := sc.Scan(&id, &ts, &m.CpuPercent, &m.CpuTempC, &m.MemoryPercent, &m.MemoryTotalMb,
+		&m.MemoryUsedMb, &m.UptimeSeconds); err != nil {
+		return 0, model.Metric{}, err
 	}
 	t, err := model.ParseDB(ts)
 	if err != nil {
-		return model.Metric{}, err
+		return 0, model.Metric{}, err
 	}
 	m.Timestamp = t
-	return m, nil
+	return id, m, nil
 }
 
 // ── Availability ────────────────────────────────────────────────────────────
@@ -546,6 +642,13 @@ func (s *Store) queryAvailability(query string, args ...any) ([]AvailabilityRow,
 
 // Prune deletes metric and availability rows older than cutoff.
 func (s *Store) Prune(cutoff model.Time) error {
+	// Before their snapshots: once the rows identifying them are gone, the
+	// volumes cannot be found to delete.
+	if _, err := s.db.Exec(`
+		DELETE FROM "MetricDisks"
+		WHERE "MetricId" IN (SELECT "Id" FROM "MetricSnapshots" WHERE "Timestamp"<?)`, cutoff.DB()); err != nil {
+		return fmt.Errorf("prune disks: %w", err)
+	}
 	if _, err := s.db.Exec(`DELETE FROM "MetricSnapshots" WHERE "Timestamp"<?`, cutoff.DB()); err != nil {
 		return fmt.Errorf("prune metrics: %w", err)
 	}

@@ -139,6 +139,12 @@ the binary and a per-node configuration over SSH, installs the systemd unit or W
 service, and restarts it. `server-id.txt` and `monitor.db` are never overwritten, so
 nodes keep their identity and history across deployments.
 
+The one exception is a schema the agent cannot use. Rather than migrate, it refuses to
+open such a database and names the file, because a node that starts and then fails
+every insert looks healthy while recording nothing. Retention keeps a week at most, so
+the fix is to stop the service, delete `monitor.db` and its `-wal` and `-shm` files,
+and deploy: the node keeps its id, and `-Mesh` puts the peers back.
+
 ```powershell
 .\deploy\Deploy-M0nit0r.ps1 -Mesh                   # all nodes, then introduce them
 .\deploy\Deploy-M0nit0r.ps1 -Mesh -RestrictFirewall # ...and admit only the nodes

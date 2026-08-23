@@ -792,9 +792,11 @@ function tempTag(v, limits) {
     return ' <span class="temp ' + cls + '">' + v.toFixed(0) + '°</span>';
 }
 
-function parseDisks(metric) {
-    try { return JSON.parse(metric?.disksJson || '[]'); } catch { return []; }
-}
+// The volumes a sample reported, as their own rows on the server rather than a
+// JSON document to unpack here. A sample can carry none - a host with no fixed
+// volume, or one whose peer is mid-upgrade - so an absent field reads as empty
+// rather than throwing halfway through a render.
+function disksOf(metric) { return metric?.disks ?? []; }
 
 function stats(values) {
     const nums = values.filter(v => v != null);
@@ -856,7 +858,7 @@ function railColor(s) {
     if (!s.isOnline) return nodeState(s) === 'unknown' ? 'transparent' : C.danger;
     const l = s.latest;
     if (!l) return 'transparent';
-    const worst = Math.max(l.cpuPercent, l.memoryPercent, ...parseDisks(l).map(d => d.usagePercent));
+    const worst = Math.max(l.cpuPercent, l.memoryPercent, ...disksOf(l).map(d => d.usagePercent));
     if (worst >= LOAD.danger) return C.danger;
     if (tempClass(l.cpuTempC, CPU_TEMP) === 'danger') return C.danger;
     if (worst >= LOAD.warn) return C.warn;
@@ -903,7 +905,7 @@ function gaugesHTML(l) {
 }
 
 function disksHTML(l) {
-    return parseDisks(l).map(d => {
+    return disksOf(l).map(d => {
         const color = d.usagePercent >= LOAD.danger ? C.danger : d.usagePercent >= LOAD.warn ? C.warn : C.accent;
         return '<div class="disk-row" title="' + esc(d.name) + ' — ' + d.usedGb.toFixed(0) + ' of ' +
             d.totalGb.toFixed(0) + ' GB used">' +
@@ -1292,7 +1294,7 @@ async function loadDetail(id) {
 // leaves a gap rather than a drop to zero.
 function renderTemperatures(labels, stamps, data) {
     const block = document.getElementById('temp-series');
-    const disks = data.map(parseDisks);
+    const disks = data.map(disksOf);
     const series = [];
 
     const cpu = data.map(d => d.cpuTempC ?? null);

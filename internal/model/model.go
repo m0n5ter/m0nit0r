@@ -104,9 +104,10 @@ type Server struct {
 	LastSeen Time   `json:"lastSeen"`
 }
 
-// Metric is a stored sample, for either this server or a peer. Disk
-// temperatures travel inside DisksJSON rather than as columns of their own,
-// since the set of drives varies per host.
+// Metric is a stored sample, for either this server or a peer. The volumes are
+// a slice rather than columns of their own because the set of drives varies
+// per host and changes under it; they are stored one row per volume, in
+// MetricDisks.
 type Metric struct {
 	Timestamp     Time     `json:"timestamp"`
 	CpuPercent    float64  `json:"cpuPercent"`
@@ -115,7 +116,7 @@ type Metric struct {
 	MemoryTotalMb float64  `json:"memoryTotalMb"`
 	MemoryUsedMb  float64  `json:"memoryUsedMb"`
 	UptimeSeconds float64  `json:"uptimeSeconds"`
-	DisksJSON     string   `json:"disksJson"`
+	Disks         []Disk   `json:"disks"`
 }
 
 // Availability is one reachability observation from one server to another.

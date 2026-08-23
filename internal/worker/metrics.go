@@ -4,7 +4,6 @@ package worker
 
 import (
 	"context"
-	"encoding/json"
 	"log/slog"
 	"time"
 
@@ -57,11 +56,6 @@ func (w *Metrics) Run(ctx context.Context) {
 func (w *Metrics) collect() error {
 	snap := w.Collector.Collect()
 
-	disks, err := json.Marshal(snap.Disks)
-	if err != nil {
-		return err
-	}
-
 	now := model.Now()
 	if _, err := w.Store.InsertMetrics(w.ServerID, []model.Metric{{
 		Timestamp:     now,
@@ -71,7 +65,7 @@ func (w *Metrics) collect() error {
 		MemoryTotalMb: snap.MemoryTotalMb,
 		MemoryUsedMb:  snap.MemoryUsedMb,
 		UptimeSeconds: snap.UptimeSeconds,
-		DisksJSON:     string(disks),
+		Disks:         snap.Disks,
 	}}); err != nil {
 		return err
 	}
