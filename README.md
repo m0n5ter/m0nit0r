@@ -142,7 +142,7 @@ nodes keep their identity and history across deployments.
 ```powershell
 .\deploy\Deploy-M0nit0r.ps1 -Mesh                   # all nodes, then introduce them
 .\deploy\Deploy-M0nit0r.ps1 -Mesh -RestrictFirewall # ...and admit only the nodes
-.\deploy\Deploy-M0nit0r.ps1 -Only home-pc           # one node
+.\deploy\Deploy-M0nit0r.ps1 -Only Proxmox           # one node
 ```
 
 `-RestrictFirewall` narrows the listening port to the nodes' own addresses instead of
@@ -172,8 +172,24 @@ gitignored. Every node is deployed with the same value.
 
 Edit the `$Nodes` block at the top of the script to change the inventory. The
 site-specific addresses sit directly above it: the public address peers use to reach
-the NAT'd node, the LAN address the router forwards to, and the router itself. They
-are declared rather than detected, so update them if the ISP or the LAN changes.
+the NAT'd nodes, the LAN address the router forwards to for each of them, and the
+router itself. They are declared rather than detected, so update them if the ISP or
+the LAN changes.
+
+Two of the nodes are at home behind that one public address, so the router publishes
+a different external port for each and translates it onto the port the agent binds.
+Every node listens on `ListenPort`; only the forwarding rules tell the two apart. A
+node's `PublicUrl` therefore carries the external port while its `appsettings.json`
+carries the internal one, and the script prints the rules it depends on at the end of
+every run.
+
+Those two also reach each other through that same public address, because a node
+advertises one address to the whole mesh and re-asserts it on every sync — there is
+no second, local address a peer could learn instead. So the router has to hairpin the
+connection. If every edge of the matrix is green except the one between the two
+machines standing a metre apart, that is why; their LAN addresses are already in the
+firewall allowlist, for the case where the router hairpins without rewriting the
+source.
 
 Run the script unelevated: the Linux nodes are reached with your own SSH keys, and
 only the Windows service and firewall steps elevate, in a separate process.

@@ -77,7 +77,7 @@
     .\deploy\Deploy-M0nit0r.ps1 -Mesh -RestrictFirewall
 
 .EXAMPLE
-    .\deploy\Deploy-M0nit0r.ps1 -Only home-pc
+    .\deploy\Deploy-M0nit0r.ps1 -Only Proxmox
 #>
 [CmdletBinding()]
 param(
@@ -96,25 +96,41 @@ Set-StrictMode -Version Latest
 
 # ── Node inventory ──────────────────────────────────────────────────────────
 # Edit Location to taste. PublicUrl is how *other* nodes reach this one, which
-# is not necessarily the address you administer it from.
+# is not necessarily the address you administer it from. A node may also
+# declare AllowedSource when the address peers see it connecting from cannot be
+# worked out by resolving that URL from here.
 
 $ListenPort = 5001
 
-# This machine sits behind NAT, and its traffic is asymmetric: peers reach it
-# through the router, while its own outbound connections leave over a VPN and
-# arrive at the peers from a different address. Both have to be declared, and
-# neither can be inferred from here, which is why observing the source address
-# of an outgoing SSH session reported the wrong one.
+# Two nodes sit behind the same NAT at home: this machine and the Proxmox host.
+# One public address serves both, so the router publishes a different external
+# port for each and translates it onto $ListenPort, which every agent binds.
+# The port a peer dials is therefore not the port the agent listens on.
+#
+# This machine's traffic is asymmetric on top of that: peers reach it through
+# the router, while its own outbound connections leave over a VPN and arrive at
+# the peers from a different address. Both have to be declared, and neither can
+# be inferred from here, which is why observing the source address of an
+# outgoing SSH session reported the wrong one. The Proxmox host has no such
+# tunnel and egresses through the router, so peers see it at $HomePublicAddress.
 $HomePublicAddress = '185.51.62.152'    # inbound: what peers connect to, forwarded by the router
 $HomeEgressAddress = '185.219.132.26'   # outbound: what peers see this machine connecting from
-$HomeLanAddress    = '192.168.1.15'     # where the router must forward it
+$HomeLanAddress    = '192.168.1.15'     # this machine, where external 5001 is forwarded
+$ProxmoxLanAddress = '192.168.1.11'     # the Proxmox host, where external 5002 is forwarded
+$ProxmoxPublicPort = 5002               # external 5001 already belongs to this machine
 $RouterAddress     = '192.168.1.1'
 
 # Sources to admit beyond the nodes' own published addresses. The egress
 # address belongs here rather than in -AllowFrom: leaving it out of a run would
 # silently cut this machine's outbound sync, which looks like a dead peer
 # rather than a firewall rule.
-$AdditionalAllowedSources = @($HomeEgressAddress)
+#
+# The two LAN addresses are here for the same reason. The home nodes reach each
+# other by dialling the router's own public address, and a router that hairpins
+# that connection without rewriting its source delivers it from 192.168.1.x -
+# an address no node publishes. Leaving them out would make the one hop that
+# never leaves the building the only broken edge in the matrix.
+$AdditionalAllowedSources = @($HomeEgressAddress, $HomeLanAddress, $ProxmoxLanAddress)
 
 # Collection and sync intervals for a deployment spread across the internet.
 # The application's own defaults (5s and 10s) are tuned for a local test mesh
@@ -144,15 +160,26 @@ $LhmTask    = 'm0nit0r LibreHardwareMonitor'
 
 $Nodes = @(
     [ordered]@{
-        Name      = 'mouseacceleration'
+        Name      = 'MAcc'
         Kind      = 'linux'
-        SshHost   = 'm0n5ter@mouseacceleration.com'
+        # Addressed by literal, for SSH and for the peers alike. The VPN this
+        # machine's DNS goes through answers mouseacceleration.com with
+        # 198.18.0.27 - RFC 2544 benchmarking space, the placeholder a
+        # split-tunnel client hands back for a name it only ever resolves at
+        # the far end. That is a property of the resolver running this script
+        # rather than of the node, so every address derived from the name here
+        # was wrong: the firewall allowlist above all, silently. 24.144.97.48
+        # is what public resolvers answer and what the peers actually see.
+        # Update it by hand if the host moves; nothing here will notice.
+        SshHost   = 'm0n5ter@24.144.97.48'
         SshPort   = 22
+        # The name lives on as the label, which is the one place it cannot
+        # resolve to the wrong thing.
         Location  = 'mouseacceleration.com'
-        PublicUrl = "http://mouseacceleration.com:$ListenPort"
+        PublicUrl = "http://24.144.97.48:$ListenPort"
     }
     [ordered]@{
-        Name      = 'vps-45-38'
+        Name      = 'VPS-DE'
         Kind      = 'linux'
         SshHost   = 'm0n5ter@45.38.190.118'
         SshPort   = 2222
@@ -160,15 +187,32 @@ $Nodes = @(
         PublicUrl = "http://45.38.190.118:$ListenPort"
     }
     [ordered]@{
-        Name      = 'MONSTER-PC'
+        Name      = 'Mon-PC'
         Kind      = 'windows-local'
         Location  = 'Home'
         # Reachable only once the router forwards $ListenPort to this machine.
         PublicUrl = "http://${HomePublicAddress}:$ListenPort"
+        # Declared so the advisory at the end can name the destination of the
+        # forwarding rule this node's PublicUrl depends on.
+        LanAddress = $HomeLanAddress
         InstallDir = 'C:\m0nit0r'
         # Read the CPU die temperature from LibreHardwareMonitor rather than
         # from the ACPI thermal zone, which on this board reports the chassis.
         LibreHardwareMonitor = $true
+    }
+    [ordered]@{
+        Name      = 'Proxmox'
+        Kind      = 'linux'
+        # Administered across the LAN. The published port exists for the peers,
+        # not for SSH, which never leaves the building.
+        SshHost   = 'root@192.168.1.11'
+        SshPort   = 22
+        Location  = 'Home'
+        # The port differs from $ListenPort deliberately: the agent binds 5001
+        # like every other node, and the router translates external 5002 onto
+        # it, because Mon-PC already holds external 5001 on this address.
+        PublicUrl = "http://${HomePublicAddress}:$ProxmoxPublicPort"
+        LanAddress = $ProxmoxLanAddress
     }
 )
 
@@ -230,10 +274,70 @@ function Test-NodeUsesLhm {
     $Node.Contains('LibreHardwareMonitor') -and $Node['LibreHardwareMonitor']
 }
 
+# Only the nodes behind the home router declare one; every other node is
+# reached at its published address directly.
+function Get-NodeLanAddress {
+    param($Node)
+    if ($Node.Contains('LanAddress')) { $Node['LanAddress'] } else { $null }
+}
+
+# No node declares one today: the one that needed it is published by literal
+# instead, which says the same thing in one place rather than two. The hatch
+# stays because the error in Get-AllowedSources below sends the next person who
+# hits an unresolvable name straight to it.
+function Get-NodeAllowedSource {
+    param($Node)
+    if ($Node.Contains('AllowedSource')) { $Node['AllowedSource'] } else { $null }
+}
+
+# Ranges a peer on the internet can never be reached at, and so can never be
+# the source of its traffic either. An answer from one of them is the local
+# resolver describing itself rather than the node: split-tunnel VPN clients
+# hand back 198.18.0.0/15, a carrier sits its subscribers in 100.64.0.0/10, and
+# a split-horizon zone answers with the RFC 1918 ranges. Written into a rule
+# they are indistinguishable from a correct answer, which is the whole problem,
+# so this names the range for an error rather than returning a bare $false.
+# Deliberately not applied to declared addresses: $AdditionalAllowedSources
+# holds LAN addresses on purpose, and something chosen by hand is not a guess.
+function Get-NonGlobalRange {
+    param([string]$Address)
+
+    $bytes = [System.Net.IPAddress]::Parse($Address).GetAddressBytes()
+    $value = ([long]$bytes[0] -shl 24) + ([long]$bytes[1] -shl 16) + ([long]$bytes[2] -shl 8) + [long]$bytes[3]
+
+    $ranges = [ordered]@{
+        '0.0.0.0/8'      = 'the unspecified range'
+        '10.0.0.0/8'     = 'a private range'
+        '100.64.0.0/10'  = 'carrier-grade NAT space'
+        '127.0.0.0/8'    = 'loopback'
+        '169.254.0.0/16' = 'link-local space'
+        '172.16.0.0/12'  = 'a private range'
+        '192.168.0.0/16' = 'a private range'
+        '198.18.0.0/15'  = 'RFC 2544 benchmarking space, which VPN clients hand out for split tunnelling'
+        '224.0.0.0/4'    = 'multicast space'
+    }
+
+    foreach ($cidr in $ranges.Keys) {
+        $network, $bits = $cidr -split '/'
+        $netBytes = [System.Net.IPAddress]::Parse($network).GetAddressBytes()
+        $netValue = ([long]$netBytes[0] -shl 24) + ([long]$netBytes[1] -shl 16) + ([long]$netBytes[2] -shl 8) + [long]$netBytes[3]
+        $mask = (0xFFFFFFFFL -shl (32 - [int]$bits)) -band 0xFFFFFFFFL
+        if (($value -band $mask) -eq $netValue) { return "$($ranges[$cidr]) ($cidr)" }
+    }
+    return $null
+}
+
 # The source addresses that must be able to reach the listening port: every
-# node, plus anything the caller added. A node's PublicUrl is also the address
-# its outbound connections originate from on all three hosts here, so the same
-# value serves as both destination and expected source.
+# node, plus anything the caller added. A node's PublicUrl is usually also the
+# address its outbound connections originate from, so the same value serves as
+# both destination and expected source; the cases where it is not are covered
+# by $AdditionalAllowedSources and by AllowedSource on the node itself.
+#
+# Where a name has to be resolved, it is resolved through whatever resolver
+# this machine happens to be using, which answers for this machine and not for
+# the mesh. Every failure that produces is silent by construction - a wrong but
+# well-formed address makes a rule that locks a node out - so an answer that
+# cannot possibly be a peer is refused here rather than written out.
 function Get-AllowedSources {
     param($AllNodes)
 
@@ -244,6 +348,13 @@ function Get-AllowedSources {
             throw "$($node.Name) has no PublicUrl, so it cannot be added to the firewall " +
                   'allowlist; restricting now would cut that node out of the mesh'
         }
+
+        $declared = Get-NodeAllowedSource $node
+        if ($declared) {
+            $addresses.Add($declared)
+            continue
+        }
+
         $hostName = ([uri]$node.PublicUrl).Host
 
         if ($hostName -match '^\d{1,3}(\.\d{1,3}){3}$') {
@@ -251,12 +362,28 @@ function Get-AllowedSources {
             continue
         }
         try {
-            [System.Net.Dns]::GetHostAddresses($hostName) |
+            $resolved = @([System.Net.Dns]::GetHostAddresses($hostName) |
                 Where-Object AddressFamily -eq 'InterNetwork' |
-                ForEach-Object { $addresses.Add($_.IPAddressToString) }
+                ForEach-Object { $_.IPAddressToString })
         } catch {
             throw "cannot resolve '$hostName' to an address for $($node.Name); " +
                   'the firewall allowlist would silently omit that node'
+        }
+        if (-not $resolved) {
+            throw "'$hostName' has no IPv4 address for $($node.Name); " +
+                  'the firewall allowlist would silently omit that node'
+        }
+
+        foreach ($address in $resolved) {
+            $range = Get-NonGlobalRange $address
+            if ($range) {
+                throw "'$hostName' resolves to $address here, which is in $range and so cannot " +
+                      "be the address $($node.Name) reaches its peers from - this machine's " +
+                      'resolver is answering for itself. Check the name against a public ' +
+                      "resolver (Resolve-DnsName $hostName -Server 8.8.8.8) and declare the " +
+                      "answer as AllowedSource on that node in `$Nodes."
+            }
+            $addresses.Add($address)
         }
     }
 
@@ -474,9 +601,13 @@ function Deploy-LinuxNode {
     } "uploading installer to $($Node.Name)" | Out-Null
 
     Write-Note 'running the remote installer (sudo may ask for your password)'
+    # On a node reached as root, sudo is not merely redundant: it is a
+    # dependency, and a minimal install has no reason to carry one.
+    $remoteScript = "$stage/install.sh"
+    $run = 'if [ "$(id -u)" -eq 0 ]; then sh ' + $remoteScript + '; else sudo sh ' + $remoteScript + '; fi'
     # -t allocates a TTY so sudo can prompt interactively.
     $output = Invoke-Native {
-        & ssh -t @(Get-SshTarget $Node) "sudo sh $stage/install.sh"
+        & ssh -t @(Get-SshTarget $Node) $run
     } "installing on $($Node.Name)"
 
     $output | Where-Object { $_ -match '^(ufw|firewalld|no active firewall|WARNING)' } | ForEach-Object {
@@ -841,19 +972,30 @@ function Test-NodeHealth {
         $detail = $_.Exception.Message
     }
 
-    # A local node failing its public check is ambiguous: the service may be
-    # fine and only the router forward missing. Loopback separates the two, so
-    # the summary points at the actual problem.
+    # A node failing its public check is ambiguous: the service may be perfectly
+    # fine and only the path to it closed - a missing port forward, a firewall,
+    # or a router declining to hairpin a connection from inside back to its own
+    # public address. Asking the host over loopback separates the two, so the
+    # summary points at the half that is actually broken.
+    $loopback = $null
     if ($Node.Kind -eq 'windows-local') {
+        try { $loopback = Invoke-RestMethod -Uri "http://127.0.0.1:$ListenPort/api/health" -TimeoutSec 5 } catch { }
+    } elseif ($Node.Kind -eq 'linux') {
+        # Over SSH rather than over the network, for the same reason peer
+        # registration goes that way: this has to be the host's own view.
         try {
-            $response = Invoke-RestMethod -Uri "http://127.0.0.1:$ListenPort/api/health" -TimeoutSec 5
-            return [pscustomobject]@{
-                Node      = $Node.Name
-                Reachable = $false
-                ServerId  = $response.serverId
-                Detail    = 'service up locally, not reachable from outside - port forward missing'
-            }
+            $raw = & ssh @(Get-SshTarget $Node) "curl -s -m 5 http://127.0.0.1:$ListenPort/api/health"
+            if ($LASTEXITCODE -eq 0 -and "$raw".Trim()) { $loopback = "$raw".Trim() | ConvertFrom-Json }
         } catch { }
+    }
+
+    if ($loopback) {
+        return [pscustomobject]@{
+            Node      = $Node.Name
+            Reachable = $false
+            ServerId  = $loopback.serverId
+            Detail    = 'service up locally, not reachable at its public address'
+        }
     }
 
     return [pscustomobject]@{ Node = $Node.Name; Reachable = $false; ServerId = $null; Detail = $detail }
@@ -909,7 +1051,7 @@ try {
     New-Item -ItemType Directory -Force $StageDir | Out-Null
 
     # Note: not $home, which is an automatic variable holding the user profile.
-    $homeSelected = $selected | Where-Object { $_.Kind -eq 'windows-local' }
+    $homeSelected = @($selected | Where-Object { Get-NodeLanAddress $_ })
 
     if (-not $MeshOnly) {
         # Built from the full inventory, not the -Only subset: narrowing the
@@ -966,8 +1108,20 @@ try {
     if ($homeSelected) {
         Write-Host ''
         Write-Host "  Port forwarding required on the router at ${RouterAddress}:" -ForegroundColor Yellow
-        Write-Host "    external TCP $ListenPort  →  ${HomeLanAddress} : $ListenPort" -ForegroundColor Yellow
-        Write-Host "    $HomeLanAddress is a DHCP lease; reserve it for this machine so the rule keeps working." -ForegroundColor DarkGray
+        foreach ($homeNode in $homeSelected) {
+            # The external port is whatever that node publishes; the internal one
+            # is always $ListenPort, because every agent binds the same port and
+            # only the forwarding rules tell the two home nodes apart.
+            $lan      = Get-NodeLanAddress $homeNode
+            $external = ([uri]$homeNode.PublicUrl).Port
+            Write-Host "    external TCP $external  →  ${lan} : $ListenPort   ($($homeNode.Name))" -ForegroundColor Yellow
+        }
+        Write-Host '    Those LAN addresses are DHCP leases; reserve them so the rules keep working.' -ForegroundColor DarkGray
+        if ($homeSelected.Count -gt 1) {
+            Write-Host '    The home nodes reach each other through the public address above too, so' -ForegroundColor DarkGray
+            Write-Host '    the router has to hairpin it. If that one edge stays red while every other' -ForegroundColor DarkGray
+            Write-Host '    edge is green, that is what to look at first.' -ForegroundColor DarkGray
+        }
     }
 
     if ($MeshOnly) {
