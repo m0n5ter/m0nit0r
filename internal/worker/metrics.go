@@ -13,6 +13,11 @@ import (
 	"github.com/m0n5ter/m0nit0r/internal/store"
 )
 
+// pruneInterval is how often retention is enforced. Sampling ticks far more
+// often than this, and the delete scans both tables in full, so running it on
+// every sample would cost more than the extra minute of history it trims.
+const pruneInterval = time.Minute
+
 // Metrics samples the local host on a fixed interval and enforces retention.
 type Metrics struct {
 	Store     *store.Store
@@ -21,6 +26,8 @@ type Metrics struct {
 	Interval  time.Duration
 	Retention time.Duration
 	Log       *slog.Logger
+
+	lastPrune time.Time
 }
 
 // Run collects until ctx is cancelled.
@@ -81,5 +88,10 @@ func (w *Metrics) prune() error {
 	if w.Retention <= 0 {
 		return nil
 	}
-	return w.Store.Prune(model.At(time.Now().Add(-w.Retention)))
+	now := time.Now()
+	if !w.lastPrune.IsZero() && now.Sub(w.lastPrune) < pruneInterval {
+		return nil
+	}
+	w.lastPrune = now
+	return w.Store.Prune(model.At(now.Add(-w.Retention)))
 }

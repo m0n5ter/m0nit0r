@@ -32,6 +32,12 @@ type file struct {
 	Monitor Options `json:"monitor"`
 }
 
+// maxRetentionDays caps how much history a node keeps, whatever the
+// configuration file asks for. Sampling is frequent enough that a longer
+// window is mostly disk, and seven days is already the widest range the
+// dashboard can plot.
+const maxRetentionDays = 7
+
 // Defaults returns the built-in configuration.
 func Defaults() Options {
 	return Options{
@@ -42,7 +48,7 @@ func Defaults() Options {
 		DatabasePath:          "monitor.db",
 		MetricIntervalSeconds: 5,
 		SyncIntervalSeconds:   10,
-		RetentionDays:         30,
+		RetentionDays:         maxRetentionDays,
 	}
 }
 
@@ -96,6 +102,11 @@ func Load(path string) (Options, error) {
 	}
 	if opts.SyncIntervalSeconds <= 0 {
 		opts.SyncIntervalSeconds = 10
+	}
+	// A missing, zero or oversized value all resolve to the cap rather than to
+	// unlimited history, so no node can hold data older than the cap allows.
+	if opts.RetentionDays <= 0 || opts.RetentionDays > maxRetentionDays {
+		opts.RetentionDays = maxRetentionDays
 	}
 	return opts, nil
 }

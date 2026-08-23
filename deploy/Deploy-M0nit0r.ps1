@@ -132,12 +132,17 @@ $RouterAddress     = '192.168.1.1'
 # never leaves the building the only broken edge in the matrix.
 $AdditionalAllowedSources = @($HomeEgressAddress, $HomeLanAddress, $ProxmoxLanAddress)
 
-# Collection and sync intervals for a deployment spread across the internet.
-# The application's own defaults (5s and 10s) are tuned for a local test mesh
-# and would accumulate roughly half a million rows per node per month.
-$MetricIntervalSeconds = 30
-$SyncIntervalSeconds   = 60
-$RetentionDays         = 30
+# Collection and sync intervals. These match the application's own defaults, so
+# the dashboard - which polls every 5s - shows readings that are actually that
+# fresh rather than a number half a minute old.
+#
+# The row count that argued for the slower 30s/60s pair is answered by the
+# retention window instead: six times the sample rate over a window four times
+# shorter lands at roughly 1.4x the rows of the month of 30s samples this
+# replaces - and seven days is already the widest range the dashboard plots.
+$MetricIntervalSeconds = 5
+$SyncIntervalSeconds   = 10
+$RetentionDays         = 7
 
 # LibreHardwareMonitor, for the Windows nodes that ask for it. The agent reads
 # the CPU die temperature from its web server, which is the only way to get one

@@ -54,7 +54,7 @@ launches it.
 | `LibreHardwareMonitorUrl` | empty | Address of a LibreHardwareMonitor web server to read the CPU die temperature from, e.g. `http://127.0.0.1:8085`. Windows only in practice; empty uses the built-in probe |
 | `MetricIntervalSeconds` | `5` | How often to sample CPU, memory, disk and temperature |
 | `SyncIntervalSeconds` | `10` | How often to push data to peers |
-| `RetentionDays` | `30` | How long to keep history |
+| `RetentionDays` | `7` | How long to keep history, in days. Also the ceiling: a larger value, or none, is treated as 7 |
 
 Peers are not configured in this file. Add them at runtime from the dashboard, or by
 posting to `/api/peers`.
