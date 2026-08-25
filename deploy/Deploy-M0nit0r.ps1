@@ -189,6 +189,14 @@ $Nodes = @(
         PublicUrl = "http://24.144.97.48:$ListenPort"
     }
     [ordered]@{
+        Name      = 'BG'
+        Kind      = 'linux'
+        SshHost   = 'm0n5ter@45.39.253.23'
+        SshPort   = 22
+        Location  = '45.39.253.23'
+        PublicUrl = "http://45.39.253.23:$ListenPort"
+    }
+    [ordered]@{
         Name      = 'DE'
         Kind      = 'linux'
         SshHost   = 'm0n5ter@45.38.190.118'
