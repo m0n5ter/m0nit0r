@@ -93,7 +93,8 @@ func runApp(parent context.Context, log *slog.Logger, opts config.Options, baseD
 	}
 	defer st.Close()
 
-	if err := st.UpsertSelf(opts.ServerID, opts.ServerName, opts.Location); err != nil {
+	if err := st.UpsertSelf(opts.ServerID, opts.ServerName, opts.Location,
+		peer.NormalizeURL(opts.PublicURL)); err != nil {
 		return err
 	}
 

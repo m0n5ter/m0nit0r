@@ -147,17 +147,21 @@ func (s *Store) Close() error { return s.db.Close() }
 
 // ── Servers ─────────────────────────────────────────────────────────────────
 
-// UpsertSelf writes this instance's own row, preserving any URL already stored.
-func (s *Store) UpsertSelf(id, name, location string) error {
+// UpsertSelf writes this instance's own row. A blank url leaves any stored
+// address alone, the same rule UpsertPeer follows: a node started without a
+// PublicUrl configured has no better address to offer than the one it already
+// published.
+func (s *Store) UpsertSelf(id, name, location, url string) error {
 	_, err := s.db.Exec(`
 		INSERT INTO "Servers" ("Id","Name","Location","Url","IsSelf","LastSeen")
-		VALUES (?,?,?,NULL,1,?)
+		VALUES (?,?,?,NULLIF(?,''),1,?)
 		ON CONFLICT("Id") DO UPDATE SET
 			"Name"=excluded."Name",
 			"Location"=excluded."Location",
+			"Url"=COALESCE(excluded."Url", "Servers"."Url"),
 			"IsSelf"=1,
 			"LastSeen"=excluded."LastSeen"`,
-		id, name, location, model.Now().DB())
+		id, name, location, url, model.Now().DB())
 	if err != nil {
 		return fmt.Errorf("upsert self: %w", err)
 	}
