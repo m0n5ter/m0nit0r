@@ -125,6 +125,11 @@ $RouterAddress     = '192.168.1.1'
 # silently cut this machine's outbound sync, which looks like a dead peer
 # rather than a firewall rule.
 #
+# It now repeats what the TR node publishes, that host being the far end of the
+# tunnel, and Get-AllowedSources folds the pair away. Kept regardless: the
+# reason above holds whether or not that node is in the inventory, and removing
+# it would quietly make this machine's outbound sync depend on TR staying in it.
+#
 # The two LAN addresses are here for the same reason. The home nodes reach each
 # other by dialling the router's own public address, and a router that hairpins
 # that connection without rewriting its source delivers it from 192.168.1.x -
@@ -184,12 +189,35 @@ $Nodes = @(
         PublicUrl = "http://24.144.97.48:$ListenPort"
     }
     [ordered]@{
-        Name      = 'VPS-DE'
+        Name      = 'DE'
         Kind      = 'linux'
         SshHost   = 'm0n5ter@45.38.190.118'
         SshPort   = 2222
         Location  = '45.38.190.118'
         PublicUrl = "http://45.38.190.118:$ListenPort"
+    }
+    [ordered]@{
+        Name      = 'TR'
+        Kind      = 'linux'
+        # The far end of the tunnel this machine's traffic leaves through, which
+        # makes its address one the file already carried: $HomeEgressAddress is
+        # where Mon-PC's outbound connections surface, and that is this host.
+        # So the allowlist admits a single address on behalf of two senders and
+        # cannot tell them apart. Accepted rather than solved - Mon-PC has no
+        # other address to be admitted by - but worth knowing before reading a
+        # rule naming this address as though it only admitted TR.
+        SshHost   = 'm0n5ter@185.219.132.26'
+        SshPort   = 22
+        Location  = '185.219.132.26'
+        PublicUrl = "http://185.219.132.26:$ListenPort"
+    }
+    [ordered]@{
+        Name      = 'UK'
+        Kind      = 'linux'
+        SshHost   = 'm0n5ter@185.168.195.238'
+        SshPort   = 51821
+        Location  = '185.168.195.238'
+        PublicUrl = "http://185.168.195.238:$ListenPort"
     }
     [ordered]@{
         Name      = 'Mon-PC'
