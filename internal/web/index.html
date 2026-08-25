@@ -35,6 +35,7 @@
     --warn-soft:    rgba(217, 162, 24, 0.16);
     --danger-soft:  rgba(248, 81, 73, 0.16);
     --accent-soft:  rgba(88, 166, 255, 0.14);
+    --accent-line:  rgba(88, 166, 255, 0.45);
     --neutral-soft: rgba(139, 148, 158, 0.10);
 
     --shadow: 0 1px 2px rgba(0,0,0,.4), 0 8px 24px rgba(0,0,0,.28);
@@ -65,6 +66,7 @@
     --warn-soft:    rgba(154, 103, 0, 0.14);
     --danger-soft:  rgba(207, 34, 46, 0.12);
     --accent-soft:  rgba(9, 105, 218, 0.10);
+    --accent-line:  rgba(9, 105, 218, 0.40);
     --neutral-soft: rgba(87, 96, 106, 0.08);
 
     --shadow: 0 1px 2px rgba(31,35,40,.06), 0 6px 18px rgba(31,35,40,.08);
@@ -361,9 +363,12 @@ code { color: var(--pink); }
 }
 .matrix-wrap::-webkit-scrollbar-track, .table-responsive::-webkit-scrollbar-track { background: transparent; }
 table.matrix {
-    /* Both are set from fitMatrix: the type has to grow with the square, or a
-       cell sized for a wide card reads as a small label adrift in a big box. */
+    /* All three are set from fitMatrix: the type has to grow with the box, or a
+       cell sized for a wide card reads as a small label adrift in a big one.
+       Height is the shorter side: a reading is two short lines, so a square
+       would be mostly empty and push the far rows off the screen. */
     --cell: 64px;
+    --cell-h: 38px;
     --cell-font: .84rem;
     border-collapse: separate; border-spacing: 3px; margin: 0 auto;
     font-size: var(--cell-font);
@@ -404,11 +409,12 @@ table.matrix td {
     border-radius: 9px; font-variant-numeric: tabular-nums; color: var(--text-dim);
     background: var(--surface-2); transition: .15s;
 }
-/* The square is the box, not the cell: max-width on a table-cell is advisory,
-   so a long latency reading would otherwise stretch its column and break the
-   grid. Anything that does not fit is clipped rather than allowed to widen. */
+/* The fixed box is here, not on the cell: max-width on a table-cell is
+   advisory, so a long latency reading would otherwise stretch its column and
+   break the grid. Anything that does not fit is clipped rather than allowed
+   to widen. */
 .cell-box {
-    width: var(--cell); height: var(--cell);
+    width: var(--cell); height: var(--cell-h);
     display: grid; place-content: center;
     overflow: hidden; padding: 0 2px;
 }
@@ -419,6 +425,11 @@ table.matrix td.na   { color: var(--text-faint); }
 table.matrix td.up   { background: var(--ok-soft); color: var(--ok); }
 table.matrix td.deg  { background: var(--warn-soft); color: var(--warn); }
 table.matrix td.down { background: var(--danger-soft); color: var(--danger); }
+/* This host's own row and column are the two readings its dashboard is most
+   often opened for, so the band is picked out in the accent. A ring rather
+   than a fill: the cell background is already carrying the link's state. */
+table.matrix td.here { box-shadow: inset 0 0 0 2px var(--accent-line); }
+table.matrix th.here, table.matrix th.here .node-link { color: var(--accent); }
 .cell-sub { display: block; font-size: .78em; opacity: .75; margin-top: .15em; }
 
 /* ── Peers table ─────────────────────────────────────────────────────────── */
@@ -673,11 +684,15 @@ const DISK_TEMP = { warn: 45, danger: 55 };
 // Load percentages shade the same way everywhere: cards, tiles and rails.
 const LOAD = { warn: 70, danger: 90 };
 
-// Bounds for the reachability squares. The floor is what a cell needs to hold
-// a latency reading and an uptime percentage; the ceiling stops a two-node
-// fleet from rendering as a pair of billboards.
+// Bounds for the reachability cells. The floor is what a cell needs to hold a
+// latency reading and an uptime percentage; the ceiling stops a two-node fleet
+// from rendering as a pair of billboards. Height runs over a much shorter
+// range than width: two lines of a reading are all that has to fit, and every
+// extra pixel of it is another row pushed off the bottom of the card.
 const MIN_CELL = 56;
 const MAX_CELL = 112;
+const MIN_CELL_H = 38;
+const MAX_CELL_H = 62;
 
 // ── Theme ────────────────────────────────────────────────────────────────────
 
@@ -1063,28 +1078,36 @@ function renderMatrix(list, matrix) {
     }
 
     const byEdge = new Map(matrix.map(e => [e.fromServerId + '>' + e.toServerId, e]));
-    const nodes = sortServers(list);
+    // Unlike the node cards, the matrix is read by looking a name up rather
+    // than by scanning from the top, so it is ordered alphabetically and stays
+    // put as load and availability move around.
+    const nodes = list.slice().sort((a, b) => a.name.localeCompare(b.name));
 
     // The headers are buttons, not labels: a node name is the most direct way
     // into that node's detail, and a real button gets keyboard access for free.
     const nameButton = s =>
         '<button type="button" class="node-link" data-node="' + esc(s.id) + '" title="' +
         esc(s.name) + '">' + esc(s.name) + '</button>';
+    const here = s => s.isSelf ? ' here' : '';
 
     let html = '<table class="matrix"><thead><tr><th class="row-head"><span>from \\ to</span></th>';
     for (const s of nodes) {
-        html += '<th class="col-head">' + nameButton(s) + '</th>';
+        html += '<th class="col-head' + here(s) + '">' + nameButton(s) + '</th>';
     }
     html += '</tr></thead><tbody>';
 
     for (const from of nodes) {
-        html += '<tr><th class="row-head">' + nameButton(from) + '</th>';
+        html += '<tr><th class="row-head' + here(from) + '">' + nameButton(from) + '</th>';
         for (const to of nodes) {
-            if (from.id === to.id) { html += '<td class="self"><div class="cell-box">·</div></td>'; continue; }
+            const band = from.isSelf || to.isSelf ? ' here' : '';
+            if (from.id === to.id) {
+                html += '<td class="self' + band + '"><div class="cell-box">·</div></td>';
+                continue;
+            }
 
             const e = byEdge.get(from.id + '>' + to.id);
             if (!e) {
-                html += '<td class="na" title="no checks recorded in the last hour">' +
+                html += '<td class="na' + band + '" title="no checks recorded in the last hour">' +
                     '<div class="cell-box">n/a</div></td>';
                 continue;
             }
@@ -1097,7 +1120,7 @@ function renderMatrix(list, matrix) {
             const title = from.name + ' → ' + to.name + ' · ' + e.availabilityPercent.toFixed(0) +
                 '% of recent checks succeeded · last check ' + formatRelative(e.lastCheck);
 
-            html += '<td class="cell ' + cls + '" title="' + esc(title) + '" ' +
+            html += '<td class="cell ' + cls + band + '" title="' + esc(title) + '" ' +
                 'data-from="' + esc(from.id) + '" data-to="' + esc(to.id) + '" ' +
                 'data-label="' + esc(from.name + ' → ' + to.name) + '"><div class="cell-box">' +
                 main + (sub ? '<span class="cell-sub">' + sub + '</span>' : '') + '</div></td>';
@@ -1108,9 +1131,9 @@ function renderMatrix(list, matrix) {
     fitMatrix();
 }
 
-// fitMatrix grows the square cells to fill the card. The matrix is the first
-// thing on the page now, and a small fleet rendered at a fixed cell size would
-// leave it marooned in whitespace; a large one still hits the floor and scrolls.
+// fitMatrix grows the cells to fill the card. The matrix is the first thing on
+// the page now, and a small fleet rendered at a fixed cell size would leave it
+// marooned in whitespace; a large one still hits the floor and scrolls.
 function fitMatrix() {
     const wrap = document.getElementById('matrix-wrap');
     const table = wrap.querySelector('table.matrix');
@@ -1124,7 +1147,7 @@ function fitMatrix() {
     const spacing = 3 * (columns + 2);
 
     // Two passes, because the sizing feeds back on itself: the type scales with
-    // the square, and larger type widens the row-header column, which leaves
+    // the cell, and larger type widens the row-header column, which leaves
     // less room than the first measurement assumed. The second pass measures
     // the header at the size it actually ended up.
     for (let pass = 0; pass < 2; pass++) {
@@ -1132,10 +1155,13 @@ function fitMatrix() {
         const room = wrap.clientWidth - padding - rowHead - spacing;
         const cell = Math.max(MIN_CELL, Math.min(MAX_CELL, Math.floor(room / columns)));
 
-        // Type tracks the square across the same range, so the reading stays
-        // proportionate to the box whether the fleet is two nodes or twenty.
+        // Height and type track the width across the same range, so a reading
+        // stays proportionate to its box whether the fleet is two nodes or
+        // twenty.
         const t = (cell - MIN_CELL) / (MAX_CELL - MIN_CELL);
         table.style.setProperty('--cell', cell + 'px');
+        table.style.setProperty('--cell-h',
+            Math.round(MIN_CELL_H + t * (MAX_CELL_H - MIN_CELL_H)) + 'px');
         table.style.setProperty('--cell-font', (0.84 + t * 0.26).toFixed(3) + 'rem');
     }
 }
@@ -1152,7 +1178,8 @@ async function renderPeers() {
         return;
     }
 
-    tbody.innerHTML = peers.map(p => {
+    // The list is a register rather than a feed, so it reads by name.
+    tbody.innerHTML = peers.slice().sort((a, b) => a.name.localeCompare(b.name)).map(p => {
         const shortId = p.id.length > 16 ? p.id.slice(0, 8) + '…' + p.id.slice(-4) : p.id;
         return '<tr>' +
             '<td class="ps-3 fw-semibold">' + esc(p.name) + '</td>' +
