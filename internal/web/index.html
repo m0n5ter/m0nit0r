@@ -385,18 +385,22 @@ table.matrix th.row-head span {
     display: block; max-width: 10rem; overflow: hidden;
     text-overflow: ellipsis; white-space: nowrap;
 }
-/* Header names open the node, so they are real buttons stripped back to look
-   like the labels they replaced. */
-table.matrix th .node-link {
+/* A name opens its node wherever it appears - the matrix headers and the peer
+   register both - so the names are real buttons stripped back to look like the
+   labels they replaced. */
+.node-link {
     background: none; border: 0; padding: 0; margin: 0;
     color: inherit; font: inherit; cursor: pointer; border-radius: 4px;
-    max-width: 10rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-table.matrix th .node-link:hover { color: var(--accent); text-decoration: underline; }
-table.matrix th .node-link:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--accent-soft); }
+.node-link:hover { color: var(--accent); text-decoration: underline; }
+.node-link:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--accent-soft); }
+/* Only the matrix has to clip them: it is quadratic, so a long name there
+   would set a column width that every cell in it then has to carry. */
+table.matrix th .node-link { max-width: 10rem; }
 table.matrix th.row-head .node-link { display: block; margin-left: auto; text-align: right; }
 /* Column labels are turned on their side so that a header never sets the
-   column width — the square cell does. vertical-rl plus a half turn is what
+   column width — the cell does. vertical-rl plus a half turn is what
    makes the text read bottom-to-top rather than top-to-bottom; the clipping
    then works off max-height, the vertical counterpart of max-width. */
 table.matrix th.col-head { vertical-align: bottom; padding-bottom: .35rem; }
@@ -441,6 +445,13 @@ table.matrix th.here, table.matrix th.here .node-link { color: var(--accent); }
 /* The URL is the one unbounded column, so it is what gives way first; the full
    value stays available as a tooltip. */
 .peers .col-url { max-width: 11rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* A node's URL is its own dashboard, so it is the way to get from one node to
+   the next. It inherits the surrounding colour rather than announcing itself:
+   a whole column in link blue would read as a state the way every other colour
+   on this page does. */
+.url-link { color: inherit; text-decoration: none; border-radius: 4px; }
+.url-link:hover { color: var(--accent); text-decoration: underline; }
+.url-link:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--accent-soft); }
 /* The table shares a column with the matrix, so how much room it has depends on
    the fleet, not the viewport. Below the width where all six columns fit, the
    location drops — every node card already carries it. */
@@ -786,6 +797,23 @@ function plural(n, word) { return n + ' ' + word + (n === 1 ? '' : 's'); }
 function esc(s) {
     return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;')
         .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+// urlLink renders a node's address as a link to its dashboard. The value is
+// self-reported - it arrives from the peer itself over /api/sync - so the
+// scheme is checked rather than trusted: esc() makes "javascript:doSomething()"
+// a perfectly valid attribute value, and it would run on click. Anything that
+// is not http or https, or that does not parse as an absolute URL at all, is
+// rendered as the text it always was.
+function urlLink(url) {
+    let parsed;
+    try { parsed = new URL(url); } catch { return esc(url); }
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return esc(url);
+    // The href is the parsed form and the label is what the node published, so
+    // a normalisation the browser applies does not silently rewrite the address
+    // the operator configured.
+    return '<a class="url-link" href="' + esc(parsed.href) + '" target="_blank" ' +
+        'rel="noopener noreferrer">' + esc(url) + '</a>';
 }
 
 function loadColor(v) {
@@ -1182,10 +1210,12 @@ async function renderPeers() {
     tbody.innerHTML = peers.slice().sort((a, b) => a.name.localeCompare(b.name)).map(p => {
         const shortId = p.id.length > 16 ? p.id.slice(0, 8) + '…' + p.id.slice(-4) : p.id;
         return '<tr>' +
-            '<td class="ps-3 fw-semibold">' + esc(p.name) + '</td>' +
+            '<td class="ps-3 fw-semibold"><button type="button" class="node-link" ' +
+                'data-node="' + esc(p.id) + '" title="' + esc(p.name) + '">' +
+                esc(p.name) + '</button></td>' +
             '<td class="text-dim">' + esc(p.location || '—') + '</td>' +
             '<td class="text-dim mono small col-url" title="' + esc(p.url) + '">' +
-                esc(p.url || '—') + '</td>' +
+                (p.url ? urlLink(p.url) : '—') + '</td>' +
             '<td class="text-faint mono small" title="' + esc(p.id) + '">' + esc(shortId) + '</td>' +
             '<td class="text-dim">' + formatRelative(p.lastSeen) + '</td>' +
             '<td class="text-end pe-3">' +
@@ -1371,7 +1401,7 @@ function renderDetailSummary(s) {
 
     const facts = [
         ['Location', esc(s.location || '\u2014')],
-        ['URL', s.url ? '<span class="mono">' + esc(s.url) + '</span>' : '<span class="text-faint">not advertised</span>'],
+        ['URL', s.url ? '<span class="mono">' + urlLink(s.url) + '</span>' : '<span class="text-faint">not advertised</span>'],
         ['Server ID', '<span class="mono">' + esc(s.id) + '</span>'],
         ['Last seen', s.isSelf ? 'this host' : esc(formatRelative(s.lastSeen))],
     ].map(([k, v]) => '<div class="fact"><dt>' + k + '</dt><dd>' + v + '</dd></div>').join('');
@@ -1669,6 +1699,8 @@ document.addEventListener('DOMContentLoaded', () => {
         if (td) openLink(td.dataset.from, td.dataset.to, td.dataset.label);
     });
     document.getElementById('peers-body').addEventListener('click', e => {
+        const name = e.target.closest('.node-link');
+        if (name) { selectServer(name.dataset.node); return; }
         const btn = e.target.closest('button[data-remove]');
         if (btn) removePeer(btn.dataset.remove, btn.dataset.name);
     });
