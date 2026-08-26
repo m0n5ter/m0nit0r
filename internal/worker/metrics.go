@@ -21,7 +21,7 @@ const pruneInterval = time.Minute
 type Metrics struct {
 	Store     *store.Store
 	Collector *metrics.Collector
-	ServerID  string
+	ServerID  int64
 	Interval  time.Duration
 	Retention time.Duration
 	Log       *slog.Logger

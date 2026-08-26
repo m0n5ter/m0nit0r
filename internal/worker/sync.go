@@ -21,7 +21,8 @@ const backfillWindow = 10 * time.Minute
 type Sync struct {
 	Store      *store.Store
 	Client     *peer.Client
-	ServerID   string
+	ServerID   int64
+	ServerUID  string
 	ServerName string
 	Location   string
 	PublicURL  string
@@ -102,7 +103,7 @@ func (w *Sync) round(ctx context.Context) error {
 func (w *Sync) push(ctx context.Context, target model.Server, payload model.SyncPayload, timestamp model.Time) {
 	ok, latencyMs, status := w.Client.PushSync(ctx, target.URL, payload)
 
-	if err := w.Store.InsertAvailability(w.ServerID, []model.Availability{{
+	if err := w.Store.InsertAvailability(w.ServerID, []store.Observation{{
 		ToServerID:  target.ID,
 		Timestamp:   timestamp,
 		IsAvailable: ok,
@@ -130,7 +131,7 @@ func (w *Sync) buildPayload() (model.SyncPayload, model.Time, model.Time, error)
 		return model.SyncPayload{}, w.lastMetric, w.lastAvail, err
 	}
 
-	availRows, err := w.Store.AvailabilitySince(w.lastAvail)
+	availability, err := w.Store.OwnAvailabilitySince(w.ServerID, w.lastAvail)
 	if err != nil {
 		return model.SyncPayload{}, w.lastMetric, w.lastAvail, err
 	}
@@ -143,27 +144,14 @@ func (w *Sync) buildPayload() (model.SyncPayload, model.Time, model.Time, error)
 	}
 
 	newestAvail := w.lastAvail
-	availability := make([]model.Availability, 0, len(availRows))
-	for _, r := range availRows {
-		// Only observations this server made are ours to forward; relaying a
-		// peer's records would duplicate them across the mesh.
-		if r.FromServerID != w.ServerID {
-			continue
-		}
-		availability = append(availability, model.Availability{
-			ToServerID:  r.ToServerID,
-			Timestamp:   r.Timestamp,
-			IsAvailable: r.IsAvailable,
-			LatencyMs:   r.LatencyMs,
-			HTTPStatus:  r.HTTPStatus,
-		})
-		if r.Timestamp.After(newestAvail.Time) {
-			newestAvail = r.Timestamp
+	for _, a := range availability {
+		if a.Timestamp.After(newestAvail.Time) {
+			newestAvail = a.Timestamp
 		}
 	}
 
 	return model.SyncPayload{
-		ServerID:     w.ServerID,
+		ServerID:     w.ServerUID,
 		ServerName:   w.ServerName,
 		Location:     w.Location,
 		SelfURL:      w.PublicURL,

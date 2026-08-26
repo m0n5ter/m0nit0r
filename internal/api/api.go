@@ -33,11 +33,16 @@ const matrixWindow = time.Hour
 const matrixSamples = 10
 
 // Server wires the HTTP handlers to storage and the peer client.
+//
+// ServerID is this node's row id, which is what the store is addressed by;
+// ServerUID is the identity it publishes, which is what peers and the dashboard
+// use. Both are fixed for the life of the process.
 type Server struct {
 	Store      *store.Store
 	Client     *peer.Client
 	Signer     *auth.Signer
-	ServerID   string
+	ServerID   int64
+	ServerUID  string
 	ServerName string
 	Location   string
 	PublicURL  string
@@ -97,7 +102,7 @@ func (s *Server) signed(next http.HandlerFunc) http.HandlerFunc {
 
 func (s *Server) identity() model.HealthResponse {
 	return model.HealthResponse{
-		ServerID:   s.ServerID,
+		ServerID:   s.ServerUID,
 		ServerName: s.ServerName,
 		Location:   s.Location,
 		Timestamp:  model.Now(),
@@ -116,8 +121,8 @@ func (s *Server) handleIntroduce(w http.ResponseWriter, r *http.Request) {
 
 	// An introduction without a reachable address tells us nothing worth
 	// storing, so record the caller only when both id and URL are present.
-	if req.ServerID != "" && req.ServerID != s.ServerID && peer.NormalizeURL(req.SelfURL) != "" {
-		if err := s.Store.UpsertPeer(req.ServerID, req.ServerName, req.Location,
+	if req.ServerID != "" && req.ServerID != s.ServerUID && peer.NormalizeURL(req.SelfURL) != "" {
+		if _, err := s.Store.UpsertPeer(req.ServerID, req.ServerName, req.Location,
 			peer.NormalizeURL(req.SelfURL), model.Now()); err != nil {
 			s.Log.Error("record introducing peer", "peer", req.ServerID, "err", err)
 			http.Error(w, "failed to record peer", http.StatusInternalServerError)
@@ -137,24 +142,25 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "ServerId required", http.StatusBadRequest)
 		return
 	}
-	if payload.ServerID == s.ServerID {
+	if payload.ServerID == s.ServerUID {
 		http.Error(w, "refusing to sync a payload from this server's own id", http.StatusBadRequest)
 		return
 	}
 
-	if err := s.Store.UpsertPeer(payload.ServerID, payload.ServerName, payload.Location,
-		peer.NormalizeURL(payload.SelfURL), model.Now()); err != nil {
+	peerID, err := s.Store.UpsertPeer(payload.ServerID, payload.ServerName, payload.Location,
+		peer.NormalizeURL(payload.SelfURL), model.Now())
+	if err != nil {
 		s.Log.Error("record syncing peer", "peer", payload.ServerID, "err", err)
 		http.Error(w, "failed to record peer", http.StatusInternalServerError)
 		return
 	}
 
-	if err := s.storeSyncedMetrics(payload); err != nil {
+	if err := s.storeSyncedMetrics(peerID, payload); err != nil {
 		s.Log.Error("store synced metrics", "peer", payload.ServerID, "err", err)
 		http.Error(w, "failed to store metrics", http.StatusInternalServerError)
 		return
 	}
-	if err := s.storeSyncedAvailability(payload); err != nil {
+	if err := s.storeSyncedAvailability(peerID, payload); err != nil {
 		s.Log.Error("store synced availability", "peer", payload.ServerID, "err", err)
 		http.Error(w, "failed to store availability", http.StatusInternalServerError)
 		return
@@ -166,12 +172,12 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 // storeSyncedMetrics inserts only samples newer than what is already held for
 // that peer. Peers resend an overlapping window every round, so this is what
 // keeps the table free of duplicates.
-func (s *Server) storeSyncedMetrics(payload model.SyncPayload) error {
+func (s *Server) storeSyncedMetrics(peerID int64, payload model.SyncPayload) error {
 	if len(payload.Metrics) == 0 {
 		return nil
 	}
 
-	watermark, ok, err := s.Store.MaxMetricTimestamp(payload.ServerID)
+	watermark, ok, err := s.Store.MaxMetricTimestamp(peerID)
 	if err != nil {
 		return err
 	}
@@ -184,29 +190,47 @@ func (s *Server) storeSyncedMetrics(payload model.SyncPayload) error {
 		fresh = append(fresh, m)
 	}
 
-	_, err = s.Store.InsertMetrics(payload.ServerID, fresh)
+	_, err = s.Store.InsertMetrics(peerID, fresh)
 	return err
 }
 
-func (s *Server) storeSyncedAvailability(payload model.SyncPayload) error {
+// storeSyncedAvailability does the same for the reachability a peer reported,
+// resolving the subject of each observation to a local row id. Those are the
+// nodes the peer can see, which is not always the set this one knows, so an
+// unfamiliar id is registered rather than dropped.
+func (s *Server) storeSyncedAvailability(peerID int64, payload model.SyncPayload) error {
 	if len(payload.Availability) == 0 {
 		return nil
 	}
 
-	watermark, ok, err := s.Store.MaxAvailabilityTimestamp(payload.ServerID)
+	watermark, ok, err := s.Store.MaxAvailabilityTimestamp(peerID)
 	if err != nil {
 		return err
 	}
 
-	fresh := make([]model.Availability, 0, len(payload.Availability))
+	targets := map[string]int64{}
+	fresh := make([]store.Observation, 0, len(payload.Availability))
 	for _, a := range payload.Availability {
 		if ok && !a.Timestamp.After(watermark.Time) {
 			continue
 		}
-		fresh = append(fresh, a)
+		to, resolved := targets[a.ToServerID]
+		if !resolved {
+			if to, err = s.Store.EnsureServer(a.ToServerID); err != nil {
+				return err
+			}
+			targets[a.ToServerID] = to
+		}
+		fresh = append(fresh, store.Observation{
+			ToServerID:  to,
+			Timestamp:   a.Timestamp,
+			IsAvailable: a.IsAvailable,
+			LatencyMs:   a.LatencyMs,
+			HTTPStatus:  a.HTTPStatus,
+		})
 	}
 
-	return s.Store.InsertAvailability(payload.ServerID, fresh)
+	return s.Store.InsertAvailability(peerID, fresh)
 }
 
 // ── Dashboard data ──────────────────────────────────────────────────────────
@@ -241,16 +265,16 @@ func (s *Server) handleServers(w http.ResponseWriter, r *http.Request) {
 		if !srv.IsSelf {
 			// Reachability is whatever this server last observed; a peer's own
 			// opinion of itself is not evidence it is reachable from here.
-			last, err := s.Store.LatestAvailability(s.ServerID, srv.ID)
+			available, _, err := s.Store.LatestAvailability(s.ServerID, srv.ID)
 			if err != nil {
 				s.fail(w, "latest availability", err)
 				return
 			}
-			online = last != nil && last.IsAvailable
+			online = available
 		}
 
 		views = append(views, serverView{
-			ID:       srv.ID,
+			ID:       srv.UID,
 			Name:     srv.Name,
 			Location: srv.Location,
 			URL:      srv.URL,
@@ -265,11 +289,20 @@ func (s *Server) handleServers(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleServerMetrics(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
+	srv, found, err := s.Store.ServerByUID(r.PathValue("id"))
+	if err != nil {
+		s.fail(w, "server metrics", err)
+		return
+	}
+	if !found {
+		writeJSON(w, http.StatusOK, []model.Metric{})
+		return
+	}
+
 	window := hoursParam(r)
 	since := model.At(time.Now().Add(-window))
 
-	metrics, err := s.Store.MetricsBucketed(id, since, bucketFor(window))
+	metrics, err := s.Store.MetricsBucketed(srv.ID, since, bucketFor(window))
 	if err != nil {
 		s.fail(w, "server metrics", err)
 		return
@@ -296,7 +329,7 @@ func (s *Server) handleAvailabilityMatrix(w http.ResponseWriter, r *http.Request
 	type edge struct{ from, to string }
 	grouped := map[edge][]store.AvailabilityRow{}
 	for _, row := range rows {
-		key := edge{row.FromServerID, row.ToServerID}
+		key := edge{row.FromUID, row.ToUID}
 		grouped[key] = append(grouped[key], row)
 	}
 
@@ -345,9 +378,24 @@ type historyEntry struct {
 }
 
 func (s *Server) handleAvailabilityHistory(w http.ResponseWriter, r *http.Request) {
+	from, fromKnown, err := s.Store.ServerByUID(r.PathValue("fromId"))
+	if err != nil {
+		s.fail(w, "availability history", err)
+		return
+	}
+	to, toKnown, err := s.Store.ServerByUID(r.PathValue("toId"))
+	if err != nil {
+		s.fail(w, "availability history", err)
+		return
+	}
+	if !fromKnown || !toKnown {
+		writeJSON(w, http.StatusOK, []historyEntry{})
+		return
+	}
+
 	since := model.At(time.Now().Add(-hoursParam(r)))
 
-	rows, err := s.Store.AvailabilityHistory(r.PathValue("fromId"), r.PathValue("toId"), since)
+	rows, err := s.Store.AvailabilityHistory(from.ID, to.ID, since)
 	if err != nil {
 		s.fail(w, "availability history", err)
 		return
@@ -379,7 +427,7 @@ func (s *Server) handleListPeers(w http.ResponseWriter, r *http.Request) {
 
 	views := make([]peerView, 0, len(peers))
 	for _, p := range peers {
-		views = append(views, peerView{p.ID, p.Name, p.Location, p.URL, p.LastSeen})
+		views = append(views, peerView{p.UID, p.Name, p.Location, p.URL, p.LastSeen})
 	}
 	writeJSON(w, http.StatusOK, views)
 }
@@ -402,7 +450,7 @@ func (s *Server) handleAddPeer(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	identity, err := s.Client.Introduce(ctx, url, model.IntroduceRequest{
-		ServerID:   s.ServerID,
+		ServerID:   s.ServerUID,
 		ServerName: s.ServerName,
 		Location:   s.Location,
 		SelfURL:    s.PublicURL,
@@ -416,7 +464,7 @@ func (s *Server) handleAddPeer(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Could not reach the peer. Make sure it is running and accessible.", http.StatusBadRequest)
 		return
 	}
-	if identity.ServerID == s.ServerID {
+	if identity.ServerID == s.ServerUID {
 		http.Error(w, "That URL points back at this server.", http.StatusBadRequest)
 		return
 	}
@@ -431,7 +479,7 @@ func (s *Server) handleAddPeer(w http.ResponseWriter, r *http.Request) {
 
 	// LastSeen records when this server observed the peer, so it uses the local
 	// clock rather than the timestamp the peer reported about itself.
-	if err := s.Store.UpsertPeer(identity.ServerID, identity.ServerName, identity.Location, url, model.Now()); err != nil {
+	if _, err := s.Store.UpsertPeer(identity.ServerID, identity.ServerName, identity.Location, url, model.Now()); err != nil {
 		s.fail(w, "store peer", err)
 		return
 	}
@@ -458,7 +506,7 @@ func (s *Server) crossIntroduce(ctx context.Context, existing []model.Server, id
 	}
 
 	for _, p := range existing {
-		if p.ID == identity.ServerID || p.URL == "" {
+		if p.UID == identity.ServerID || p.URL == "" {
 			continue
 		}
 		wg.Add(2)
@@ -469,7 +517,7 @@ func (s *Server) crossIntroduce(ctx context.Context, existing []model.Server, id
 			SelfURL:    url,
 		})
 		go announce(url, model.IntroduceRequest{
-			ServerID:   p.ID,
+			ServerID:   p.UID,
 			ServerName: p.Name,
 			Location:   p.Location,
 			SelfURL:    p.URL,
@@ -479,9 +527,7 @@ func (s *Server) crossIntroduce(ctx context.Context, existing []model.Server, id
 }
 
 func (s *Server) handleRemovePeer(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-
-	srv, found, err := s.Store.GetServer(id)
+	srv, found, err := s.Store.ServerByUID(r.PathValue("id"))
 	if err != nil {
 		s.fail(w, "get server", err)
 		return
@@ -497,7 +543,7 @@ func (s *Server) handleRemovePeer(w http.ResponseWriter, r *http.Request) {
 
 	// Clearing the address stops syncing but keeps the collected history, which
 	// is what the dashboard warns the operator will happen.
-	if err := s.Store.SetPeerURL(id, ""); err != nil {
+	if err := s.Store.SetPeerURL(srv.ID, ""); err != nil {
 		s.fail(w, "clear peer url", err)
 		return
 	}

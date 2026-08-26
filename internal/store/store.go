@@ -1,6 +1,12 @@
 // Package store persists servers, metric samples and availability records in
-// SQLite. The schema and the TEXT timestamp encoding match what the previous
-// EF Core implementation created, so an existing monitor.db opens unchanged.
+// SQLite.
+//
+// Servers are referenced by an integer row id. The identity a node publishes -
+// the GUID in server-id.txt - lives in "Servers"."Uid" and is what crosses the
+// wire, but repeating it in every one of the millions of metric and
+// availability rows cost more space than the readings themselves and turned
+// every lookup into a 36-byte string comparison. Timestamps are stored the same
+// way, as integer Unix milliseconds rather than padded ISO text.
 package store
 
 import (
@@ -16,18 +22,19 @@ import (
 
 const schema = `
 CREATE TABLE IF NOT EXISTS "Servers" (
-    "Id"       TEXT NOT NULL PRIMARY KEY,
+    "Id"       INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+    "Uid"      TEXT NOT NULL UNIQUE,
     "Name"     TEXT NOT NULL,
     "Location" TEXT NOT NULL,
     "Url"      TEXT NULL,
     "IsSelf"   INTEGER NOT NULL,
-    "LastSeen" TEXT NOT NULL
+    "LastSeen" INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS "MetricSnapshots" (
     "Id"            INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
-    "ServerId"      TEXT NOT NULL,
-    "Timestamp"     TEXT NOT NULL,
+    "ServerId"      INTEGER NOT NULL REFERENCES "Servers"("Id"),
+    "Timestamp"     INTEGER NOT NULL,
     "CpuPercent"    REAL NOT NULL,
     "CpuTempC"      REAL NULL,
     "MemoryPercent" REAL NOT NULL,
@@ -61,9 +68,9 @@ CREATE INDEX IF NOT EXISTS "IX_MetricDisks_MetricId"
 
 CREATE TABLE IF NOT EXISTS "AvailabilityRecords" (
     "Id"           INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
-    "FromServerId" TEXT NOT NULL,
-    "ToServerId"   TEXT NOT NULL,
-    "Timestamp"    TEXT NOT NULL,
+    "FromServerId" INTEGER NOT NULL REFERENCES "Servers"("Id"),
+    "ToServerId"   INTEGER NOT NULL REFERENCES "Servers"("Id"),
+    "Timestamp"    INTEGER NOT NULL,
     "IsAvailable"  INTEGER NOT NULL,
     "LatencyMs"    REAL NULL,
     "HttpStatus"   INTEGER NULL
@@ -108,10 +115,12 @@ func Open(path string) (*Store, error) {
 	// nothing here fills, and every insert would fail against it - one sample
 	// at a time, every few seconds, while the node went on looking healthy.
 	//
-	// There is deliberately no migration: retention keeps a week at most, so
-	// the history is cheap to lose and not worth the code to carry across.
-	// Dropping the tables unasked would be worse than refusing, though, so
-	// this says what it found and leaves the file for its owner to remove.
+	// There is deliberately no migration off that one: the disks of every
+	// stored sample are in a format this build cannot read back, and retention
+	// keeps a week at most, so the history is cheap to lose and not worth the
+	// code to carry across. Dropping the tables unasked would be worse than
+	// refusing, though, so this says what it found and leaves the file for its
+	// owner to remove.
 	legacy, err := hasColumn(db, "MetricSnapshots", "DisksJson")
 	if err != nil {
 		db.Close()
@@ -121,6 +130,23 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("%s stores disks as JSON, which this build replaced with the "+
 			"MetricDisks table; delete the file (and its -wal and -shm) to start clean", path)
+	}
+
+	// The move to integer keys and timestamps, unlike the disk split, loses
+	// nothing: a GUID maps to a row id and an ISO string to a millisecond
+	// count, both exactly. So this one is migrated rather than refused - the
+	// history is replaceable, but the peer register is what holds the mesh
+	// together, and rebuilding that is an operator's afternoon.
+	migrate, err := needsIntegerKeys(db)
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	if migrate {
+		if err := toIntegerKeys(db); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("migrate %s to integer keys: %w", path, err)
+		}
 	}
 
 	if _, err := db.Exec(schema); err != nil {
@@ -147,94 +173,124 @@ func (s *Store) Close() error { return s.db.Close() }
 
 // ── Servers ─────────────────────────────────────────────────────────────────
 
-// UpsertSelf writes this instance's own row. A blank url leaves any stored
-// address alone, the same rule UpsertPeer follows: a node started without a
-// PublicUrl configured has no better address to offer than the one it already
-// published.
-func (s *Store) UpsertSelf(id, name, location, url string) error {
-	_, err := s.db.Exec(`
-		INSERT INTO "Servers" ("Id","Name","Location","Url","IsSelf","LastSeen")
-		VALUES (?,?,?,NULLIF(?,''),1,?)
-		ON CONFLICT("Id") DO UPDATE SET
-			"Name"=excluded."Name",
-			"Location"=excluded."Location",
-			"Url"=COALESCE(excluded."Url", "Servers"."Url"),
-			"IsSelf"=1,
-			"LastSeen"=excluded."LastSeen"`,
-		id, name, location, url, model.Now().DB())
+// UpsertSelf writes this instance's own row and returns its id. A blank url
+// leaves any stored address alone, the same rule UpsertPeer follows: a node
+// started without a PublicUrl configured has no better address to offer than
+// the one it already published.
+func (s *Store) UpsertSelf(uid, name, location, url string) (int64, error) {
+	id, err := s.upsertServer(uid, name, location, url, true, model.Now())
 	if err != nil {
-		return fmt.Errorf("upsert self: %w", err)
+		return 0, fmt.Errorf("upsert self: %w", err)
 	}
-	return nil
+	return id, nil
 }
 
-// UpsertPeer records a peer's identity. A blank url leaves any stored URL
-// alone, so an introduction that omits it cannot erase a working address.
-func (s *Store) UpsertPeer(id, name, location, url string, lastSeen model.Time) error {
-	_, err := s.db.Exec(`
-		INSERT INTO "Servers" ("Id","Name","Location","Url","IsSelf","LastSeen")
-		VALUES (?,?,?,NULLIF(?,''),0,?)
-		ON CONFLICT("Id") DO UPDATE SET
+// UpsertPeer records a peer's identity and returns its id. A blank url leaves
+// any stored URL alone, so an introduction that omits it cannot erase a working
+// address.
+func (s *Store) UpsertPeer(uid, name, location, url string, lastSeen model.Time) (int64, error) {
+	id, err := s.upsertServer(uid, name, location, url, false, lastSeen)
+	if err != nil {
+		return 0, fmt.Errorf("upsert peer %s: %w", uid, err)
+	}
+	return id, nil
+}
+
+// upsertServer writes a server row keyed by its uid and returns the row id.
+// IsSelf is only ever raised, never cleared: an introduction arriving with this
+// node's own id would otherwise demote it to a peer of itself.
+func (s *Store) upsertServer(uid, name, location, url string, self bool, lastSeen model.Time) (int64, error) {
+	var id int64
+	err := s.db.QueryRow(`
+		INSERT INTO "Servers" ("Uid","Name","Location","Url","IsSelf","LastSeen")
+		VALUES (?,?,?,NULLIF(?,''),?,?)
+		ON CONFLICT("Uid") DO UPDATE SET
 			"Name"=excluded."Name",
 			"Location"=excluded."Location",
 			"Url"=COALESCE(excluded."Url", "Servers"."Url"),
-			"LastSeen"=excluded."LastSeen"`,
-		id, name, location, url, lastSeen.DB())
-	if err != nil {
-		return fmt.Errorf("upsert peer %s: %w", id, err)
+			"IsSelf"=MAX("Servers"."IsSelf", excluded."IsSelf"),
+			"LastSeen"=excluded."LastSeen"
+		RETURNING "Id"`,
+		uid, name, location, url, self, lastSeen.DB()).Scan(&id)
+	return id, err
+}
+
+// EnsureServer returns the row id for a uid, registering the server if this
+// node has never heard of it.
+//
+// A peer forwards the reachability it observed towards every node it knows, and
+// a cross-introduction that failed can leave this node holding an observation
+// about a third party it has no row for. Recording it under a placeholder keeps
+// the reading rather than discarding it; the name arrives with the next
+// introduction and overwrites the id standing in for it.
+func (s *Store) EnsureServer(uid string) (int64, error) {
+	var id int64
+	err := s.db.QueryRow(`SELECT "Id" FROM "Servers" WHERE "Uid"=?`, uid).Scan(&id)
+	if err == nil {
+		return id, nil
 	}
-	return nil
+	if !errors.Is(err, sql.ErrNoRows) {
+		return 0, fmt.Errorf("resolve server %s: %w", uid, err)
+	}
+
+	// The name stands in for itself until an introduction supplies a real one,
+	// and the unset LastSeen is what the dashboard reads as "no data" rather
+	// than as a node that has gone quiet. The conflict clause updates the uid to
+	// the value it already holds: a no-op that exists only so RETURNING still
+	// yields the row if one appeared since the select above.
+	err = s.db.QueryRow(`
+		INSERT INTO "Servers" ("Uid","Name","Location","Url","IsSelf","LastSeen")
+		VALUES (?,?,'',NULL,0,?)
+		ON CONFLICT("Uid") DO UPDATE SET "Uid"=excluded."Uid"
+		RETURNING "Id"`, uid, uid, model.Time{}.DB()).Scan(&id)
+	if err != nil {
+		return 0, fmt.Errorf("register server %s: %w", uid, err)
+	}
+	return id, nil
 }
 
 // SetPeerURL overwrites a peer's address unconditionally.
-func (s *Store) SetPeerURL(id, url string) error {
+func (s *Store) SetPeerURL(id int64, url string) error {
 	_, err := s.db.Exec(`UPDATE "Servers" SET "Url"=NULLIF(?,'') WHERE "Id"=?`, url, id)
 	if err != nil {
-		return fmt.Errorf("set peer url %s: %w", id, err)
+		return fmt.Errorf("set peer url %d: %w", id, err)
 	}
 	return nil
 }
 
 // TouchLastSeen records that a server was reachable at t.
-func (s *Store) TouchLastSeen(id string, t model.Time) error {
+func (s *Store) TouchLastSeen(id int64, t model.Time) error {
 	_, err := s.db.Exec(`UPDATE "Servers" SET "LastSeen"=? WHERE "Id"=?`, t.DB(), id)
 	if err != nil {
-		return fmt.Errorf("touch last seen %s: %w", id, err)
+		return fmt.Errorf("touch last seen %d: %w", id, err)
 	}
 	return nil
 }
 
-// GetServer returns one server row. The bool reports whether it existed.
-func (s *Store) GetServer(id string) (model.Server, bool, error) {
-	row := s.db.QueryRow(`
-		SELECT "Id","Name","Location",COALESCE("Url",''),"IsSelf","LastSeen"
-		FROM "Servers" WHERE "Id"=?`, id)
+const selectServer = `SELECT "Id","Uid","Name","Location",COALESCE("Url",''),"IsSelf","LastSeen" FROM "Servers"`
 
-	srv, err := scanServer(row)
+// ServerByUID returns the server published under uid. The bool reports whether
+// it existed, which is how the dashboard and peer endpoints turn the identity
+// they were handed into the id the tables are keyed by.
+func (s *Store) ServerByUID(uid string) (model.Server, bool, error) {
+	srv, err := scanServer(s.db.QueryRow(selectServer+` WHERE "Uid"=?`, uid))
 	if errors.Is(err, sql.ErrNoRows) {
 		return model.Server{}, false, nil
 	}
 	if err != nil {
-		return model.Server{}, false, fmt.Errorf("get server %s: %w", id, err)
+		return model.Server{}, false, fmt.Errorf("get server %s: %w", uid, err)
 	}
 	return srv, true, nil
 }
 
 // ListServers returns every known server, self included.
 func (s *Store) ListServers() ([]model.Server, error) {
-	return s.queryServers(`
-		SELECT "Id","Name","Location",COALESCE("Url",''),"IsSelf","LastSeen"
-		FROM "Servers"
-		ORDER BY "IsSelf" DESC, "Name"`)
+	return s.queryServers(selectServer + ` ORDER BY "IsSelf" DESC, "Name"`)
 }
 
 // ListPeers returns non-self servers that still have an address configured.
 func (s *Store) ListPeers() ([]model.Server, error) {
-	return s.queryServers(`
-		SELECT "Id","Name","Location",COALESCE("Url",''),"IsSelf","LastSeen"
-		FROM "Servers"
-		WHERE "IsSelf"=0 AND "Url" IS NOT NULL AND "Url"<>''
-		ORDER BY "Name"`)
+	return s.queryServers(selectServer + ` WHERE "IsSelf"=0 AND "Url" IS NOT NULL AND "Url"<>'' ORDER BY "Name"`)
 }
 
 func (s *Store) queryServers(query string, args ...any) ([]model.Server, error) {
@@ -261,16 +317,12 @@ type scanner interface{ Scan(dest ...any) error }
 func scanServer(sc scanner) (model.Server, error) {
 	var (
 		srv      model.Server
-		lastSeen string
+		lastSeen int64
 	)
-	if err := sc.Scan(&srv.ID, &srv.Name, &srv.Location, &srv.URL, &srv.IsSelf, &lastSeen); err != nil {
+	if err := sc.Scan(&srv.ID, &srv.UID, &srv.Name, &srv.Location, &srv.URL, &srv.IsSelf, &lastSeen); err != nil {
 		return model.Server{}, err
 	}
-	t, err := model.ParseDB(lastSeen)
-	if err != nil {
-		return model.Server{}, err
-	}
-	srv.LastSeen = t
+	srv.LastSeen = model.FromDB(lastSeen)
 	return srv, nil
 }
 
@@ -279,7 +331,7 @@ func scanServer(sc scanner) (model.Server, error) {
 // InsertMetrics appends samples for serverID and reports how many were
 // written. A sample's volumes go in the same transaction, so a snapshot never
 // exists without the disks it reported.
-func (s *Store) InsertMetrics(serverID string, metrics []model.Metric) (int, error) {
+func (s *Store) InsertMetrics(serverID int64, metrics []model.Metric) (int, error) {
 	if len(metrics) == 0 {
 		return 0, nil
 	}
@@ -338,30 +390,19 @@ func (s *Store) InsertMetrics(serverID string, metrics []model.Metric) (int, err
 // Peers resend an overlapping window on every sync, so this is the high-water
 // mark used to discard duplicates. Comparing against one value keeps the cost
 // constant regardless of how much history has accumulated.
-func (s *Store) MaxMetricTimestamp(serverID string) (model.Time, bool, error) {
-	var raw sql.NullString
-	err := s.db.QueryRow(`SELECT MAX("Timestamp") FROM "MetricSnapshots" WHERE "ServerId"=?`, serverID).Scan(&raw)
-	if err != nil {
-		return model.Time{}, false, fmt.Errorf("max metric timestamp: %w", err)
-	}
-	if !raw.Valid || raw.String == "" {
-		return model.Time{}, false, nil
-	}
-	t, err := model.ParseDB(raw.String)
-	if err != nil {
-		return model.Time{}, false, err
-	}
-	return t, true, nil
+func (s *Store) MaxMetricTimestamp(serverID int64) (model.Time, bool, error) {
+	return s.maxTimestamp(`SELECT MAX("Timestamp") FROM "MetricSnapshots" WHERE "ServerId"=?`,
+		"max metric timestamp", serverID)
 }
 
 // LatestMetric returns the newest sample for a server, or nil if there is none.
-func (s *Store) LatestMetric(serverID string) (*model.Metric, error) {
+func (s *Store) LatestMetric(serverID int64) (*model.Metric, error) {
 	metrics, err := s.queryMetrics(`
 		SELECT "Id","Timestamp","CpuPercent","CpuTempC","MemoryPercent","MemoryTotalMb","MemoryUsedMb","UptimeSeconds"
 		FROM "MetricSnapshots" WHERE "ServerId"=?
 		ORDER BY "Timestamp" DESC LIMIT 1`, serverID)
 	if err != nil {
-		return nil, fmt.Errorf("latest metric %s: %w", serverID, err)
+		return nil, fmt.Errorf("latest metric %d: %w", serverID, err)
 	}
 	if len(metrics) == 0 {
 		return nil, nil
@@ -370,7 +411,7 @@ func (s *Store) LatestMetric(serverID string) (*model.Metric, error) {
 }
 
 // MetricsSince returns a server's samples from since onwards, oldest first.
-func (s *Store) MetricsSince(serverID string, since model.Time) ([]model.Metric, error) {
+func (s *Store) MetricsSince(serverID int64, since model.Time) ([]model.Metric, error) {
 	metrics, err := s.queryMetrics(`
 		SELECT "Id","Timestamp","CpuPercent","CpuTempC","MemoryPercent","MemoryTotalMb","MemoryUsedMb","UptimeSeconds"
 		FROM "MetricSnapshots"
@@ -396,9 +437,13 @@ func (s *Store) MetricsSince(serverID string, since model.Time) ([]model.Metric,
 // bare column rather than becoming a MAX of its own. The id carries that same
 // row's volumes, so the disks reported for a bucket are one real reading
 // rather than a blend of drives that were never mounted at the same time.
-func (s *Store) MetricsBucketed(serverID string, since model.Time, bucket time.Duration) ([]model.Metric, error) {
-	seconds := int64(bucket / time.Second)
-	if seconds <= 0 {
+//
+// Grouping is integer division on the stored millisecond count. It used to go
+// through strftime, which had to parse a date string per row before it could
+// divide anything.
+func (s *Store) MetricsBucketed(serverID int64, since model.Time, bucket time.Duration) ([]model.Metric, error) {
+	width := bucket.Milliseconds()
+	if width <= 0 {
 		return s.MetricsSince(serverID, since)
 	}
 
@@ -407,8 +452,8 @@ func (s *Store) MetricsBucketed(serverID string, since model.Time, bucket time.D
 		       AVG("MemoryTotalMb"),AVG("MemoryUsedMb"),"UptimeSeconds"
 		FROM "MetricSnapshots"
 		WHERE "ServerId"=? AND "Timestamp">=?
-		GROUP BY CAST(strftime('%s',"Timestamp") AS INTEGER)/?
-		ORDER BY MAX("Timestamp")`, serverID, since.DB(), seconds)
+		GROUP BY "Timestamp"/?
+		ORDER BY MAX("Timestamp")`, serverID, since.DB(), width)
 	if err != nil {
 		return nil, fmt.Errorf("metrics bucketed: %w", err)
 	}
@@ -503,34 +548,43 @@ func scanMetric(sc scanner) (int64, model.Metric, error) {
 	var (
 		m  model.Metric
 		id int64
-		ts string
+		ts int64
 	)
 	if err := sc.Scan(&id, &ts, &m.CpuPercent, &m.CpuTempC, &m.MemoryPercent, &m.MemoryTotalMb,
 		&m.MemoryUsedMb, &m.UptimeSeconds); err != nil {
 		return 0, model.Metric{}, err
 	}
-	t, err := model.ParseDB(ts)
-	if err != nil {
-		return 0, model.Metric{}, err
-	}
-	m.Timestamp = t
+	m.Timestamp = model.FromDB(ts)
 	return id, m, nil
 }
 
 // ── Availability ────────────────────────────────────────────────────────────
 
-// AvailabilityRow is one stored reachability observation, including its origin.
+// Observation is one reachability reading about a server in this database,
+// named by its row id. Everything written is in this form, and so is one edge's
+// history, where the caller already knows both ends.
+type Observation struct {
+	ToServerID  int64
+	Timestamp   model.Time
+	IsAvailable bool
+	LatencyMs   *float64
+	HTTPStatus  *int
+}
+
+// AvailabilityRow is one stored observation with both ends resolved to the ids
+// their nodes publish, which is what the dashboard's matrix is drawn from - it
+// spans the whole mesh, so neither end is known in advance.
 type AvailabilityRow struct {
-	FromServerID string
-	ToServerID   string
-	Timestamp    model.Time
-	IsAvailable  bool
-	LatencyMs    *float64
-	HTTPStatus   *int
+	FromUID     string
+	ToUID       string
+	Timestamp   model.Time
+	IsAvailable bool
+	LatencyMs   *float64
+	HTTPStatus  *int
 }
 
 // InsertAvailability appends observations made by fromServerID.
-func (s *Store) InsertAvailability(fromServerID string, records []model.Availability) error {
+func (s *Store) InsertAvailability(fromServerID int64, records []Observation) error {
 	if len(records) == 0 {
 		return nil
 	}
@@ -565,61 +619,36 @@ func (s *Store) InsertAvailability(fromServerID string, records []model.Availabi
 
 // MaxAvailabilityTimestamp returns the newest observation time recorded by a
 // given origin server, used to drop duplicates arriving from a peer resync.
-func (s *Store) MaxAvailabilityTimestamp(fromServerID string) (model.Time, bool, error) {
-	var raw sql.NullString
-	err := s.db.QueryRow(`SELECT MAX("Timestamp") FROM "AvailabilityRecords" WHERE "FromServerId"=?`, fromServerID).Scan(&raw)
-	if err != nil {
-		return model.Time{}, false, fmt.Errorf("max availability timestamp: %w", err)
+func (s *Store) MaxAvailabilityTimestamp(fromServerID int64) (model.Time, bool, error) {
+	return s.maxTimestamp(`SELECT MAX("Timestamp") FROM "AvailabilityRecords" WHERE "FromServerId"=?`,
+		"max availability timestamp", fromServerID)
+}
+
+// maxTimestamp runs a MAX("Timestamp") query, reporting through the bool
+// whether there was any row to take a maximum of.
+func (s *Store) maxTimestamp(query, what string, args ...any) (model.Time, bool, error) {
+	var raw sql.NullInt64
+	if err := s.db.QueryRow(query, args...).Scan(&raw); err != nil {
+		return model.Time{}, false, fmt.Errorf("%s: %w", what, err)
 	}
-	if !raw.Valid || raw.String == "" {
+	if !raw.Valid {
 		return model.Time{}, false, nil
 	}
-	t, err := model.ParseDB(raw.String)
-	if err != nil {
-		return model.Time{}, false, err
-	}
-	return t, true, nil
+	return model.FromDB(raw.Int64), true, nil
 }
 
-// AvailabilitySince returns every observation newer than since, from any origin.
+// AvailabilitySince returns every observation newer than since, from any
+// origin, for the dashboard's matrix.
 func (s *Store) AvailabilitySince(since model.Time) ([]AvailabilityRow, error) {
-	return s.queryAvailability(`
-		SELECT "FromServerId","ToServerId","Timestamp","IsAvailable","LatencyMs","HttpStatus"
-		FROM "AvailabilityRecords"
-		WHERE "Timestamp">=?
-		ORDER BY "Timestamp"`, since.DB())
-}
-
-// LatestAvailability returns the most recent observation on one edge of the
-// mesh, or nil when that pair has never been measured.
-func (s *Store) LatestAvailability(fromServerID, toServerID string) (*AvailabilityRow, error) {
-	rows, err := s.queryAvailability(`
-		SELECT "FromServerId","ToServerId","Timestamp","IsAvailable","LatencyMs","HttpStatus"
-		FROM "AvailabilityRecords"
-		WHERE "FromServerId"=? AND "ToServerId"=?
-		ORDER BY "Timestamp" DESC LIMIT 1`, fromServerID, toServerID)
+	rows, err := s.db.Query(`
+		SELECT f."Uid",t."Uid",a."Timestamp",a."IsAvailable",a."LatencyMs",a."HttpStatus"
+		FROM "AvailabilityRecords" a
+		JOIN "Servers" f ON f."Id"=a."FromServerId"
+		JOIN "Servers" t ON t."Id"=a."ToServerId"
+		WHERE a."Timestamp">=?
+		ORDER BY a."Timestamp"`, since.DB())
 	if err != nil {
-		return nil, err
-	}
-	if len(rows) == 0 {
-		return nil, nil
-	}
-	return &rows[0], nil
-}
-
-// AvailabilityHistory returns one edge's observations from since onwards.
-func (s *Store) AvailabilityHistory(fromServerID, toServerID string, since model.Time) ([]AvailabilityRow, error) {
-	return s.queryAvailability(`
-		SELECT "FromServerId","ToServerId","Timestamp","IsAvailable","LatencyMs","HttpStatus"
-		FROM "AvailabilityRecords"
-		WHERE "FromServerId"=? AND "ToServerId"=? AND "Timestamp">=?
-		ORDER BY "Timestamp"`, fromServerID, toServerID, since.DB())
-}
-
-func (s *Store) queryAvailability(query string, args ...any) ([]AvailabilityRow, error) {
-	rows, err := s.db.Query(query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("query availability: %w", err)
+		return nil, fmt.Errorf("availability since: %w", err)
 	}
 	defer rows.Close()
 
@@ -627,17 +656,88 @@ func (s *Store) queryAvailability(query string, args ...any) ([]AvailabilityRow,
 	for rows.Next() {
 		var (
 			r  AvailabilityRow
-			ts string
+			ts int64
 		)
-		if err := rows.Scan(&r.FromServerID, &r.ToServerID, &ts, &r.IsAvailable, &r.LatencyMs, &r.HTTPStatus); err != nil {
+		if err := rows.Scan(&r.FromUID, &r.ToUID, &ts, &r.IsAvailable, &r.LatencyMs, &r.HTTPStatus); err != nil {
 			return nil, fmt.Errorf("scan availability: %w", err)
 		}
-		t, err := model.ParseDB(ts)
-		if err != nil {
-			return nil, err
-		}
-		r.Timestamp = t
+		r.Timestamp = model.FromDB(ts)
 		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// OwnAvailabilitySince returns the observations fromServerID itself made from
+// since onwards, in the form a peer is sent them.
+//
+// Only a node's own readings are its to forward - relaying what a peer reported
+// would duplicate it around the mesh - so the origin is a condition on the
+// index rather than a filter applied to every row afterwards.
+func (s *Store) OwnAvailabilitySince(fromServerID int64, since model.Time) ([]model.Availability, error) {
+	rows, err := s.db.Query(`
+		SELECT t."Uid",a."Timestamp",a."IsAvailable",a."LatencyMs",a."HttpStatus"
+		FROM "AvailabilityRecords" a
+		JOIN "Servers" t ON t."Id"=a."ToServerId"
+		WHERE a."FromServerId"=? AND a."Timestamp">=?
+		ORDER BY a."Timestamp"`, fromServerID, since.DB())
+	if err != nil {
+		return nil, fmt.Errorf("own availability since: %w", err)
+	}
+	defer rows.Close()
+
+	out := []model.Availability{}
+	for rows.Next() {
+		var (
+			a  model.Availability
+			ts int64
+		)
+		if err := rows.Scan(&a.ToServerID, &ts, &a.IsAvailable, &a.LatencyMs, &a.HTTPStatus); err != nil {
+			return nil, fmt.Errorf("scan own availability: %w", err)
+		}
+		a.Timestamp = model.FromDB(ts)
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
+// LatestAvailability reports the most recent observation on one edge of the
+// mesh. The second bool is false when that pair has never been measured, which
+// is not the same as having been measured as down.
+func (s *Store) LatestAvailability(fromServerID, toServerID int64) (available, found bool, err error) {
+	err = s.db.QueryRow(`
+		SELECT "IsAvailable" FROM "AvailabilityRecords"
+		WHERE "FromServerId"=? AND "ToServerId"=?
+		ORDER BY "Timestamp" DESC LIMIT 1`, fromServerID, toServerID).Scan(&available)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, false, nil
+	}
+	if err != nil {
+		return false, false, fmt.Errorf("latest availability %d->%d: %w", fromServerID, toServerID, err)
+	}
+	return available, true, nil
+}
+
+// AvailabilityHistory returns one edge's observations from since onwards.
+func (s *Store) AvailabilityHistory(fromServerID, toServerID int64, since model.Time) ([]Observation, error) {
+	rows, err := s.db.Query(`
+		SELECT "Timestamp","IsAvailable","LatencyMs","HttpStatus"
+		FROM "AvailabilityRecords"
+		WHERE "FromServerId"=? AND "ToServerId"=? AND "Timestamp">=?
+		ORDER BY "Timestamp"`, fromServerID, toServerID, since.DB())
+	if err != nil {
+		return nil, fmt.Errorf("availability history: %w", err)
+	}
+	defer rows.Close()
+
+	out := []Observation{}
+	for rows.Next() {
+		o := Observation{ToServerID: toServerID}
+		var ts int64
+		if err := rows.Scan(&ts, &o.IsAvailable, &o.LatencyMs, &o.HTTPStatus); err != nil {
+			return nil, fmt.Errorf("scan availability history: %w", err)
+		}
+		o.Timestamp = model.FromDB(ts)
+		out = append(out, o)
 	}
 	return out, rows.Err()
 }

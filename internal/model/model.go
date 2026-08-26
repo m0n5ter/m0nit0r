@@ -13,13 +13,8 @@ import (
 // offset here would produce an invalid date string in the browser.
 const jsonLayout = "2006-01-02T15:04:05.9999999"
 
-// dbLayout matches EF Core's SQLite DateTime encoding: same shape but space
-// separated and fixed-width, so that lexicographic TEXT comparison in SQL is
-// equivalent to chronological comparison. Widths must not vary here.
-const dbLayout = "2006-01-02 15:04:05.0000000"
-
-// Time is a UTC timestamp that round-trips through both the .NET-compatible
-// JSON form and the EF Core-compatible SQLite TEXT form.
+// Time is a UTC timestamp that round-trips through the .NET-compatible JSON
+// form on the wire and a Unix millisecond integer in the database.
 type Time struct {
 	time.Time
 }
@@ -53,22 +48,16 @@ func (t *Time) UnmarshalJSON(b []byte) error {
 	return fmt.Errorf("model: cannot parse time %q", s)
 }
 
-// DB renders the timestamp for storage in SQLite.
-func (t Time) DB() string { return t.UTC().Format(dbLayout) }
+// DB renders the timestamp for storage in SQLite, as milliseconds since the
+// Unix epoch. An integer sorts, ranges and buckets arithmetically, where the
+// TEXT encoding this replaced only sorted chronologically because every value
+// was padded to the same width, and had to go through strftime to be grouped.
+// Millisecond resolution is far finer than the sampling interval.
+func (t Time) DB() int64 { return t.UTC().UnixMilli() }
 
-// ParseDB reads a timestamp back out of SQLite, tolerating rows written with a
-// shorter fraction than the canonical seven digits.
-func ParseDB(s string) (Time, error) {
-	if s == "" {
-		return Time{}, nil
-	}
-	for _, layout := range []string{"2006-01-02 15:04:05", "2006-01-02T15:04:05"} {
-		if v, err := time.Parse(layout, s); err == nil {
-			return Time{v.UTC()}, nil
-		}
-	}
-	return Time{}, fmt.Errorf("model: cannot parse stored time %q", s)
-}
+// FromDB reads a timestamp back out of SQLite. The zero Time survives the round
+// trip, so a row that was never stamped still reads as unset.
+func FromDB(ms int64) Time { return Time{time.UnixMilli(ms).UTC()} }
 
 // Disk is one fixed volume in a snapshot. TempC is the temperature of the drive
 // backing the volume, nil when the drive exposes no sensor.
@@ -95,13 +84,19 @@ type Snapshot struct {
 }
 
 // Server is a node known to this instance, self included.
+//
+// ID is the row id in this node's own database and means nothing anywhere
+// else; UID is the identity the node was given at first start and the one that
+// travels, so it is what the peer protocol and the dashboard both speak. The
+// tables reference servers by ID, which is why the two are carried together.
 type Server struct {
-	ID       string `json:"id"`
-	Name     string `json:"name"`
-	Location string `json:"location"`
-	URL      string `json:"url"`
-	IsSelf   bool   `json:"isSelf"`
-	LastSeen Time   `json:"lastSeen"`
+	ID       int64
+	UID      string
+	Name     string
+	Location string
+	URL      string
+	IsSelf   bool
+	LastSeen Time
 }
 
 // Metric is a stored sample, for either this server or a peer. The volumes are

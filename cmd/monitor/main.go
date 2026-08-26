@@ -93,8 +93,12 @@ func runApp(parent context.Context, log *slog.Logger, opts config.Options, baseD
 	}
 	defer st.Close()
 
-	if err := st.UpsertSelf(opts.ServerID, opts.ServerName, opts.Location,
-		peer.NormalizeURL(opts.PublicURL)); err != nil {
+	// The row id this resolves to is what every table is keyed by, so it is
+	// read once here and handed to the workers and the API rather than looked
+	// up again on each write.
+	serverID, err := st.UpsertSelf(opts.ServerID, opts.ServerName, opts.Location,
+		peer.NormalizeURL(opts.PublicURL))
+	if err != nil {
 		return err
 	}
 
@@ -115,7 +119,8 @@ func runApp(parent context.Context, log *slog.Logger, opts config.Options, baseD
 		Store:      st,
 		Client:     client,
 		Signer:     signer,
-		ServerID:   opts.ServerID,
+		ServerID:   serverID,
+		ServerUID:  opts.ServerID,
 		ServerName: opts.ServerName,
 		Location:   opts.Location,
 		PublicURL:  peer.NormalizeURL(opts.PublicURL),
@@ -142,7 +147,7 @@ func runApp(parent context.Context, log *slog.Logger, opts config.Options, baseD
 				LibreHardwareMonitorURL: opts.LibreHardwareMonitor,
 				Log:                     log,
 			}),
-			ServerID:  opts.ServerID,
+			ServerID:  serverID,
 			Interval:  time.Duration(opts.MetricIntervalSeconds) * time.Second,
 			Retention: time.Duration(opts.RetentionDays) * 24 * time.Hour,
 			Log:       log,
@@ -150,7 +155,8 @@ func runApp(parent context.Context, log *slog.Logger, opts config.Options, baseD
 		(&worker.Sync{
 			Store:      st,
 			Client:     client,
-			ServerID:   opts.ServerID,
+			ServerID:   serverID,
+			ServerUID:  opts.ServerID,
 			ServerName: opts.ServerName,
 			Location:   opts.Location,
 			PublicURL:  peer.NormalizeURL(opts.PublicURL),
