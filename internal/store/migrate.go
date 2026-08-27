@@ -142,3 +142,30 @@ func toIntegerKeys(db *sql.DB) error {
 	db.Exec(`VACUUM`)
 	return nil
 }
+
+// addColumns brings a table created by an earlier build up to the current
+// shape. CREATE TABLE IF NOT EXISTS leaves an existing table exactly as it
+// found it, so a column added to the schema after a node was deployed has to be
+// applied separately.
+//
+// Unlike toIntegerKeys this needs no data rewritten: every column here carries
+// a DEFAULT, which is what SQLite fills the existing rows with. A node whose
+// register predates the alerting flag reads back as one where nobody alerts,
+// which is exactly what was true of it.
+func addColumns(db *sql.DB) error {
+	for _, col := range []struct{ table, name, decl string }{
+		{"Servers", "Alerts", `"Alerts" INTEGER NOT NULL DEFAULT 0`},
+	} {
+		present, err := hasColumn(db, col.table, col.name)
+		if err != nil {
+			return err
+		}
+		if present {
+			continue
+		}
+		if _, err := db.Exec(`ALTER TABLE "` + col.table + `" ADD COLUMN ` + col.decl); err != nil {
+			return fmt.Errorf("add %s.%s: %w", col.table, col.name, err)
+		}
+	}
+	return nil
+}

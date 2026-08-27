@@ -110,7 +110,7 @@ func TestMetricsBucketedAveragesAndKeepsTheNewestSample(t *testing.T) {
 	}
 	defer s.Close()
 
-	node, err := s.UpsertSelf("11111111-1111-4111-8111-111111111111", "node-1", "Lab", "")
+	node, err := s.UpsertSelf("11111111-1111-4111-8111-111111111111", "node-1", "Lab", "", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -404,7 +404,7 @@ func TestEnsureServerRegistersAnUnknownIdOnce(t *testing.T) {
 	}
 
 	// An introduction arriving afterwards names it without adding a second row.
-	named, err := s.UpsertPeer(uidGone, "late", "Remote", "http://late:5001", model.Now())
+	named, err := s.UpsertPeer(uidGone, "late", "Remote", "http://late:5001", false, model.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -418,5 +418,214 @@ func TestEnsureServerRegistersAnUnknownIdOnce(t *testing.T) {
 	}
 	if len(servers) != 1 || servers[0].Name != "late" {
 		t.Errorf("servers are %+v, want the one row, now named", servers)
+	}
+}
+
+// alertingFixture is a store holding this node and one peer, ready to have a
+// route between them written.
+func alertingFixture(t *testing.T) (*Store, int64, int64) {
+	t.Helper()
+
+	s, err := Open(filepath.Join(t.TempDir(), "monitor.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+
+	self, err := s.UpsertSelf("11111111-1111-4111-8111-111111111111", "here", "Lab", "http://here:5001", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := s.UpsertPeer("22222222-2222-4222-8222-222222222222", "there", "Remote",
+		"http://there:5001", false, model.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s, self, other
+}
+
+// TestStreakFindsWhereTheCurrentRunBegan is the reading the alert thresholds
+// are measured against, so what it has to get right is the start of the run and
+// not merely its state: a node that has been down for an hour and one that
+// failed its first check a moment ago look identical in the newest record.
+func TestStreakFindsWhereTheCurrentRunBegan(t *testing.T) {
+	s, self, other := alertingFixture(t)
+
+	base := time.Date(2026, 8, 27, 12, 0, 0, 0, time.UTC)
+	// Up for a minute, then down for two, which is the shape of an outage
+	// caught in progress.
+	states := []bool{true, true, true, true, true, true, false, false, false, false, false, false}
+	records := make([]Observation, 0, len(states))
+	for i, up := range states {
+		records = append(records, Observation{
+			ToServerID:  other,
+			Timestamp:   model.At(base.Add(time.Duration(i) * 10 * time.Second)),
+			IsAvailable: up,
+		})
+	}
+	if err := s.InsertAvailability(self, records); err != nil {
+		t.Fatal(err)
+	}
+
+	available, since, found, err := s.Streak(self, other)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("Streak found nothing on an edge with a dozen observations")
+	}
+	if available {
+		t.Error("Streak reports the peer available, but the newest check failed")
+	}
+	// The sixth reading, at 60s, is the last success; the seventh is where the
+	// outage begins and is what its duration has to be measured from.
+	if want := base.Add(60 * time.Second); !since.Equal(want) {
+		t.Errorf("the run begins at %s, want %s", since.UTC(), want)
+	}
+
+	// Coming back starts a new run, from the first success rather than from the
+	// newest one, or a recovery would always read as having just happened.
+	recovered := model.At(base.Add(2 * time.Minute))
+	if err := s.InsertAvailability(self, []Observation{
+		{ToServerID: other, Timestamp: recovered, IsAvailable: true},
+		{ToServerID: other, Timestamp: model.At(base.Add(130 * time.Second)), IsAvailable: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	available, since, _, err = s.Streak(self, other)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !available {
+		t.Error("Streak reports the peer down after two successful checks")
+	}
+	if !since.Equal(recovered.Time) {
+		t.Errorf("the recovery begins at %s, want %s", since.UTC(), recovered.UTC())
+	}
+}
+
+func TestStreakReportsNothingForAnUnmeasuredEdge(t *testing.T) {
+	s, self, other := alertingFixture(t)
+
+	_, _, found, err := s.Streak(self, other)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if found {
+		t.Error("Streak found a run on an edge that was never probed")
+	}
+}
+
+// TestLatestNoticeSpansTheWholeMesh is the property the whole scheme rests on:
+// a node suppresses its own message on the strength of somebody else's, so what
+// it reads back has to be the newest announcement from any origin, not the
+// newest of its own.
+func TestLatestNoticeSpansTheWholeMesh(t *testing.T) {
+	s, self, other := alertingFixture(t)
+
+	base := time.Date(2026, 8, 27, 12, 0, 0, 0, time.UTC)
+	if err := s.InsertNotices(self, []Notice{
+		{ToServerID: other, Timestamp: model.At(base), IsDown: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The same node, reported back up by a third party a minute later.
+	third, err := s.EnsureServer("33333333-3333-4333-8333-333333333333")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertNotices(third, []Notice{
+		{ToServerID: other, Timestamp: model.At(base.Add(time.Minute)), IsDown: false},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	last, announced, err := s.LatestNotice(other)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !announced {
+		t.Fatal("LatestNotice found nothing after two notices were written")
+	}
+	if last.IsDown {
+		t.Error("LatestNotice returned the older down notice over the newer up one")
+	}
+
+	// Only a node's own announcements are its to forward, or one report would
+	// multiply around the mesh.
+	own, err := s.OwnNoticesSince(self, model.At(base.Add(-time.Hour)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(own) != 1 || !own[0].IsDown {
+		t.Errorf("own notices are %+v, want only the one this node made", own)
+	}
+	if own[0].ToServerID != "22222222-2222-4222-8222-222222222222" {
+		t.Errorf("the notice names %q, want the peer's published id", own[0].ToServerID)
+	}
+}
+
+// TestOpenAddsTheAlertingColumnToAnExistingRegister is the upgrade every
+// already-deployed node takes. Its database is on integer keys already, so none
+// of the rewriting migrations apply to it and CREATE TABLE IF NOT EXISTS leaves
+// its Servers table exactly as it found it - which means the column the
+// alerting order is read from would not be there at all, and every query that
+// names it would fail from the first tick onwards.
+func TestOpenAddsTheAlertingColumnToAnExistingRegister(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "monitor.db")
+
+	// The Servers table as the build before alerting created it.
+	existing, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := existing.Exec(`
+		CREATE TABLE "Servers" (
+		    "Id"       INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+		    "Uid"      TEXT NOT NULL UNIQUE,
+		    "Name"     TEXT NOT NULL,
+		    "Location" TEXT NOT NULL,
+		    "Url"      TEXT NULL,
+		    "IsSelf"   INTEGER NOT NULL,
+		    "LastSeen" INTEGER NOT NULL
+		);
+		INSERT INTO "Servers" ("Uid","Name","Location","Url","IsSelf","LastSeen")
+		VALUES ('11111111-1111-4111-8111-111111111111','here','Lab','http://here:5001',1,0)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := existing.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("open a register without the alerting column: %v", err)
+	}
+	defer s.Close()
+
+	servers, err := s.ListServers()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(servers) != 1 {
+		t.Fatalf("servers are %+v, want the one row that was already there", servers)
+	}
+	// Backfilled as "does not alert", which is what was true of every node
+	// before this existed.
+	if servers[0].Name != "here" || servers[0].Alerts {
+		t.Errorf("the migrated row is %+v, want it intact and not alerting", servers[0])
+	}
+
+	// And the flag is writable from here on, which is what the node does with
+	// its own row at every start.
+	if _, err := s.UpsertSelf("11111111-1111-4111-8111-111111111111", "here", "Lab", "", true); err != nil {
+		t.Fatal(err)
+	}
+	if servers, err = s.ListServers(); err != nil {
+		t.Fatal(err)
+	} else if !servers[0].Alerts {
+		t.Error("the row did not take the alerting flag after the column was added")
 	}
 }

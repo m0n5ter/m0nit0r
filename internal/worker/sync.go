@@ -26,6 +26,7 @@ type Sync struct {
 	ServerName string
 	Location   string
 	PublicURL  string
+	Alerts     bool
 	Interval   time.Duration
 	Log        *slog.Logger
 
@@ -35,6 +36,7 @@ type Sync struct {
 	// being skipped.
 	lastMetric model.Time
 	lastAvail  model.Time
+	lastNotice model.Time
 }
 
 // Run synchronises until ctx is cancelled.
@@ -42,7 +44,7 @@ func (w *Sync) Run(ctx context.Context) {
 	w.Log.Info("peer sync started", "interval", w.Interval)
 
 	start := model.At(time.Now().Add(-backfillWindow))
-	w.lastMetric, w.lastAvail = start, start
+	w.lastMetric, w.lastAvail, w.lastNotice = start, start, start
 
 	// Let the first metrics land before the opening round, so a fresh peer is
 	// not handed an empty payload.
@@ -79,7 +81,7 @@ func (w *Sync) round(ctx context.Context) error {
 		return nil
 	}
 
-	payload, newestMetric, newestAvail, err := w.buildPayload()
+	payload, marks, err := w.buildPayload()
 	if err != nil {
 		return err
 	}
@@ -95,9 +97,20 @@ func (w *Sync) round(ctx context.Context) error {
 	}
 	wg.Wait()
 
-	w.lastMetric, w.lastAvail = newestMetric, newestAvail
+	w.lastMetric, w.lastAvail, w.lastNotice = marks.metric, marks.avail, marks.notice
 	w.Log.Debug("sync round complete", "metrics", len(payload.Metrics), "peers", len(peers))
 	return nil
+}
+
+// watermarks is how far each of the three streams has been offered to peers.
+type watermarks struct{ metric, avail, notice model.Time }
+
+// advance moves a watermark to t when t is newer, which is how the newest row
+// actually sent is found without sorting what was read.
+func advance(mark *model.Time, t model.Time) {
+	if t.After(mark.Time) {
+		*mark = t
+	}
 }
 
 func (w *Sync) push(ctx context.Context, target model.Server, payload model.SyncPayload, timestamp model.Time) {
@@ -125,29 +138,36 @@ func (w *Sync) push(ctx context.Context, target model.Server, payload model.Sync
 
 // buildPayload gathers everything produced locally since the last round, and
 // reports the newest timestamp in each stream so the watermarks can advance.
-func (w *Sync) buildPayload() (model.SyncPayload, model.Time, model.Time, error) {
+func (w *Sync) buildPayload() (model.SyncPayload, watermarks, error) {
+	marks := watermarks{w.lastMetric, w.lastAvail, w.lastNotice}
+
 	metrics, err := w.Store.MetricsSince(w.ServerID, w.lastMetric)
 	if err != nil {
-		return model.SyncPayload{}, w.lastMetric, w.lastAvail, err
+		return model.SyncPayload{}, marks, err
 	}
 
 	availability, err := w.Store.OwnAvailabilitySince(w.ServerID, w.lastAvail)
 	if err != nil {
-		return model.SyncPayload{}, w.lastMetric, w.lastAvail, err
+		return model.SyncPayload{}, marks, err
 	}
 
-	newestMetric := w.lastMetric
+	// What this node has already announced about its peers. Carried so that
+	// the other alerting nodes can see the message was sent and not send it
+	// again - and, when this node stops sending them, so that they can see it
+	// stopped and take over.
+	notices, err := w.Store.OwnNoticesSince(w.ServerID, w.lastNotice)
+	if err != nil {
+		return model.SyncPayload{}, marks, err
+	}
+
 	for _, m := range metrics {
-		if m.Timestamp.After(newestMetric.Time) {
-			newestMetric = m.Timestamp
-		}
+		advance(&marks.metric, m.Timestamp)
 	}
-
-	newestAvail := w.lastAvail
 	for _, a := range availability {
-		if a.Timestamp.After(newestAvail.Time) {
-			newestAvail = a.Timestamp
-		}
+		advance(&marks.avail, a.Timestamp)
+	}
+	for _, n := range notices {
+		advance(&marks.notice, n.Timestamp)
 	}
 
 	return model.SyncPayload{
@@ -155,7 +175,9 @@ func (w *Sync) buildPayload() (model.SyncPayload, model.Time, model.Time, error)
 		ServerName:   w.ServerName,
 		Location:     w.Location,
 		SelfURL:      w.PublicURL,
+		Alerts:       w.Alerts,
 		Metrics:      metrics,
 		Availability: availability,
-	}, newestMetric, newestAvail, nil
+		Notices:      notices,
+	}, marks, nil
 }

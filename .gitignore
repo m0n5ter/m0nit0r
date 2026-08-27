@@ -18,6 +18,7 @@ dist/
 appsettings.json
 !appsettings.example.json
 deploy/.secret
+deploy/.telegram
 
 ## Database
 *.db

@@ -46,6 +46,7 @@ type Server struct {
 	ServerName string
 	Location   string
 	PublicURL  string
+	Alerts     bool
 	Log        *slog.Logger
 }
 
@@ -105,6 +106,7 @@ func (s *Server) identity() model.HealthResponse {
 		ServerID:   s.ServerUID,
 		ServerName: s.ServerName,
 		Location:   s.Location,
+		Alerts:     s.Alerts,
 		Timestamp:  model.Now(),
 	}
 }
@@ -123,7 +125,7 @@ func (s *Server) handleIntroduce(w http.ResponseWriter, r *http.Request) {
 	// storing, so record the caller only when both id and URL are present.
 	if req.ServerID != "" && req.ServerID != s.ServerUID && peer.NormalizeURL(req.SelfURL) != "" {
 		if _, err := s.Store.UpsertPeer(req.ServerID, req.ServerName, req.Location,
-			peer.NormalizeURL(req.SelfURL), model.Now()); err != nil {
+			peer.NormalizeURL(req.SelfURL), req.Alerts, model.Now()); err != nil {
 			s.Log.Error("record introducing peer", "peer", req.ServerID, "err", err)
 			http.Error(w, "failed to record peer", http.StatusInternalServerError)
 			return
@@ -148,7 +150,7 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 	}
 
 	peerID, err := s.Store.UpsertPeer(payload.ServerID, payload.ServerName, payload.Location,
-		peer.NormalizeURL(payload.SelfURL), model.Now())
+		peer.NormalizeURL(payload.SelfURL), payload.Alerts, model.Now())
 	if err != nil {
 		s.Log.Error("record syncing peer", "peer", payload.ServerID, "err", err)
 		http.Error(w, "failed to record peer", http.StatusInternalServerError)
@@ -163,6 +165,11 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 	if err := s.storeSyncedAvailability(peerID, payload); err != nil {
 		s.Log.Error("store synced availability", "peer", payload.ServerID, "err", err)
 		http.Error(w, "failed to store availability", http.StatusInternalServerError)
+		return
+	}
+	if err := s.storeSyncedNotices(peerID, payload); err != nil {
+		s.Log.Error("store synced notices", "peer", payload.ServerID, "err", err)
+		http.Error(w, "failed to store notices", http.StatusInternalServerError)
 		return
 	}
 
@@ -231,6 +238,42 @@ func (s *Server) storeSyncedAvailability(peerID int64, payload model.SyncPayload
 	}
 
 	return s.Store.InsertAvailability(peerID, fresh)
+}
+
+// storeSyncedNotices does the same for the alerts a peer reported having sent.
+// This is what stops an outage from arriving in Telegram once per alerting node
+// - each of them learns here what the others have already announced.
+func (s *Server) storeSyncedNotices(peerID int64, payload model.SyncPayload) error {
+	if len(payload.Notices) == 0 {
+		return nil
+	}
+
+	watermark, ok, err := s.Store.MaxNoticeTimestamp(peerID)
+	if err != nil {
+		return err
+	}
+
+	targets := map[string]int64{}
+	fresh := make([]store.Notice, 0, len(payload.Notices))
+	for _, n := range payload.Notices {
+		if ok && !n.Timestamp.After(watermark.Time) {
+			continue
+		}
+		to, resolved := targets[n.ToServerID]
+		if !resolved {
+			if to, err = s.Store.EnsureServer(n.ToServerID); err != nil {
+				return err
+			}
+			targets[n.ToServerID] = to
+		}
+		fresh = append(fresh, store.Notice{
+			ToServerID: to,
+			Timestamp:  n.Timestamp,
+			IsDown:     n.IsDown,
+		})
+	}
+
+	return s.Store.InsertNotices(peerID, fresh)
 }
 
 // ── Dashboard data ──────────────────────────────────────────────────────────
@@ -454,6 +497,7 @@ func (s *Server) handleAddPeer(w http.ResponseWriter, r *http.Request) {
 		ServerName: s.ServerName,
 		Location:   s.Location,
 		SelfURL:    s.PublicURL,
+		Alerts:     s.Alerts,
 	})
 	if err != nil {
 		s.Log.Warn("introduce to new peer failed", "url", url, "err", err)
@@ -479,7 +523,8 @@ func (s *Server) handleAddPeer(w http.ResponseWriter, r *http.Request) {
 
 	// LastSeen records when this server observed the peer, so it uses the local
 	// clock rather than the timestamp the peer reported about itself.
-	if _, err := s.Store.UpsertPeer(identity.ServerID, identity.ServerName, identity.Location, url, model.Now()); err != nil {
+	if _, err := s.Store.UpsertPeer(identity.ServerID, identity.ServerName, identity.Location, url,
+		identity.Alerts, model.Now()); err != nil {
 		s.fail(w, "store peer", err)
 		return
 	}
@@ -515,12 +560,14 @@ func (s *Server) crossIntroduce(ctx context.Context, existing []model.Server, id
 			ServerName: identity.ServerName,
 			Location:   identity.Location,
 			SelfURL:    url,
+			Alerts:     identity.Alerts,
 		})
 		go announce(url, model.IntroduceRequest{
 			ServerID:   p.UID,
 			ServerName: p.Name,
 			Location:   p.Location,
 			SelfURL:    p.URL,
+			Alerts:     p.Alerts,
 		})
 	}
 	wg.Wait()

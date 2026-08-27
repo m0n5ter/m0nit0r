@@ -55,9 +55,73 @@ launches it.
 | `MetricIntervalSeconds` | `5` | How often to sample CPU, memory, disk and temperature |
 | `SyncIntervalSeconds` | `10` | How often to push data to peers |
 | `RetentionDays` | `7` | How long to keep history, in days. Also the ceiling: a larger value, or none, is treated as 7 |
+| `Telegram.BotToken` | empty | Bot token from [@BotFather](https://t.me/BotFather). Empty on both this and `ChatId` disables alerting on this node |
+| `Telegram.ChatId` | empty | Chat to send alerts to — your own user id, or a group/channel id (negative, e.g. `-1001234567890`) |
+| `Telegram.DownAfterSeconds` | `120` | How long a peer has to stay unreachable before it is reported |
+| `Telegram.RepeatMinutes` | `60` | How often an outage that is still going is reported again |
+| `Telegram.StaggerSeconds` | `60` | How far apart alerting nodes take their turns. See [Alerting](#alerting) |
 
 Peers are not configured in this file. Add them at runtime from the dashboard, or by
 posting to `/api/peers`.
+
+## Alerting
+
+A node with `Telegram.BotToken` and `Telegram.ChatId` set sends a message when a peer
+stops answering and another when it comes back:
+
+```
+🔴 BG is unreachable
+Location: 45.39.253.23
+Down for: 2m 10s
+Unreachable since: 2026-08-27 14:32:05 UTC
+Seen from: DE
+```
+
+What it reports is what that node itself observed — the same readings it contributes to
+the availability matrix. A peer's opinion of a third node is not evidence about this
+node's route to it, and is not alerted on.
+
+An outage is reported once, then again every `RepeatMinutes` for as long as it lasts,
+and once more when it ends. A blip shorter than `DownAfterSeconds` is not reported at
+all, which is what keeps a reboot or a lost sync round out of the chat.
+
+### More than one alerting node
+
+Alerting should be enabled on **at least two** nodes. The one node that alerts is also
+the one node whose own failure nobody is left to report — and it is exactly the failure
+you most want to hear about.
+
+Several alerting nodes do not produce several messages. Each one records what it
+announced, that record travels to the others in the ordinary sync alongside the metrics,
+and a node that finds its message already sent stays quiet. `StaggerSeconds` is what
+gives that record time to arrive: the alerting nodes order themselves by server id, and
+each takes its turn one stagger behind the one before it.
+
+So for an outage of some third node:
+
+| | first-ranked node | second-ranked node |
+|---|---|---|
+| `DownAfterSeconds` | sends, and records that it did | still waiting |
+| `+ StaggerSeconds` | — | sees the record, stays quiet |
+
+and for an outage of the first-ranked node itself:
+
+| | first-ranked node | second-ranked node |
+|---|---|---|
+| `DownAfterSeconds` | down; nothing recorded | still waiting |
+| `+ StaggerSeconds` | — | finds no record, sends |
+
+Either way one message arrives. The same stagger applies to each hourly repeat and to
+the recovery message, so no round of alerts ever comes due on two nodes at once.
+
+Two nodes cut off from each other — rather than from the node they are both watching —
+will each report what they see, and each message says which node it is `Seen from`. That
+is a partition being reported accurately, not a duplicate.
+
+Nothing is read back out of Telegram to do any of this. The Bot API cannot read a chat's
+history: `getUpdates` returns only messages addressed to the bot, never the bot's own,
+and polling it from several nodes would have them stealing each other's updates. The
+coordination runs over the mesh the nodes already have.
 
 ## Temperature
 
@@ -259,7 +323,7 @@ to write to, so logs go to `monitor.log` beside the executable instead, rotated 
 |---|---|---|
 | GET | `/api/health` | Server identity |
 | POST | `/api/introduce` | Exchange identities with a peer; records the caller |
-| POST | `/api/sync` | Receive metrics and availability records from a peer |
+| POST | `/api/sync` | Receive metrics, availability records and alert notices from a peer |
 | GET | `/api/servers` | All servers with their latest metrics |
 | GET | `/api/servers/{id}/metrics?hours=24` | Time-series metrics. Raw samples for an hour; longer windows come back averaged into buckets wide enough to keep the series around 360 points |
 | GET | `/api/availability/matrix` | Availability matrix, last hour |

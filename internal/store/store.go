@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS "Servers" (
     "Location" TEXT NOT NULL,
     "Url"      TEXT NULL,
     "IsSelf"   INTEGER NOT NULL,
+    "Alerts"   INTEGER NOT NULL DEFAULT 0,
     "LastSeen" INTEGER NOT NULL
 );
 
@@ -78,6 +79,30 @@ CREATE TABLE IF NOT EXISTS "AvailabilityRecords" (
 
 CREATE INDEX IF NOT EXISTS "IX_AvailabilityRecords_FromServerId_ToServerId_Timestamp"
     ON "AvailabilityRecords" ("FromServerId", "ToServerId", "Timestamp");
+
+-- One row per alert a node actually sent out, replicated across the mesh the
+-- same way observations are. Several nodes may be configured to raise alerts,
+-- and they all watch the same set of peers, so without a record of what has
+-- already been announced one outage would arrive as one message per alerting
+-- node. A node reads this table to find out whether somebody has already said
+-- what it was about to say.
+--
+-- Deliberately not keyed by outage: two nodes notice the same node failing a
+-- few seconds apart and would compute different start times for it. "The most
+-- recent thing anyone announced about this node" needs no such agreement.
+CREATE TABLE IF NOT EXISTS "AlertNotices" (
+    "Id"           INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+    "FromServerId" INTEGER NOT NULL REFERENCES "Servers"("Id"),
+    "ToServerId"   INTEGER NOT NULL REFERENCES "Servers"("Id"),
+    "Timestamp"    INTEGER NOT NULL,
+    "IsDown"       INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS "IX_AlertNotices_ToServerId_Timestamp"
+    ON "AlertNotices" ("ToServerId", "Timestamp");
+
+CREATE INDEX IF NOT EXISTS "IX_AlertNotices_FromServerId_Timestamp"
+    ON "AlertNotices" ("FromServerId", "Timestamp");
 `
 
 // Store owns the database handle.
@@ -154,6 +179,14 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("create schema: %w", err)
 	}
 
+	// Columns added to a table that already exists, which CREATE TABLE IF NOT
+	// EXISTS above cannot reach. Run after the schema so the table is there to
+	// alter on a database being created from nothing.
+	if err := addColumns(db); err != nil {
+		db.Close()
+		return nil, err
+	}
+
 	return &Store{db: db}, nil
 }
 
@@ -177,8 +210,8 @@ func (s *Store) Close() error { return s.db.Close() }
 // leaves any stored address alone, the same rule UpsertPeer follows: a node
 // started without a PublicUrl configured has no better address to offer than
 // the one it already published.
-func (s *Store) UpsertSelf(uid, name, location, url string) (int64, error) {
-	id, err := s.upsertServer(uid, name, location, url, true, model.Now())
+func (s *Store) UpsertSelf(uid, name, location, url string, alerts bool) (int64, error) {
+	id, err := s.upsertServer(uid, name, location, url, true, alerts, model.Now())
 	if err != nil {
 		return 0, fmt.Errorf("upsert self: %w", err)
 	}
@@ -188,8 +221,8 @@ func (s *Store) UpsertSelf(uid, name, location, url string) (int64, error) {
 // UpsertPeer records a peer's identity and returns its id. A blank url leaves
 // any stored URL alone, so an introduction that omits it cannot erase a working
 // address.
-func (s *Store) UpsertPeer(uid, name, location, url string, lastSeen model.Time) (int64, error) {
-	id, err := s.upsertServer(uid, name, location, url, false, lastSeen)
+func (s *Store) UpsertPeer(uid, name, location, url string, alerts bool, lastSeen model.Time) (int64, error) {
+	id, err := s.upsertServer(uid, name, location, url, false, alerts, lastSeen)
 	if err != nil {
 		return 0, fmt.Errorf("upsert peer %s: %w", uid, err)
 	}
@@ -199,19 +232,24 @@ func (s *Store) UpsertPeer(uid, name, location, url string, lastSeen model.Time)
 // upsertServer writes a server row keyed by its uid and returns the row id.
 // IsSelf is only ever raised, never cleared: an introduction arriving with this
 // node's own id would otherwise demote it to a peer of itself.
-func (s *Store) upsertServer(uid, name, location, url string, self bool, lastSeen model.Time) (int64, error) {
+// Alerts, unlike IsSelf, is overwritten: it is the node's current configuration
+// and a node that has had its Telegram credentials removed has to stop counting
+// as one of the alerting nodes, or the rest of the mesh keeps deferring to
+// announcements it will never make.
+func (s *Store) upsertServer(uid, name, location, url string, self, alerts bool, lastSeen model.Time) (int64, error) {
 	var id int64
 	err := s.db.QueryRow(`
-		INSERT INTO "Servers" ("Uid","Name","Location","Url","IsSelf","LastSeen")
-		VALUES (?,?,?,NULLIF(?,''),?,?)
+		INSERT INTO "Servers" ("Uid","Name","Location","Url","IsSelf","Alerts","LastSeen")
+		VALUES (?,?,?,NULLIF(?,''),?,?,?)
 		ON CONFLICT("Uid") DO UPDATE SET
 			"Name"=excluded."Name",
 			"Location"=excluded."Location",
 			"Url"=COALESCE(excluded."Url", "Servers"."Url"),
 			"IsSelf"=MAX("Servers"."IsSelf", excluded."IsSelf"),
+			"Alerts"=excluded."Alerts",
 			"LastSeen"=excluded."LastSeen"
 		RETURNING "Id"`,
-		uid, name, location, url, self, lastSeen.DB()).Scan(&id)
+		uid, name, location, url, self, alerts, lastSeen.DB()).Scan(&id)
 	return id, err
 }
 
@@ -239,8 +277,8 @@ func (s *Store) EnsureServer(uid string) (int64, error) {
 	// the value it already holds: a no-op that exists only so RETURNING still
 	// yields the row if one appeared since the select above.
 	err = s.db.QueryRow(`
-		INSERT INTO "Servers" ("Uid","Name","Location","Url","IsSelf","LastSeen")
-		VALUES (?,?,'',NULL,0,?)
+		INSERT INTO "Servers" ("Uid","Name","Location","Url","IsSelf","Alerts","LastSeen")
+		VALUES (?,?,'',NULL,0,0,?)
 		ON CONFLICT("Uid") DO UPDATE SET "Uid"=excluded."Uid"
 		RETURNING "Id"`, uid, uid, model.Time{}.DB()).Scan(&id)
 	if err != nil {
@@ -267,7 +305,7 @@ func (s *Store) TouchLastSeen(id int64, t model.Time) error {
 	return nil
 }
 
-const selectServer = `SELECT "Id","Uid","Name","Location",COALESCE("Url",''),"IsSelf","LastSeen" FROM "Servers"`
+const selectServer = `SELECT "Id","Uid","Name","Location",COALESCE("Url",''),"IsSelf","Alerts","LastSeen" FROM "Servers"`
 
 // ServerByUID returns the server published under uid. The bool reports whether
 // it existed, which is how the dashboard and peer endpoints turn the identity
@@ -319,7 +357,8 @@ func scanServer(sc scanner) (model.Server, error) {
 		srv      model.Server
 		lastSeen int64
 	)
-	if err := sc.Scan(&srv.ID, &srv.UID, &srv.Name, &srv.Location, &srv.URL, &srv.IsSelf, &lastSeen); err != nil {
+	if err := sc.Scan(&srv.ID, &srv.UID, &srv.Name, &srv.Location, &srv.URL, &srv.IsSelf,
+		&srv.Alerts, &lastSeen); err != nil {
 		return model.Server{}, err
 	}
 	srv.LastSeen = model.FromDB(lastSeen)
@@ -717,6 +756,51 @@ func (s *Store) LatestAvailability(fromServerID, toServerID int64) (available, f
 	return available, true, nil
 }
 
+// Streak reports how one edge of the mesh currently stands and when it came to
+// stand that way: available is the state of the newest observation, and since
+// is the timestamp of the first observation in the unbroken run of that state.
+// found is false when the pair has never been measured.
+//
+// A node that has been unreachable for longer than the retention window has no
+// surviving observation of it being up, so the run appears to begin at the
+// oldest record still held. The reported duration is then a floor rather than
+// the true one, which for an outage already a week old is a distinction without
+// a difference.
+func (s *Store) Streak(fromServerID, toServerID int64) (available bool, since model.Time, found bool, err error) {
+	var newest int64
+	err = s.db.QueryRow(`
+		SELECT "IsAvailable","Timestamp" FROM "AvailabilityRecords"
+		WHERE "FromServerId"=? AND "ToServerId"=?
+		ORDER BY "Timestamp" DESC LIMIT 1`, fromServerID, toServerID).Scan(&available, &newest)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, model.Time{}, false, nil
+	}
+	if err != nil {
+		return false, model.Time{}, false, fmt.Errorf("streak %d->%d: %w", fromServerID, toServerID, err)
+	}
+
+	// The run began at the oldest observation newer than the last one that
+	// disagreed with it. The subquery is over the same index as the outer
+	// query, which is what keeps this two seeks rather than a scan.
+	var start sql.NullInt64
+	err = s.db.QueryRow(`
+		SELECT MIN("Timestamp") FROM "AvailabilityRecords"
+		WHERE "FromServerId"=? AND "ToServerId"=? AND "IsAvailable"=?
+		  AND "Timestamp" > COALESCE((
+		      SELECT MAX("Timestamp") FROM "AvailabilityRecords"
+		      WHERE "FromServerId"=? AND "ToServerId"=? AND "IsAvailable"<>?), -1)`,
+		fromServerID, toServerID, available, fromServerID, toServerID, available).Scan(&start)
+	if err != nil {
+		return false, model.Time{}, false, fmt.Errorf("streak start %d->%d: %w", fromServerID, toServerID, err)
+	}
+	if !start.Valid {
+		// Cannot happen while the row read above is still there, but a
+		// concurrent prune is cheaper to tolerate than to exclude.
+		return available, model.FromDB(newest), true, nil
+	}
+	return available, model.FromDB(start.Int64), true, nil
+}
+
 // AvailabilityHistory returns one edge's observations from since onwards.
 func (s *Store) AvailabilityHistory(fromServerID, toServerID int64, since model.Time) ([]Observation, error) {
 	rows, err := s.db.Query(`
@@ -742,6 +826,107 @@ func (s *Store) AvailabilityHistory(fromServerID, toServerID int64, since model.
 	return out, rows.Err()
 }
 
+// ── Alert notices ───────────────────────────────────────────────────────────
+
+// InsertNotices records that fromServerID announced these state changes.
+func (s *Store) InsertNotices(fromServerID int64, notices []Notice) error {
+	if len(notices) == 0 {
+		return nil
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin notices tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	stmt, err := tx.Prepare(`
+		INSERT INTO "AlertNotices" ("FromServerId","ToServerId","Timestamp","IsDown")
+		VALUES (?,?,?,?)`)
+	if err != nil {
+		return fmt.Errorf("prepare notice insert: %w", err)
+	}
+	defer stmt.Close()
+
+	for _, n := range notices {
+		if _, err := stmt.Exec(fromServerID, n.ToServerID, n.Timestamp.DB(), n.IsDown); err != nil {
+			return fmt.Errorf("insert notice: %w", err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit notices: %w", err)
+	}
+	return nil
+}
+
+// Notice is one announcement about a server in this database, named by its row
+// id. This is the form notices are written and read back in locally, the same
+// way Observation is for reachability.
+type Notice struct {
+	ToServerID int64
+	Timestamp  model.Time
+	IsDown     bool
+}
+
+// LatestNotice returns the most recent announcement anyone in the mesh made
+// about a server, whoever made it. The bool is false when nothing has ever been
+// announced about it, which is what distinguishes a node nobody has complained
+// about from one that was already reported down.
+func (s *Store) LatestNotice(toServerID int64) (Notice, bool, error) {
+	n := Notice{ToServerID: toServerID}
+	var ts int64
+	err := s.db.QueryRow(`
+		SELECT "Timestamp","IsDown" FROM "AlertNotices"
+		WHERE "ToServerId"=?
+		ORDER BY "Timestamp" DESC LIMIT 1`, toServerID).Scan(&ts, &n.IsDown)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Notice{}, false, nil
+	}
+	if err != nil {
+		return Notice{}, false, fmt.Errorf("latest notice %d: %w", toServerID, err)
+	}
+	n.Timestamp = model.FromDB(ts)
+	return n, true, nil
+}
+
+// MaxNoticeTimestamp returns the newest announcement time recorded for an
+// origin, used to drop the duplicates a peer resync brings back.
+func (s *Store) MaxNoticeTimestamp(fromServerID int64) (model.Time, bool, error) {
+	return s.maxTimestamp(`SELECT MAX("Timestamp") FROM "AlertNotices" WHERE "FromServerId"=?`,
+		"max notice timestamp", fromServerID)
+}
+
+// OwnNoticesSince returns the announcements fromServerID itself made from since
+// onwards, in the form a peer is sent them. As with observations, only a node's
+// own are its to forward.
+func (s *Store) OwnNoticesSince(fromServerID int64, since model.Time) ([]model.Notice, error) {
+	rows, err := s.db.Query(`
+		SELECT t."Uid",n."Timestamp",n."IsDown"
+		FROM "AlertNotices" n
+		JOIN "Servers" t ON t."Id"=n."ToServerId"
+		WHERE n."FromServerId"=? AND n."Timestamp">=?
+		ORDER BY n."Timestamp"`, fromServerID, since.DB())
+	if err != nil {
+		return nil, fmt.Errorf("own notices since: %w", err)
+	}
+	defer rows.Close()
+
+	out := []model.Notice{}
+	for rows.Next() {
+		var (
+			n  model.Notice
+			ts int64
+		)
+		if err := rows.Scan(&n.ToServerID, &ts, &n.IsDown); err != nil {
+			return nil, fmt.Errorf("scan own notice: %w", err)
+		}
+		n.Timestamp = model.FromDB(ts)
+		out = append(out, n)
+	}
+	return out, rows.Err()
+}
+
 // ── Retention ───────────────────────────────────────────────────────────────
 
 // Prune deletes metric and availability rows older than cutoff.
@@ -758,6 +943,9 @@ func (s *Store) Prune(cutoff model.Time) error {
 	}
 	if _, err := s.db.Exec(`DELETE FROM "AvailabilityRecords" WHERE "Timestamp"<?`, cutoff.DB()); err != nil {
 		return fmt.Errorf("prune availability: %w", err)
+	}
+	if _, err := s.db.Exec(`DELETE FROM "AlertNotices" WHERE "Timestamp"<?`, cutoff.DB()); err != nil {
+		return fmt.Errorf("prune alert notices: %w", err)
 	}
 	return nil
 }

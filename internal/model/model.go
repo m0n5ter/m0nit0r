@@ -20,10 +20,17 @@ type Time struct {
 }
 
 // Now returns the current UTC time.
-func Now() Time { return Time{time.Now().UTC()} }
+func Now() Time { return At(time.Now()) }
 
-// At wraps t, normalising it to UTC.
-func At(t time.Time) Time { return Time{t.UTC()} }
+// At wraps t, normalising it to UTC and to the resolution the database keeps.
+//
+// Truncating here rather than only in DB is what makes a timestamp compare
+// equal to itself after a round trip through storage. Peers resend an
+// overlapping window every sync round and the receiver discards what is not
+// newer than its high-water mark, so a value that came back from SQLite a
+// fraction of a millisecond behind the one that was sent would read as newer
+// on every resend, and each round would store the same rows again.
+func At(t time.Time) Time { return Time{t.UTC().Truncate(time.Millisecond)} }
 
 // MarshalJSON renders the timestamp the way the dashboard expects it.
 func (t Time) MarshalJSON() ([]byte, error) {
@@ -31,7 +38,8 @@ func (t Time) MarshalJSON() ([]byte, error) {
 }
 
 // UnmarshalJSON accepts both the zone-less .NET form and ordinary RFC 3339, so
-// that peers running either implementation can be read.
+// that peers running either implementation can be read. Whatever resolution
+// arrives is cut to the one this side stores, for the same reason At does it.
 func (t *Time) UnmarshalJSON(b []byte) error {
 	s := strings.Trim(string(b), `"`)
 	if s == "" || s == "null" {
@@ -41,7 +49,7 @@ func (t *Time) UnmarshalJSON(b []byte) error {
 	// A layout without a fractional part still parses input that has one.
 	for _, layout := range []string{"2006-01-02T15:04:05", time.RFC3339Nano} {
 		if v, err := time.Parse(layout, s); err == nil {
-			t.Time = v.UTC()
+			*t = At(v)
 			return nil
 		}
 	}
@@ -96,6 +104,7 @@ type Server struct {
 	Location string
 	URL      string
 	IsSelf   bool
+	Alerts   bool
 	LastSeen Time
 }
 
@@ -123,14 +132,29 @@ type Availability struct {
 	HTTPStatus  *int     `json:"httpStatus"`
 }
 
+// Notice records that some node announced a change in another node's
+// reachability - to Telegram, today - so that the rest of the mesh can see the
+// announcement was already made and stay quiet.
+//
+// It carries no message text. What was said is reconstructable from the
+// availability records that travel alongside it; what the other nodes need is
+// only that somebody said it, about whom, and when.
+type Notice struct {
+	ToServerID string `json:"toServerId"`
+	Timestamp  Time   `json:"timestamp"`
+	IsDown     bool   `json:"isDown"`
+}
+
 // SyncPayload is the body of POST /api/sync.
 type SyncPayload struct {
 	ServerID     string         `json:"serverId"`
 	ServerName   string         `json:"serverName"`
 	Location     string         `json:"location"`
 	SelfURL      string         `json:"selfUrl"`
+	Alerts       bool           `json:"alerts"`
 	Metrics      []Metric       `json:"metrics"`
 	Availability []Availability `json:"availability"`
+	Notices      []Notice       `json:"notices"`
 }
 
 // IntroduceRequest is the body of POST /api/introduce.
@@ -139,6 +163,7 @@ type IntroduceRequest struct {
 	ServerName string `json:"serverName"`
 	Location   string `json:"location"`
 	SelfURL    string `json:"selfUrl"`
+	Alerts     bool   `json:"alerts"`
 }
 
 // HealthResponse identifies this instance to a caller.
@@ -146,5 +171,6 @@ type HealthResponse struct {
 	ServerID   string `json:"serverId"`
 	ServerName string `json:"serverName"`
 	Location   string `json:"location"`
+	Alerts     bool   `json:"alerts"`
 	Timestamp  Time   `json:"timestamp"`
 }

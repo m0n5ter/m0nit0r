@@ -25,6 +25,14 @@
     driver that reads one. It is installed headless, as a scheduled task running
     at startup, with its web server on loopback and its port blocked inbound.
 
+    Nodes flagged with TelegramAlerts get Telegram credentials written into
+    their configuration and start reporting unreachable peers to that chat. The
+    credentials come from deploy/.telegram - bot token on the first line, chat
+    id on the second - which is ignored by git the way deploy/.secret is. Two
+    nodes carry the flag on purpose: several alerting nodes coordinate over the
+    mesh and do not send duplicates, while a single one leaves its own failure
+    as the one nobody is left to report.
+
 .PARAMETER Secret
     Shared secret authenticating the peer protocol. Must be identical on every
     node. When omitted it is read from deploy/.secret, and generated and saved
@@ -149,6 +157,19 @@ $MetricIntervalSeconds = 5
 $SyncIntervalSeconds   = 10
 $RetentionDays         = 7
 
+# Telegram alerting, for the nodes that declare TelegramAlerts in the inventory.
+# The credentials are not here: they come from deploy/.telegram, which is
+# ignored by git the same way .secret is.
+#
+# Two minutes is long enough that a reboot or a lost sync round passes without a
+# message. The stagger is what separates the alerting nodes' turns so that the
+# first one's record of having sent reaches the others before they act on the
+# same outage; it has to be comfortably more than $SyncIntervalSeconds, which is
+# how long that record takes to travel.
+$AlertDownAfterSeconds = 120
+$AlertRepeatMinutes    = 60
+$AlertStaggerSeconds   = 60
+
 # LibreHardwareMonitor, for the Windows nodes that ask for it. The agent reads
 # the CPU die temperature from its web server, which is the only way to get one
 # without shipping a signed kernel driver of our own.
@@ -187,6 +208,11 @@ $Nodes = @(
         # resolve to the wrong thing.
         Location  = 'mouseacceleration.com'
         PublicUrl = "http://24.144.97.48:$ListenPort"
+        # One of the two nodes that raise Telegram alerts. Both are VPSes on
+        # unrelated networks, so no single outage - the home uplink above all -
+        # takes both of them off the air at once. Alerting on only one node
+        # would leave that node's own failure as the one nobody reports.
+        TelegramAlerts = $true
     }
     [ordered]@{
         Name      = 'BG'
@@ -203,6 +229,10 @@ $Nodes = @(
         SshPort   = 2222
         Location  = '45.38.190.118'
         PublicUrl = "http://45.38.190.118:$ListenPort"
+        # The second alerting node; see MAcc above. Which of the two speaks
+        # first is decided by the agents themselves, from the server ids they
+        # generated on first run, and is not something set here.
+        TelegramAlerts = $true
     }
     [ordered]@{
         Name      = 'TR'
@@ -261,6 +291,7 @@ $RepoRoot  = Split-Path -Parent $PSScriptRoot
 $DistDir   = Join-Path $RepoRoot 'dist'
 $StageDir  = Join-Path $RepoRoot 'dist\stage'
 $SecretFile = Join-Path $PSScriptRoot '.secret'
+$TelegramFile = Join-Path $PSScriptRoot '.telegram'
 $RemoteDir = '/opt/m0nit0r'
 $ServiceName = 'm0nit0r'
 
@@ -301,6 +332,34 @@ function Resolve-Secret {
     Write-Ok "generated a new shared secret and saved it to $SecretFile"
     Write-Note 'keep that file: every node must carry the same value'
     return $generated
+}
+
+# Reads the bot credentials from deploy/.telegram: the bot token on the first
+# line, the chat id on the second, blank lines and # comments ignored. Unlike
+# the shared secret there is nothing to generate - a token comes from BotFather
+# - so an absent file means alerting is simply not configured, and the run says
+# so at the end rather than failing.
+function Resolve-Telegram {
+    if (-not (Test-Path $TelegramFile)) { return $null }
+
+    $lines = @(Get-Content $TelegramFile |
+        ForEach-Object { $_.Trim() } |
+        Where-Object { $_ -and -not $_.StartsWith('#') })
+
+    if ($lines.Count -lt 2) {
+        throw "$TelegramFile needs two lines: the bot token, then the chat id"
+    }
+
+    Write-Note "telegram credentials read from $TelegramFile"
+    return [ordered]@{ BotToken = $lines[0]; ChatId = $lines[1] }
+}
+
+# The flag is optional, and read the same way as the LibreHardwareMonitor one:
+# under Set-StrictMode -Version Latest a missing key read through dot notation
+# is an error rather than a null.
+function Test-NodeAlerts {
+    param($Node)
+    $Node.Contains('TelegramAlerts') -and $Node['TelegramAlerts']
 }
 
 function Get-SshTarget {
@@ -473,7 +532,7 @@ function Build-Binary {
 }
 
 function New-NodeConfig {
-    param($Node, [string]$SharedSecret)
+    param($Node, [string]$SharedSecret, $Telegram)
 
     $config = [ordered]@{
         Monitor = [ordered]@{
@@ -496,6 +555,20 @@ function New-NodeConfig {
     # dropping the key from a node that has one would silently downgrade it.
     if (Test-NodeUsesLhm $Node) {
         $config.Monitor['LibreHardwareMonitorUrl'] = "http://127.0.0.1:$LhmPort"
+    }
+
+    # Written only for the nodes that declare it, and only when the credentials
+    # are actually to hand. A node whose section is dropped stops alerting and
+    # publishes that it has stopped, so the other alerting nodes take over its
+    # turn rather than waiting behind it for a message that will not come.
+    if ((Test-NodeAlerts $Node) -and $Telegram) {
+        $config.Monitor['Telegram'] = [ordered]@{
+            BotToken         = $Telegram.BotToken
+            ChatId           = $Telegram.ChatId
+            DownAfterSeconds = $AlertDownAfterSeconds
+            RepeatMinutes    = $AlertRepeatMinutes
+            StaggerSeconds   = $AlertStaggerSeconds
+        }
     }
 
     $path = Join-Path $StageDir "appsettings.$($Node.Name).json"
@@ -628,7 +701,7 @@ echo "M0NIT0R_STATE=$(systemctl is-active "$SERVICE" || true)"
 '@
 
 function Deploy-LinuxNode {
-    param($Node, [string]$SharedSecret, [string[]]$Allowed)
+    param($Node, [string]$SharedSecret, $Telegram, [string[]]$Allowed)
 
     Write-Step "Deploying to $($Node.Name)  [$($Node.SshHost) port $($Node.SshPort)]"
 
@@ -636,7 +709,7 @@ function Deploy-LinuxNode {
     Write-Note "remote architecture: linux/$arch"
 
     $binary = Build-Binary -Goos 'linux' -Goarch $arch
-    $config = New-NodeConfig -Node $Node -SharedSecret $SharedSecret
+    $config = New-NodeConfig -Node $Node -SharedSecret $SharedSecret -Telegram $Telegram
 
     $stage = "/tmp/m0nit0r-deploy-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
     $installer = $RemoteInstaller `
@@ -963,12 +1036,12 @@ if ($installLhm) {
 '@
 
 function Deploy-WindowsLocalNode {
-    param($Node, [string]$SharedSecret, [string[]]$Allowed)
+    param($Node, [string]$SharedSecret, $Telegram, [string[]]$Allowed)
 
     Write-Step "Deploying to $($Node.Name)  [this machine]"
 
     $binary = Build-Binary -Goos 'windows' -Goarch 'amd64'
-    $config = New-NodeConfig -Node $Node -SharedSecret $SharedSecret
+    $config = New-NodeConfig -Node $Node -SharedSecret $SharedSecret -Telegram $Telegram
 
     $stage = Join-Path $StageDir 'windows'
     New-Item -ItemType Directory -Force $stage | Out-Null
@@ -1112,6 +1185,7 @@ try {
     if (-not $selected) { throw "no nodes matched -Only: $($Only -join ', ')" }
 
     $sharedSecret = Resolve-Secret
+    $telegram     = Resolve-Telegram
     New-Item -ItemType Directory -Force $StageDir | Out-Null
 
     # Note: not $home, which is an automatic variable holding the user profile.
@@ -1129,8 +1203,8 @@ try {
 
         foreach ($node in $selected) {
             switch ($node.Kind) {
-                'linux'         { Deploy-LinuxNode -Node $node -SharedSecret $sharedSecret -Allowed $allowed }
-                'windows-local' { Deploy-WindowsLocalNode -Node $node -SharedSecret $sharedSecret -Allowed $allowed }
+                'linux'         { Deploy-LinuxNode -Node $node -SharedSecret $sharedSecret -Telegram $telegram -Allowed $allowed }
+                'windows-local' { Deploy-WindowsLocalNode -Node $node -SharedSecret $sharedSecret -Telegram $telegram -Allowed $allowed }
             }
         }
     }
@@ -1167,6 +1241,25 @@ try {
     Write-Step 'Done'
     foreach ($node in $selected) {
         Write-Host "  $($node.Name.PadRight(20)) $($node.PublicUrl)"
+    }
+
+    # Counted over the whole inventory rather than the -Only subset: a node left
+    # out of this run keeps the configuration it already has, so it still counts
+    # towards how many nodes are watching.
+    $alerting = @($Nodes | Where-Object { Test-NodeAlerts $_ })
+    if ($alerting -and -not $MeshOnly) {
+        Write-Host ''
+        if (-not $telegram) {
+            Write-Host "  $($alerting.Name -join ', ') are flagged for Telegram alerts, but $TelegramFile" -ForegroundColor Yellow
+            Write-Host '  does not exist, so they were deployed without any. Write the bot token on' -ForegroundColor Yellow
+            Write-Host '  the first line and the chat id on the second, then re-run.' -ForegroundColor Yellow
+        } else {
+            Write-Host "  Telegram alerts: $($alerting.Name -join ', ')" -ForegroundColor DarkGray
+            if ($alerting.Count -lt 2) {
+                Write-Host '  Only one node alerts, so nothing reports that node going down. Flag a' -ForegroundColor Yellow
+                Write-Host '  second one with TelegramAlerts - they coordinate and will not duplicate.' -ForegroundColor Yellow
+            }
+        }
     }
 
     if ($homeSelected) {

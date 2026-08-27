@@ -23,6 +23,7 @@ import (
 	"github.com/m0n5ter/m0nit0r/internal/auth"
 	"github.com/m0n5ter/m0nit0r/internal/config"
 	"github.com/m0n5ter/m0nit0r/internal/metrics"
+	"github.com/m0n5ter/m0nit0r/internal/notify"
 	"github.com/m0n5ter/m0nit0r/internal/peer"
 	"github.com/m0n5ter/m0nit0r/internal/store"
 	"github.com/m0n5ter/m0nit0r/internal/worker"
@@ -93,11 +94,16 @@ func runApp(parent context.Context, log *slog.Logger, opts config.Options, baseD
 	}
 	defer st.Close()
 
+	// Whether this node raises alerts is published to the mesh along with its
+	// name and address: the other alerting nodes order themselves by it, so
+	// each of them has to know which of the others are alerting at all.
+	alerts := opts.Telegram.Enabled()
+
 	// The row id this resolves to is what every table is keyed by, so it is
 	// read once here and handed to the workers and the API rather than looked
 	// up again on each write.
 	serverID, err := st.UpsertSelf(opts.ServerID, opts.ServerName, opts.Location,
-		peer.NormalizeURL(opts.PublicURL))
+		peer.NormalizeURL(opts.PublicURL), alerts)
 	if err != nil {
 		return err
 	}
@@ -124,6 +130,7 @@ func runApp(parent context.Context, log *slog.Logger, opts config.Options, baseD
 		ServerName: opts.ServerName,
 		Location:   opts.Location,
 		PublicURL:  peer.NormalizeURL(opts.PublicURL),
+		Alerts:     alerts,
 		Log:        log,
 	}
 
@@ -160,9 +167,26 @@ func runApp(parent context.Context, log *slog.Logger, opts config.Options, baseD
 			ServerName: opts.ServerName,
 			Location:   opts.Location,
 			PublicURL:  peer.NormalizeURL(opts.PublicURL),
+			Alerts:     alerts,
 			Interval:   time.Duration(opts.SyncIntervalSeconds) * time.Second,
 			Log:        log,
 		}).Run,
+	}
+
+	if alerts {
+		workers = append(workers, (&worker.Alerts{
+			Store:      st,
+			Telegram:   notify.NewTelegram(opts.Telegram.BotToken, opts.Telegram.ChatID),
+			ServerID:   serverID,
+			ServerUID:  opts.ServerID,
+			ServerName: opts.ServerName,
+			DownAfter:  time.Duration(opts.Telegram.DownAfterSeconds) * time.Second,
+			Repeat:     time.Duration(opts.Telegram.RepeatMinutes) * time.Minute,
+			Stagger:    time.Duration(opts.Telegram.StaggerSeconds) * time.Second,
+			Log:        log,
+		}).Run)
+	} else {
+		log.Info("telegram alerts disabled: no BotToken and ChatId configured")
 	}
 
 	var wg sync.WaitGroup

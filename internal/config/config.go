@@ -26,6 +26,31 @@ type Options struct {
 	MetricIntervalSeconds int    `json:"metricIntervalSeconds"`
 	SyncIntervalSeconds   int    `json:"syncIntervalSeconds"`
 	RetentionDays         int    `json:"retentionDays"`
+
+	Telegram Telegram `json:"telegram"`
+}
+
+// Telegram configures outbound alerts. A node raises them only when both a bot
+// token and a chat id are present, so leaving the section out - which every
+// node does by default - is how a node opts out.
+//
+// More than one node in a mesh may be configured to alert, and should be: the
+// one node that alerts is also the one node whose own failure nobody reports.
+// They do not send duplicates. Each records what it announced, that record
+// reaches the others over the ordinary sync, and a node that finds its message
+// already sent stays quiet. StaggerSeconds is what keeps two of them from
+// deciding at the same instant, before either has heard from the other.
+type Telegram struct {
+	BotToken         string `json:"botToken"`
+	ChatID           string `json:"chatId"`
+	DownAfterSeconds int    `json:"downAfterSeconds"`
+	RepeatMinutes    int    `json:"repeatMinutes"`
+	StaggerSeconds   int    `json:"staggerSeconds"`
+}
+
+// Enabled reports whether this node has enough configuration to send anything.
+func (t Telegram) Enabled() bool {
+	return strings.TrimSpace(t.BotToken) != "" && strings.TrimSpace(t.ChatID) != ""
 }
 
 type file struct {
@@ -49,6 +74,14 @@ func Defaults() Options {
 		MetricIntervalSeconds: 5,
 		SyncIntervalSeconds:   10,
 		RetentionDays:         maxRetentionDays,
+		Telegram: Telegram{
+			// Two minutes is long enough that a sync round lost to a reboot,
+			// a routing hiccup or a service restart passes without a message,
+			// and short enough to still be news.
+			DownAfterSeconds: 120,
+			RepeatMinutes:    60,
+			StaggerSeconds:   60,
+		},
 	}
 }
 
@@ -107,6 +140,20 @@ func Load(path string) (Options, error) {
 	// unlimited history, so no node can hold data older than the cap allows.
 	if opts.RetentionDays <= 0 || opts.RetentionDays > maxRetentionDays {
 		opts.RetentionDays = maxRetentionDays
+	}
+
+	opts.Telegram.BotToken = strings.TrimSpace(opts.Telegram.BotToken)
+	opts.Telegram.ChatID = strings.TrimSpace(opts.Telegram.ChatID)
+	if opts.Telegram.DownAfterSeconds <= 0 {
+		opts.Telegram.DownAfterSeconds = 120
+	}
+	if opts.Telegram.RepeatMinutes <= 0 {
+		opts.Telegram.RepeatMinutes = 60
+	}
+	// Zero is a meaningful setting here - a single alerting node needs no
+	// stagger at all - so only a negative value is corrected.
+	if opts.Telegram.StaggerSeconds < 0 {
+		opts.Telegram.StaggerSeconds = 0
 	}
 	return opts, nil
 }
