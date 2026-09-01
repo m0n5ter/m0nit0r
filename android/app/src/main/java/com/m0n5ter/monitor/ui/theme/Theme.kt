@@ -55,12 +55,16 @@ fun MonitorTheme(
 
     // MainActivity calls enableEdgeToEdge(), which owns the bar colors itself
     // (and is the only supported way to set them from API 35 on) - this just
-    // switches the status bar icons to match the chosen scheme.
+    // switches the bar icons to match the chosen scheme. Both bars, not only
+    // the status bar: content now draws under the gesture handle too.
     val view = LocalView.current
     if (!view.isInEditMode) {
         SideEffect {
             val window = (view.context as Activity).window
-            WindowCompat.getInsetsController(window, view).isAppearanceLightStatusBars = !darkTheme
+            WindowCompat.getInsetsController(window, view).apply {
+                isAppearanceLightStatusBars = !darkTheme
+                isAppearanceLightNavigationBars = !darkTheme
+            }
         }
     }
 

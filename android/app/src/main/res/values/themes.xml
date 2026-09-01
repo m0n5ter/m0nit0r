@@ -2,10 +2,13 @@
 <resources xmlns:tools="http://schemas.android.com/tools">
     <!--
         Compose draws every screen through MaterialTheme (ui/theme/Theme.kt), so
-        this only has to cover the moment before setContent runs.
+        this only has to cover the moment before setContent runs. It still has to
+        follow the system light/dark setting though - see values-night - or that
+        first frame flashes the wrong background.
     -->
-    <style name="Theme.Monitor" parent="android:Theme.Material.NoActionBar">
+    <style name="Theme.Monitor" parent="android:Theme.Material.Light.NoActionBar">
         <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
         <item name="android:windowLightStatusBar" tools:targetApi="m">true</item>
     </style>
 </resources>

@@ -1,10 +1,11 @@
 package com.m0n5ter.monitor.ui
 
-import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.filled.CompareArrows
+import androidx.compose.material.icons.automirrored.filled.CompareArrows
 import androidx.compose.material.icons.filled.Dns
 import androidx.compose.material.icons.filled.Hub
 import androidx.compose.material.icons.filled.Settings
@@ -52,7 +53,7 @@ private data class Tab(val route: String, val label: String, val icon: ImageVect
 
 private val tabs = listOf(
     Tab(Routes.Servers, "Servers", Icons.Filled.Dns),
-    Tab(Routes.Matrix, "Matrix", Icons.Filled.CompareArrows),
+    Tab(Routes.Matrix, "Matrix", Icons.AutoMirrored.Filled.CompareArrows),
     Tab(Routes.Peers, "Mesh", Icons.Filled.Hub),
     Tab(Routes.Settings, "Settings", Icons.Filled.Settings),
 )
@@ -97,16 +98,14 @@ private fun MainScaffold(
     var showSwitchServer by remember { mutableStateOf(false) }
 
     if (showSwitchServer) {
-        Scaffold { padding ->
-            Box(Modifier.padding(padding)) {
-                ConnectionScreen(
-                    viewModel = connectionViewModel,
-                    showCancel = true,
-                    onConnected = { showSwitchServer = false },
-                    onCancel = { showSwitchServer = false },
-                )
-            }
-        }
+        // ConnectionScreen brings its own Scaffold, background and window
+        // insets, so it stands in for this screen's chrome wholesale.
+        ConnectionScreen(
+            viewModel = connectionViewModel,
+            showCancel = true,
+            onConnected = { showSwitchServer = false },
+            onCancel = { showSwitchServer = false },
+        )
         return
     }
 
@@ -114,6 +113,12 @@ private fun MainScaffold(
     val currentRoute = backStackEntry?.destination?.route
 
     Scaffold(
+        // safeDrawing rather than the systemBars default, so the body also
+        // clears a display cutout when the device is rotated. The bars handle
+        // their own insets, and Scaffold hands the body the bar heights where
+        // a bar is present - so this only takes effect on the edges that have
+        // none, i.e. the bottom of the bar-less server detail screen.
+        contentWindowInsets = WindowInsets.safeDrawing,
         topBar = {
             TopAppBar(
                 title = { Text(titleFor(currentRoute, selectedServer)) },
