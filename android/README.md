@@ -51,6 +51,32 @@ A release build needs your own signing config (`app/build.gradle.kts` ->
 `signingConfigs`); none is set up here since this is a self-hosted tool with
 no store listing.
 
+### Build and run on an emulator, from the command line
+
+`scripts/run-emulator.sh` (Linux/macOS) and `scripts/run-emulator.ps1`
+(Windows) build the debug APK, boot an AVD if none is already running
+(creating one on first use), install the APK and launch the app - so
+`./scripts/run-emulator.sh` or `.\scripts\run-emulator.ps1` is enough end to
+end. Both need the Android SDK's `cmdline-tools`, `platform-tools` and
+`emulator` packages (whatever Android Studio's SDK Manager installs) and
+`$ANDROID_HOME`/`$env:ANDROID_HOME` pointed at the SDK; each script falls
+back to the default install location (`~/Android/Sdk`,
+`~/Library/Android/sdk`, or `%LOCALAPPDATA%\Android\Sdk`) if that isn't set.
+
+```bash
+./scripts/run-emulator.sh              # build, boot/reuse an AVD, install, launch
+./scripts/run-emulator.sh --avd Pixel_7
+./scripts/run-emulator.sh --no-build    # reinstall the last APK without rebuilding
+./scripts/run-emulator.sh --logcat      # also tail the app's logcat after launch
+```
+
+```powershell
+.\scripts\run-emulator.ps1
+.\scripts\run-emulator.ps1 -Avd Pixel_7
+.\scripts\run-emulator.ps1 -NoBuild
+.\scripts\run-emulator.ps1 -Logcat
+```
+
 ## Using it
 
 1. Launch the app and enter one node's address, e.g. `192.168.1.10:5001` or
