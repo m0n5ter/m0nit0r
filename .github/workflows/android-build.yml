@@ -8,6 +8,7 @@ name: Android build
 on:
   push:
     branches:
+      - master
       - 'claude/**'
     paths:
       - 'android/**'
