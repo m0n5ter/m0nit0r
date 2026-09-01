@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    m0nit0r nodes are meant to be reached over a LAN, a VPN or an SSH/WireGuard
+    tunnel, and README.md is explicit that peer traffic is plain HTTP - there is
+    no TLS story here at all. The dashboard this app talks to is the same plain
+    HTTP endpoint, so cleartext has to stay allowed for every host; there is no
+    fixed set of domains to scope it to since the server address is whatever
+    the person running the mesh points the app at.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

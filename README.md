@@ -332,6 +332,14 @@ to write to, so logs go to `monitor.log` beside the executable instead, rotated 
 | POST | `/api/peers` | Add a peer by URL, body `{"url":"http://host:5001"}` |
 | DELETE | `/api/peers/{id}` | Stop syncing with a peer, keeping its history |
 
+## Android app
+
+A native Android client lives in [`android/`](android/README.md). It talks to
+this same JSON API - point it at any one node's address and it shows the
+whole mesh, servers, availability matrix and peers included, without any
+change to the server. See that directory's README for building and running
+it.
+
 ## Security
 
 The peer protocol is authenticated with a shared secret. `/api/sync` and
