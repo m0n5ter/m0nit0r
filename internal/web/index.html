@@ -491,9 +491,69 @@ main { padding: 1.1rem 1.25rem 3rem; display: flex; flex-direction: column; gap:
     .self-chip { display: none; }
     .stat-value { font-size: 1.3rem; }
 }
+
+/* ── Sign-in ─────────────────────────────────────────────────────────────── */
+/* The page loads without a password - it holds no data of its own - and asks
+   for one here, in place of the browser's own dialog. While it is up, the
+   dashboard behind it stays covered rather than blurred: nothing in it is
+   meant to be seen before signing in. */
+.login-screen {
+    position: fixed; inset: 0; z-index: 1080;
+    display: none; place-items: center;
+    background: var(--bg); padding: 16px;
+}
+.login-screen.show { display: grid; }
+.login-card {
+    width: min(360px, 100%);
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); box-shadow: var(--shadow);
+    padding: 1.6rem 1.5rem 1.4rem;
+}
+.login-card .brand { font-size: 1.2rem; margin-bottom: .35rem; }
+.login-card .brand-mark { width: 30px; height: 30px; font-size: 1rem; }
+.login-host { color: var(--text-dim); font-size: .86rem; margin-bottom: 1.2rem; overflow-wrap: anywhere; }
+.login-card label { font-size: .83rem; color: var(--text-dim); margin-bottom: .35rem; }
+.login-card .btn { width: 100%; margin-top: .9rem; }
+.login-remember {
+    display: flex; align-items: center; gap: .5rem;
+    margin-top: .8rem; font-size: .86rem; color: var(--text-dim);
+    cursor: pointer; user-select: none;
+}
+.login-remember input {
+    width: 1rem; height: 1rem; accent-color: var(--accent); cursor: pointer;
+}
+.login-error {
+    display: none; margin-top: .8rem; font-size: .83rem; color: var(--danger);
+    align-items: center; gap: .45rem;
+}
+.login-error.show { display: flex; }
     </style>
 </head>
 <body>
+
+<div class="login-screen" id="login-screen" role="dialog" aria-modal="true" aria-labelledby="login-title">
+    <form class="login-card" id="login-form">
+        <div class="brand" id="login-title">
+            <span class="brand-mark"><i class="bi bi-activity"></i></span>m0nit0r
+        </div>
+        <div class="login-host mono" id="login-host"></div>
+        <!-- Password managers file a saved password under a user name; this
+             one is the node's address, so each node gets its own entry. -->
+        <input type="text" name="username" id="login-user" autocomplete="username" hidden />
+        <label for="login-password">Password</label>
+        <input type="password" class="form-control" id="login-password" name="password"
+               autocomplete="current-password" required />
+        <label class="login-remember" for="login-remember">
+            <input type="checkbox" id="login-remember" checked />Remember me on this device
+        </label>
+        <button type="submit" class="btn btn-primary" id="login-submit">
+            <i class="bi bi-box-arrow-in-right me-1"></i>Sign in
+        </button>
+        <div class="login-error" id="login-error" role="alert">
+            <i class="bi bi-exclamation-circle"></i><span id="login-error-text"></span>
+        </div>
+    </form>
+</div>
 
 <header class="topbar">
     <div class="topbar-inner">
@@ -510,6 +570,9 @@ main { padding: 1.1rem 1.25rem 3rem; display: flex; flex-direction: column; gap:
             </button>
             <button class="icon-btn" id="btn-theme" title="Toggle theme" aria-label="Toggle colour theme">
                 <i class="bi bi-sun"></i>
+            </button>
+            <button class="icon-btn" id="btn-logout" title="Sign out" aria-label="Sign out" hidden>
+                <i class="bi bi-box-arrow-right"></i>
             </button>
         </div>
     </div>
@@ -870,10 +933,96 @@ let linkEdge = null, linkHours = 6;
 
 // ── Fetch helper ─────────────────────────────────────────────────────────────
 
+// Signed out is not an error to report in the banner: the session lapsed or
+// the password changed, and the answer is the sign-in form.
+class SignedOut extends Error {}
+
+async function api(url, options) {
+    const r = await fetch(url, options);
+    if (r.status === 401) { showLogin(); throw new SignedOut(); }
+    return r;
+}
+
 async function getJSON(url) {
-    const r = await fetch(url);
+    const r = await api(url);
     if (!r.ok) throw new Error(url + ' → ' + r.status);
     return r.json();
+}
+
+// ── Sign-in ──────────────────────────────────────────────────────────────────
+
+let started = false;
+
+function showLogin(message) {
+    clearInterval(pollTimer);
+    pollTimer = null;
+    document.getElementById('btn-logout').hidden = true;
+    document.getElementById('login-host').textContent = location.host;
+    document.getElementById('login-user').value = location.host;
+    loginError(message || '');
+    const screen = document.getElementById('login-screen');
+    if (!screen.classList.contains('show')) {
+        screen.classList.add('show');
+        // Unticked once, it stays unticked on this browser - the box is a
+        // statement about the machine, not about one visit.
+        document.getElementById('login-remember').checked =
+            localStorage.getItem('m0nit0r-remember') !== 'no';
+        const input = document.getElementById('login-password');
+        input.value = '';
+        input.focus();
+    }
+}
+
+function loginError(text) {
+    document.getElementById('login-error-text').textContent = text;
+    document.getElementById('login-error').classList.toggle('show', !!text);
+}
+
+async function signIn(e) {
+    e.preventDefault();
+    const input = document.getElementById('login-password');
+    const btn = document.getElementById('login-submit');
+    const remember = document.getElementById('login-remember').checked;
+    btn.disabled = true;
+    loginError('');
+    localStorage.setItem('m0nit0r-remember', remember ? 'yes' : 'no');
+    try {
+        const r = await fetch('/api/login', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ password: input.value, remember }),
+        });
+        if (r.ok) {
+            document.getElementById('login-screen').classList.remove('show');
+            document.getElementById('btn-logout').hidden = false;
+            start();
+            return;
+        }
+        if (r.status === 429) {
+            const wait = Math.ceil((Number(r.headers.get('Retry-After')) || 60) / 60);
+            loginError('Too many failed attempts. Try again in ' + wait + ' min.');
+        } else {
+            loginError('Wrong password.');
+        }
+        input.select();
+    } catch (err) {
+        loginError('Cannot reach the agent.');
+    } finally {
+        btn.disabled = false;
+    }
+}
+
+async function signOut() {
+    await fetch('/api/logout', { method: 'POST' }).catch(() => {});
+    showLogin();
+}
+
+// start begins polling once the page may read data. It runs again after every
+// sign-in, including one that follows a session lapsing mid-view.
+function start() {
+    started = true;
+    refresh();
+    schedule();
 }
 
 // ── Server cards ─────────────────────────────────────────────────────────────
@@ -1517,7 +1666,7 @@ async function addPeer() {
     };
 
     try {
-        const resp = await fetch('/api/peers', {
+        const resp = await api('/api/peers', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ url }),
@@ -1545,7 +1694,7 @@ async function addPeer() {
 
 async function removePeer(id, name) {
     if (!confirm('Remove peer "' + name + '"?\n\nHistorical data will be kept.')) return;
-    const resp = await fetch('/api/peers/' + encodeURIComponent(id), { method: 'DELETE' });
+    const resp = await api('/api/peers/' + encodeURIComponent(id), { method: 'DELETE' });
     if (resp.ok) {
         if (selectedId === id) selectedId = null;
         await refresh();
@@ -1603,6 +1752,7 @@ async function refresh() {
         lastOk = Date.now();
         tickClock();
     } catch (e) {
+        if (e instanceof SignedOut) return;
         document.getElementById('banner-text').textContent =
             'Cannot reach the agent — showing the last data received. (' + e.message + ')';
         document.getElementById('banner').classList.add('show');
@@ -1716,12 +1866,23 @@ document.addEventListener('DOMContentLoaded', () => {
     // Polling a hidden tab keeps a laptop awake for data nobody is reading.
     document.addEventListener('visibilitychange', () => {
         if (document.hidden) { clearInterval(pollTimer); pollTimer = null; }
-        else if (!paused) { refresh(); schedule(); }
+        else if (started && !paused && !document.getElementById('login-screen').classList.contains('show')) {
+            refresh(); schedule();
+        }
     });
 
+    document.getElementById('login-form').addEventListener('submit', signIn);
+    document.getElementById('btn-logout').addEventListener('click', signOut);
+
     setInterval(tickClock, 1000);
-    refresh();
-    schedule();
+
+    // Ask before polling, so a signed-out browser goes straight to the form
+    // rather than through a round of refused requests.
+    fetch('/api/session').then(r => r.json()).then(session => {
+        if (session.passwordRequired && !session.signedIn) { showLogin(); return; }
+        document.getElementById('btn-logout').hidden = !session.passwordRequired;
+        start();
+    }).catch(() => start());
 });
 </script>
 </body>

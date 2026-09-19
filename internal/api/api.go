@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -41,6 +42,7 @@ type Server struct {
 	Store      *store.Store
 	Client     *peer.Client
 	Signer     *auth.Signer
+	Gate       *auth.Gate
 	ServerID   int64
 	ServerUID  string
 	ServerName string
@@ -56,6 +58,9 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /api/health", s.handleHealth)
+	mux.HandleFunc("GET /api/session", s.handleSession)
+	mux.HandleFunc("POST /api/login", s.handleLogin)
+	mux.HandleFunc("POST /api/logout", s.handleLogout)
 	mux.HandleFunc("POST /api/introduce", s.signed(s.handleIntroduce))
 	mux.HandleFunc("POST /api/sync", s.signed(s.handleSync))
 	mux.HandleFunc("GET /api/servers", s.handleServers)
@@ -69,7 +74,115 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /{$}", web.Dashboard())
 	mux.Handle("GET /assets/", web.Assets())
 
-	return mux
+	return s.guarded(mux)
+}
+
+// openPaths are served without the dashboard password.
+//
+// The two peer-protocol endpoints carry a shared-secret signature instead, and
+// the health check names the node and nothing more - it is what the deployment
+// script and the Android app probe an address with before they have any
+// credentials. The dashboard page and its assets hold no data of their own; the
+// page is what shows the login form, so it has to load before anybody has
+// logged in. The session endpoints are how they do.
+var openPaths = map[string]bool{
+	"/":              true,
+	"/api/health":    true,
+	"/api/sync":      true,
+	"/api/introduce": true,
+	"/api/login":     true,
+	"/api/logout":    true,
+	"/api/session":   true,
+}
+
+// guarded puts everything else - every read endpoint and peer management -
+// behind the dashboard password.
+//
+// A refusal carries no WWW-Authenticate challenge. That header is what makes a
+// browser raise its own login dialog; the dashboard asks with a form of its
+// own instead. Clients that send basic authentication unprompted, as the
+// Android app and curl -u do, are unaffected.
+func (s *Server) guarded(next http.Handler) http.Handler {
+	if s.Gate == nil || !s.Gate.Enabled() {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if openPaths[r.URL.Path] || strings.HasPrefix(r.URL.Path, "/assets/") {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		switch result, wait := s.Gate.Check(r); result {
+		case auth.Allowed:
+			next.ServeHTTP(w, r)
+		case auth.LockedOut:
+			lockedOut(w, wait)
+		default:
+			if _, _, supplied := r.BasicAuth(); supplied {
+				s.Log.Warn("rejected dashboard login", "path", r.URL.Path, "remote", r.RemoteAddr)
+			}
+			http.Error(w, "password required", http.StatusUnauthorized)
+		}
+	})
+}
+
+func lockedOut(w http.ResponseWriter, wait time.Duration) {
+	w.Header().Set("Retry-After", strconv.Itoa(int(wait.Seconds())+1))
+	http.Error(w, "too many failed logins; try again later", http.StatusTooManyRequests)
+}
+
+// ── Dashboard session ───────────────────────────────────────────────────────
+
+type sessionView struct {
+	// PasswordRequired is false on a node without a password, and for a
+	// browser on the host itself, which is let through without one.
+	PasswordRequired bool `json:"passwordRequired"`
+	SignedIn         bool `json:"signedIn"`
+}
+
+// handleSession tells the dashboard whether to show its login form and
+// whether a sign-out button means anything.
+func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
+	required := s.Gate != nil && s.Gate.Enabled() && !auth.IsLoopback(r.RemoteAddr)
+	signedIn := !required
+	if required {
+		result, _ := s.Gate.Check(r)
+		signedIn = result == auth.Allowed
+	}
+	writeJSON(w, http.StatusOK, sessionView{PasswordRequired: required, SignedIn: signedIn})
+}
+
+// handleLogin trades the password for a session cookie. Wrong guesses count
+// towards the same lockout basic authentication does, so the form is no
+// easier to guess through.
+func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Password string `json:"password"`
+		Remember bool   `json:"remember"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if s.Gate == nil || !s.Gate.Enabled() {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	switch result, wait := s.Gate.Try(r.RemoteAddr, req.Password); result {
+	case auth.Allowed:
+		http.SetCookie(w, s.Gate.NewSession(req.Remember))
+		w.WriteHeader(http.StatusNoContent)
+	case auth.LockedOut:
+		lockedOut(w, wait)
+	default:
+		s.Log.Warn("rejected dashboard login", "remote", r.RemoteAddr)
+		http.Error(w, "wrong password", http.StatusUnauthorized)
+	}
+}
+
+func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
+	http.SetCookie(w, auth.EndSession())
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // signed wraps the peer-protocol handlers with shared-secret verification.

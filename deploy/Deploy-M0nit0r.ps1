@@ -58,11 +58,13 @@
 .PARAMETER RestrictFirewall
     Admit the listening port only from the other nodes instead of from anywhere.
 
-    Worth understanding before using it: the shared secret authenticates
-    /api/sync and /api/introduce, but the dashboard and the peer-management
-    endpoints are not covered by it, and on a public address they are reachable
-    by anyone. Restricting by source address is what actually closes that, and
-    it is the reason this switch exists.
+    Without it the port is open to any source. That is safe enough: the peer
+    protocol is signed with the shared secret, and everything else - the
+    dashboard, the read endpoints, peer management - asks for the dashboard
+    password from deploy/.dashboard-password. It is also what push-only nodes
+    on dynamic addresses need, since their address cannot be on any list.
+    Restricting additionally hides the port from scanners, and protects the
+    password, which crosses plain HTTP as typed, from being tried at all.
 
     Existing rules on the host are only ever narrowed, never created wholesale:
     an inactive firewall is left inactive and reported, because enabling one
@@ -226,7 +228,7 @@ $Nodes = @(
         Name      = 'DE'
         Kind      = 'linux'
         SshHost   = 'm0n5ter@45.38.190.118'
-        SshPort   = 2222
+        SshPort   = 22
         Location  = '45.38.190.118'
         PublicUrl = "http://45.38.190.118:$ListenPort"
         # The second alerting node; see MAcc above. Which of the two speaks
@@ -253,7 +255,7 @@ $Nodes = @(
         Name      = 'UK'
         Kind      = 'linux'
         SshHost   = 'm0n5ter@185.168.195.238'
-        SshPort   = 51821
+        SshPort   = 22
         Location  = '185.168.195.238'
         PublicUrl = "http://185.168.195.238:$ListenPort"
     }
@@ -292,6 +294,7 @@ $DistDir   = Join-Path $RepoRoot 'dist'
 $StageDir  = Join-Path $RepoRoot 'dist\stage'
 $SecretFile = Join-Path $PSScriptRoot '.secret'
 $TelegramFile = Join-Path $PSScriptRoot '.telegram'
+$PasswordFile = Join-Path $PSScriptRoot '.dashboard-password'
 $RemoteDir = '/opt/m0nit0r'
 $ServiceName = 'm0nit0r'
 
@@ -331,6 +334,32 @@ function Resolve-Secret {
     Set-Content -Path $SecretFile -Value $generated -Encoding ascii -NoNewline
     Write-Ok "generated a new shared secret and saved it to $SecretFile"
     Write-Note 'keep that file: every node must carry the same value'
+    return $generated
+}
+
+# The password people log in to the dashboards and the Android app with. One
+# for the whole mesh, like the shared secret, and kept apart from it on purpose:
+# over plain HTTP a password crosses the wire as typed, and one that leaked that
+# way must not also sign the peer protocol. Generated readable, since it is
+# typed by hand, and long enough that the agents' lockout makes guessing it
+# hopeless.
+function Resolve-DashboardPassword {
+    if (Test-Path $PasswordFile) {
+        $stored = (Get-Content -Raw $PasswordFile).Trim()
+        if ($stored) {
+            Write-Note "dashboard password read from $PasswordFile"
+            return $stored
+        }
+    }
+
+    # No 0/O, 1/l/I: it is read off one screen and typed into another.
+    $alphabet = 'abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789'
+    $bytes = [byte[]]::new(20)
+    [System.Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
+    $generated = -join ($bytes | ForEach-Object { $alphabet[$_ % $alphabet.Length] })
+
+    Set-Content -Path $PasswordFile -Value $generated -Encoding ascii -NoNewline
+    Write-Ok "generated a dashboard password and saved it to $PasswordFile"
     return $generated
 }
 
@@ -532,7 +561,7 @@ function Build-Binary {
 }
 
 function New-NodeConfig {
-    param($Node, [string]$SharedSecret, $Telegram)
+    param($Node, [string]$SharedSecret, [string]$DashboardPassword, $Telegram)
 
     $config = [ordered]@{
         Monitor = [ordered]@{
@@ -542,6 +571,7 @@ function New-NodeConfig {
             ListenAddress         = '0.0.0.0'
             ListenPort            = $ListenPort
             SharedSecret          = $SharedSecret
+            DashboardPassword     = $DashboardPassword
             DatabasePath          = 'monitor.db'
             MetricIntervalSeconds = $MetricIntervalSeconds
             SyncIntervalSeconds   = $SyncIntervalSeconds
@@ -701,7 +731,7 @@ echo "M0NIT0R_STATE=$(systemctl is-active "$SERVICE" || true)"
 '@
 
 function Deploy-LinuxNode {
-    param($Node, [string]$SharedSecret, $Telegram, [string[]]$Allowed)
+    param($Node, [string]$SharedSecret, [string]$DashboardPassword, $Telegram, [string[]]$Allowed)
 
     Write-Step "Deploying to $($Node.Name)  [$($Node.SshHost) port $($Node.SshPort)]"
 
@@ -709,7 +739,7 @@ function Deploy-LinuxNode {
     Write-Note "remote architecture: linux/$arch"
 
     $binary = Build-Binary -Goos 'linux' -Goarch $arch
-    $config = New-NodeConfig -Node $Node -SharedSecret $SharedSecret -Telegram $Telegram
+    $config = New-NodeConfig -Node $Node -SharedSecret $SharedSecret -DashboardPassword $DashboardPassword -Telegram $Telegram
 
     $stage = "/tmp/m0nit0r-deploy-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
     $installer = $RemoteInstaller `
@@ -1036,12 +1066,12 @@ if ($installLhm) {
 '@
 
 function Deploy-WindowsLocalNode {
-    param($Node, [string]$SharedSecret, $Telegram, [string[]]$Allowed)
+    param($Node, [string]$SharedSecret, [string]$DashboardPassword, $Telegram, [string[]]$Allowed)
 
     Write-Step "Deploying to $($Node.Name)  [this machine]"
 
     $binary = Build-Binary -Goos 'windows' -Goarch 'amd64'
-    $config = New-NodeConfig -Node $Node -SharedSecret $SharedSecret -Telegram $Telegram
+    $config = New-NodeConfig -Node $Node -SharedSecret $SharedSecret -DashboardPassword $DashboardPassword -Telegram $Telegram
 
     $stage = Join-Path $StageDir 'windows'
     New-Item -ItemType Directory -Force $stage | Out-Null
@@ -1185,6 +1215,7 @@ try {
     if (-not $selected) { throw "no nodes matched -Only: $($Only -join ', ')" }
 
     $sharedSecret = Resolve-Secret
+    $dashboardPassword = Resolve-DashboardPassword
     $telegram     = Resolve-Telegram
     New-Item -ItemType Directory -Force $StageDir | Out-Null
 
@@ -1203,8 +1234,8 @@ try {
 
         foreach ($node in $selected) {
             switch ($node.Kind) {
-                'linux'         { Deploy-LinuxNode -Node $node -SharedSecret $sharedSecret -Telegram $telegram -Allowed $allowed }
-                'windows-local' { Deploy-WindowsLocalNode -Node $node -SharedSecret $sharedSecret -Telegram $telegram -Allowed $allowed }
+                'linux'         { Deploy-LinuxNode -Node $node -SharedSecret $sharedSecret -DashboardPassword $dashboardPassword -Telegram $telegram -Allowed $allowed }
+                'windows-local' { Deploy-WindowsLocalNode -Node $node -SharedSecret $sharedSecret -DashboardPassword $dashboardPassword -Telegram $telegram -Allowed $allowed }
             }
         }
     }
@@ -1289,8 +1320,9 @@ try {
         Write-Host '  Re-run after any of them changes, or the mesh will silently stop syncing.' -ForegroundColor DarkGray
     } else {
         Write-Host ''
-        Write-Host '  The dashboard and the peer-management endpoints are reachable from any' -ForegroundColor Yellow
-        Write-Host '  source on this port. Re-run with -RestrictFirewall to limit it to the nodes.' -ForegroundColor Yellow
+        Write-Host '  The port is open to any source, which push-only nodes on dynamic addresses' -ForegroundColor DarkGray
+        Write-Host "  need. The dashboards ask for the password in $PasswordFile;" -ForegroundColor DarkGray
+        Write-Host '  the peer protocol is signed with the shared secret.' -ForegroundColor DarkGray
     }
 } finally {
     Pop-Location

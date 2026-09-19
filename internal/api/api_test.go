@@ -2,8 +2,10 @@ package api
 
 import (
 	"log/slog"
+	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -269,5 +271,167 @@ func TestUnsignedSyncReplyIsIgnored(t *testing.T) {
 	}
 	if res.Reply != nil {
 		t.Errorf("an unsigned reply was accepted: %+v", res.Reply)
+	}
+}
+
+// TestDashboardPasswordCoversEverythingButThePeerProtocol: with the port open
+// to the internet, the password is what stands in front of the dashboard, the
+// read endpoints and peer management. The peer protocol has its own signature
+// and the health probe has to answer before anybody has credentials.
+func TestDashboardPasswordCoversEverythingButThePeerProtocol(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "monitor.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+
+	s := &Server{
+		Store:     st,
+		Client:    peer.New(""),
+		Signer:    auth.New("s3cret"),
+		Gate:      auth.NewGate("hunter2"),
+		ServerUID: "11111111-1111-4111-8111-111111111111",
+		Log:       slog.New(slog.DiscardHandler),
+	}
+	if s.ServerID, err = st.UpsertSelf(s.ServerUID, "here", "Lab", "", false); err != nil {
+		t.Fatal(err)
+	}
+	h := s.Handler()
+
+	serve := func(method, path, remote, password string) int {
+		r := httptest.NewRequest(method, path, nil)
+		r.RemoteAddr = remote
+		if password != "" {
+			r.SetBasicAuth("", password)
+		}
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		return w.Code
+	}
+
+	const outside = "203.0.113.5:40000"
+	for _, tc := range []struct{ method, path string }{
+		{"GET", "/api/servers"},
+		{"GET", "/api/availability/matrix"},
+		{"GET", "/api/peers"},
+		{"POST", "/api/peers"},
+		{"DELETE", "/api/peers/whatever"},
+	} {
+		if code := serve(tc.method, tc.path, outside, ""); code != 401 {
+			t.Errorf("%s %s without a password: %d, want 401", tc.method, tc.path, code)
+		}
+	}
+
+	if code := serve("GET", "/api/servers", outside, "hunter2"); code != 200 {
+		t.Errorf("with the password: %d, want 200", code)
+	}
+	if code := serve("GET", "/api/servers", "127.0.0.1:40000", ""); code != 200 {
+		t.Errorf("from the host itself: %d, want 200", code)
+	}
+	// The page is what shows the login form, so it and its assets load
+	// without one; they carry no data of their own.
+	for _, path := range []string{"/api/health", "/", "/assets/bootstrap.min.css"} {
+		if code := serve("GET", path, outside, ""); code != 200 {
+			t.Errorf("%s without a password: %d, want 200", path, code)
+		}
+	}
+	// Reaches the handler and is refused by the signature check, not the gate.
+	if code := serve("POST", "/api/sync", outside, ""); code != 401 {
+		t.Errorf("unsigned sync: %d, want the signature's 401", code)
+	}
+}
+
+// TestDashboardLoginTradesThePasswordForACookie: the dashboard's own form is
+// how a browser signs in, so the cookie it earns has to open the API, a wrong
+// password must earn nothing, and a refusal must not carry the challenge that
+// makes a browser raise its own login dialog.
+func TestDashboardLoginTradesThePasswordForACookie(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "monitor.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+
+	s := &Server{
+		Store:     st,
+		Client:    peer.New(""),
+		Signer:    auth.New(""),
+		Gate:      auth.NewGate("hunter2"),
+		ServerUID: "11111111-1111-4111-8111-111111111111",
+		Log:       slog.New(slog.DiscardHandler),
+	}
+	if s.ServerID, err = st.UpsertSelf(s.ServerUID, "here", "Lab", "", false); err != nil {
+		t.Fatal(err)
+	}
+	h := s.Handler()
+	const outside = "203.0.113.5:40000"
+
+	do := func(method, path, body string, cookies ...*http.Cookie) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(method, path, strings.NewReader(body))
+		r.RemoteAddr = outside
+		for _, c := range cookies {
+			r.AddCookie(c)
+		}
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		return w
+	}
+
+	refused := do("GET", "/api/servers", "")
+	if refused.Code != 401 {
+		t.Fatalf("no session: %d, want 401", refused.Code)
+	}
+	if got := refused.Header().Get("WWW-Authenticate"); got != "" {
+		t.Errorf("refusal carries %q, which pops the browser's own dialog", got)
+	}
+
+	if w := do("POST", "/api/login", `{"password":"nope"}`); w.Code != 401 || len(w.Result().Cookies()) != 0 {
+		t.Errorf("wrong password: %d with %d cookies, want 401 and none", w.Code, len(w.Result().Cookies()))
+	}
+
+	login := do("POST", "/api/login", `{"password":"hunter2","remember":true}`)
+	if login.Code != 204 {
+		t.Fatalf("right password: %d, want 204", login.Code)
+	}
+	cookies := login.Result().Cookies()
+	if len(cookies) != 1 || !cookies[0].HttpOnly || cookies[0].SameSite != http.SameSiteStrictMode {
+		t.Fatalf("session cookie %+v, want one HttpOnly SameSite=Strict cookie", cookies)
+	}
+	// "Remember me" is what decides whether the browser keeps the cookie past
+	// its own lifetime; both forms open the API just the same.
+	if cookies[0].MaxAge <= 0 {
+		t.Errorf("remembered cookie has MaxAge %d, want it stored until it expires", cookies[0].MaxAge)
+	}
+	forgotten := do("POST", "/api/login", `{"password":"hunter2"}`).Result().Cookies()
+	if len(forgotten) != 1 || forgotten[0].MaxAge != 0 || !forgotten[0].Expires.IsZero() {
+		t.Errorf("unremembered cookie %+v, want one the browser drops when it closes", forgotten)
+	}
+	if w := do("GET", "/api/servers", "", forgotten[0]); w.Code != 200 {
+		t.Errorf("with an unremembered session: %d, want 200", w.Code)
+	}
+
+	if w := do("GET", "/api/servers", "", cookies[0]); w.Code != 200 {
+		t.Errorf("with the session: %d, want 200", w.Code)
+	}
+	if w := do("GET", "/api/session", "", cookies[0]); !strings.Contains(w.Body.String(), `"signedIn":true`) {
+		t.Errorf("session view with the cookie: %s", w.Body.String())
+	}
+
+	forged := *cookies[0]
+	forged.Value = strings.Replace(forged.Value, ".", "9.", 1)
+	if w := do("GET", "/api/servers", "", &forged); w.Code != 401 {
+		t.Errorf("with a tampered session: %d, want 401", w.Code)
+	}
+
+	// A session signed under another password - the one before a change -
+	// no longer opens anything.
+	other := auth.NewGate("changed").NewSession(true)
+	if w := do("GET", "/api/servers", "", other); w.Code != 401 {
+		t.Errorf("with a session from another password: %d, want 401", w.Code)
+	}
+
+	logout := do("POST", "/api/logout", "", cookies[0])
+	if c := logout.Result().Cookies(); len(c) != 1 || c[0].MaxAge >= 0 {
+		t.Errorf("logout did not clear the cookie: %+v", c)
 	}
 }

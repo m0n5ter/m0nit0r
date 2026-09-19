@@ -139,12 +139,18 @@ func runApp(parent context.Context, log *slog.Logger, opts config.Options, baseD
 		log.Warn("SharedSecret is not set: /api/sync and /api/introduce accept writes from anyone who can reach this port")
 	}
 
+	gate := auth.NewGate(opts.DashboardPassword)
+	if !gate.Enabled() {
+		log.Warn("DashboardPassword is not set: the dashboard and peer management are open to anyone who can reach this port")
+	}
+
 	client := peer.New(opts.SharedSecret)
 
 	apiServer := &api.Server{
 		Store:      st,
 		Client:     client,
 		Signer:     signer,
+		Gate:       gate,
 		ServerID:   serverID,
 		ServerUID:  opts.ServerID,
 		ServerName: opts.ServerName,

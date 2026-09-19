@@ -51,6 +51,7 @@ launches it.
 | `ListenAddress` | `0.0.0.0` | Interface to bind. Set to `127.0.0.1` to keep the API off the network |
 | `ListenPort` | `5001` | HTTP port for dashboard and peer API |
 | `SharedSecret` | empty | Shared secret authenticating the peer protocol. Must be identical on every node. Empty disables authentication |
+| `DashboardPassword` | empty | Password for the dashboard, the read endpoints and peer management, asked for as HTTP basic auth. One per mesh, and deliberately not the shared secret. Empty leaves them open. See [Security](#security) |
 | `DatabasePath` | `monitor.db` | SQLite file path, relative to the executable |
 | `LibreHardwareMonitorUrl` | empty | Address of a LibreHardwareMonitor web server to read the CPU die temperature from, e.g. `http://127.0.0.1:8085`. Windows only in practice; empty uses the built-in probe |
 | `MetricIntervalSeconds` | `5` | How often to sample CPU, memory, disk and temperature |
@@ -263,9 +264,13 @@ the peers back.
 .\deploy\Deploy-M0nit0r.ps1 -Only Proxmox           # one node
 ```
 
-`-RestrictFirewall` narrows the listening port to the nodes' own addresses instead of
-leaving it open to any source, which is what actually protects the endpoints the
-shared secret does not cover. It resolves each node's address, then configures ufw or
+Without `-RestrictFirewall` the port is opened to any source, which is what push-only
+nodes on dynamic addresses need. The dashboards are then protected by the password the
+script generates on first run and stores in `deploy/.dashboard-password` (gitignored,
+like `deploy/.secret`), written to every node as `DashboardPassword`.
+
+`-RestrictFirewall` narrows the listening port to the nodes' own addresses instead, which
+also hides it from scanners and keeps the password from being tried at all. It resolves each node's address, then configures ufw or
 firewalld on Linux and the inbound rule on Windows. Add `-AllowFrom <ip>` for an extra
 address you want to reach the dashboards from.
 
@@ -363,6 +368,9 @@ to write to, so logs go to `monitor.log` beside the executable instead, rotated 
 | Method | Path | Description |
 |---|---|---|
 | GET | `/api/health` | Server identity |
+| GET | `/api/session` | Whether this browser needs to sign in, and whether it has |
+| POST | `/api/login` | Sign in to the dashboard, body `{"password":"…"}`; sets the session cookie |
+| POST | `/api/logout` | Sign out; clears the session cookie |
 | POST | `/api/introduce` | Exchange identities with a peer; records the caller |
 | POST | `/api/sync` | Receive metrics, availability records and alert notices from a peer. A push-only sender is answered with a signed `{"peers":[…]}` |
 | GET | `/api/servers` | All servers with their latest metrics |
@@ -405,12 +413,35 @@ the dashboard as an explicit signature error when adding a peer, not as a timeou
 the port insert metrics and register as a peer. The service logs a warning at start-up
 when that is the case.
 
-The remaining endpoints are still unauthenticated. The read endpoints only expose
-monitoring data, but `POST /api/peers` and `DELETE /api/peers/{id}` change which peers
-this node talks to, and a browser cannot hold the shared secret to sign them. Treat the
-dashboard as an admin surface: bind it to a private interface with `ListenAddress`, or
-firewall the port, or put it behind a reverse proxy that handles authentication.
+Everything else — every read endpoint, and `POST`/`DELETE /api/peers` — asks for
+`DashboardPassword`. The dashboard has a sign-in form of its own: `POST /api/login` trades
+the password for a session cookie (HttpOnly, SameSite=Strict), signed with a key derived
+from the password, so changing the password signs every browser out and a restart signs
+nobody out. "Remember me" is what decides whether the browser keeps that cookie for the
+thirty days it is good for or drops it when it closes. The page and its assets load without a password, since they hold no data
+and are what shows the form. The Android app and scripts send the password as HTTP basic
+authentication instead, with any user name; refusals carry no `WWW-Authenticate` challenge,
+so a browser never raises its own dialog. `/api/health` stays open, since it only names the
+node and is how the deployment script and the app probe an address before they have
+credentials.
+
+It is a second credential rather than the shared secret because a browser cannot sign
+requests, so the password travels as typed, and over plain HTTP anybody on the path can
+read it. Were it the shared secret, whoever read it could also forge metrics, register
+peers and hand push-only nodes a peer list of their choosing. As it is, a leaked password
+exposes the monitoring data and peer management, and nothing that is signed.
+
+After five wrong passwords an address is locked out for a minute, doubling with each
+further failure up to fifteen, and during a lockout even the right password is refused.
+Requests from the host itself (loopback) need no password: whoever can make one can read
+`appsettings.json` anyway, and it is how the deployment script manages peers and how a
+push-only node's own dashboard is reached. That also means a reverse proxy on the same
+host would pass everything through unchecked — put the authentication in the proxy if you
+add one.
+
+**Leaving `DashboardPassword` empty leaves all of that open**, and the service logs a
+warning at start-up saying so. Keep the port firewalled in that case.
 
 Traffic between nodes is plain HTTP. The signature protects integrity and origin, not
-confidentiality — run peers over a private network or a tunnel if the metrics
-themselves are sensitive.
+confidentiality, and the password is readable by anybody on the path — run peers over a
+private network or a tunnel if that matters, or put a TLS-terminating proxy in front.

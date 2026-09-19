@@ -19,6 +19,7 @@ appsettings.json
 !appsettings.example.json
 deploy/.secret
 deploy/.telegram
+deploy/.dashboard-password
 
 ## Database
 *.db
