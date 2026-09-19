@@ -55,6 +55,11 @@ type node struct {
 }
 
 func newNode(t *testing.T, uid, name string, alerts bool) *node {
+	return newSecretNode(t, uid, name, alerts, "")
+}
+
+// newSecretNode is newNode for a mesh that signs its protocol with secret.
+func newSecretNode(t *testing.T, uid, name string, alerts bool, secret string) *node {
 	t.Helper()
 
 	st, err := store.Open(filepath.Join(t.TempDir(), "monitor.db"))
@@ -67,8 +72,8 @@ func newNode(t *testing.T, uid, name string, alerts bool) *node {
 
 	api := &Server{
 		Store:      st,
-		Client:     peer.New(""),
-		Signer:     auth.New(""),
+		Client:     peer.New(secret),
+		Signer:     auth.New(secret),
 		ServerUID:  uid,
 		ServerName: name,
 		Location:   "Lab",
@@ -92,9 +97,8 @@ func (n *node) sync(t *testing.T, to *node, payload model.SyncPayload) {
 
 	payload.ServerID = n.uid
 	payload.SelfURL = n.server.URL
-	ok, _, status := peer.New("").PushSync(t.Context(), to.server.URL, payload)
-	if !ok {
-		t.Fatalf("sync to %s failed, status %v", to.uid, status)
+	if res := peer.New("").PushSync(t.Context(), to.server.URL, payload); !res.OK {
+		t.Fatalf("sync to %s failed, status %v", to.uid, res.Status)
 	}
 }
 
@@ -168,5 +172,102 @@ func TestAlertNoticesReachTheOtherAlertingNodes(t *testing.T) {
 	}
 	if len(stored) != 1 {
 		t.Errorf("the replayed round left %d notices, want the one: %+v", len(stored), stored)
+	}
+}
+
+// TestPushOnlyNodeIsRecordedAndToldAboutTheMesh covers the one hop a push-only
+// node depends on. It cannot be reached, so it is never introduced to anybody:
+// everything it learns about the mesh arrives in the replies to its own pushes,
+// and everything the mesh learns about it arrives in those pushes.
+func TestPushOnlyNodeIsRecordedAndToldAboutTheMesh(t *testing.T) {
+	const secret = "s3cret"
+	hub := newSecretNode(t, "11111111-1111-4111-8111-111111111111", "hub", false, secret)
+	other := newSecretNode(t, "22222222-2222-4222-8222-222222222222", "other", false, secret)
+	roamer := "33333333-3333-4333-8333-333333333333"
+
+	if _, err := hub.store.UpsertPeer(other.uid, "other", "Lab", other.server.URL, false, model.Now()); err != nil {
+		t.Fatal(err)
+	}
+	// The hub once knew the roamer at an address, before it lost it. Being
+	// told the node is push-only now has to stop the hub pushing there.
+	if _, err := hub.store.UpsertPeer(roamer, "roamer", "Car", "http://10.0.0.9:5001", false, model.Now()); err != nil {
+		t.Fatal(err)
+	}
+
+	res := peer.New(secret).PushSync(t.Context(), hub.server.URL, model.SyncPayload{
+		ServerID:   roamer,
+		ServerName: "roamer",
+		Location:   "Car",
+		PushOnly:   true,
+		Metrics:    []model.Metric{{Timestamp: model.Now(), CpuPercent: 12}},
+	})
+	if !res.OK {
+		t.Fatalf("push failed, status %v", res.Status)
+	}
+
+	if res.Reply == nil {
+		t.Fatal("the push-only node got no signed reply, so it can never learn of the rest of the mesh")
+	}
+	var named []string
+	for _, p := range res.Reply.Peers {
+		named = append(named, p.ServerID)
+		if p.ServerID == other.uid && p.URL != other.server.URL {
+			t.Errorf("other named at %q, want %q", p.URL, other.server.URL)
+		}
+	}
+	if len(named) != 1 || named[0] != other.uid {
+		t.Errorf("reply names %v, want only the other node", named)
+	}
+
+	srv, found, err := hub.store.ServerByUID(roamer)
+	if err != nil || !found {
+		t.Fatalf("hub has no row for the roamer: found=%v err=%v", found, err)
+	}
+	if !srv.PushOnly {
+		t.Error("the hub does not know the roamer is push-only, and would never watch for its pushes")
+	}
+	if srv.URL != "" {
+		t.Errorf("the roamer kept the address %q, and the hub would go on pushing to it", srv.URL)
+	}
+
+	peers, err := hub.store.ListPeers()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range peers {
+		if p.UID == roamer {
+			t.Error("the roamer is still among the peers the hub pushes to")
+		}
+	}
+
+	latest, err := hub.store.LatestMetric(srv.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if latest == nil || latest.CpuPercent != 12 {
+		t.Errorf("the roamer's metrics did not arrive: %+v", latest)
+	}
+}
+
+// TestUnsignedSyncReplyIsIgnored: the peers a reply names are where the
+// push-only node will send its data next, so a reply the shared secret does not
+// vouch for must not be acted on - even when the push itself went through.
+func TestUnsignedSyncReplyIsIgnored(t *testing.T) {
+	// A hub without the secret signs nothing, and accepts anything.
+	hub := newNode(t, "11111111-1111-4111-8111-111111111111", "hub", false)
+	if _, err := hub.store.UpsertPeer("22222222-2222-4222-8222-222222222222", "other", "Lab",
+		"http://elsewhere:5001", false, model.Now()); err != nil {
+		t.Fatal(err)
+	}
+
+	res := peer.New("s3cret").PushSync(t.Context(), hub.server.URL, model.SyncPayload{
+		ServerID: "33333333-3333-4333-8333-333333333333",
+		PushOnly: true,
+	})
+	if !res.OK {
+		t.Fatalf("push failed, status %v", res.Status)
+	}
+	if res.Reply != nil {
+		t.Errorf("an unsigned reply was accepted: %+v", res.Reply)
 	}
 }

@@ -22,6 +22,14 @@ const (
 	pathSync      = "/api/sync"
 )
 
+// ReplyPath is what the reply to a sync is signed over in place of a request
+// path. It is not one any request can carry, so a signature lifted from a
+// request cannot be passed off as a reply, nor a reply's as a request.
+const ReplyPath = pathSync + "#reply"
+
+// maxReplyBytes caps a sync reply, which names peers and nothing else.
+const maxReplyBytes = 1 << 20
+
 // ErrUnauthorized reports that the peer rejected our signature, which almost
 // always means the two ends have different shared secrets.
 var ErrUnauthorized = errors.New("peer rejected our signature")
@@ -61,31 +69,64 @@ func (c *Client) Introduce(ctx context.Context, baseURL string, req model.Introd
 	return &health, nil
 }
 
-// PushSync sends payload to a peer. The measured round trip is also this
+// PushResult is the outcome of one push. The measured round trip is also this
 // server's availability probe for that peer, so a failure is a normal result
 // rather than an error: latency and status are reported either way.
-func (c *Client) PushSync(ctx context.Context, baseURL string, payload model.SyncPayload) (ok bool, latencyMs float64, status *int) {
+//
+// Reply is what the peer answered with, when it answered a push-only sender
+// and its answer carried a valid signature; it is nil otherwise.
+type PushResult struct {
+	OK        bool
+	LatencyMs float64
+	Status    *int
+	Reply     *model.SyncReply
+}
+
+// PushSync sends payload to a peer.
+func (c *Client) PushSync(ctx context.Context, baseURL string, payload model.SyncPayload) PushResult {
 	start := time.Now()
 
 	body, err := json.Marshal(payload)
 	if err != nil {
-		return false, 0, nil
+		return PushResult{}
 	}
 
 	req, err := c.newRequest(ctx, NormalizeURL(baseURL), pathSync, body)
 	if err != nil {
-		return false, elapsedMs(start), nil
+		return PushResult{LatencyMs: elapsedMs(start)}
 	}
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return false, elapsedMs(start), nil
+		return PushResult{LatencyMs: elapsedMs(start)}
 	}
 	defer resp.Body.Close()
-	io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+
+	// Read before the clock stops, so the latency covers the whole exchange
+	// the way it did when the body was only drained.
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, maxReplyBytes))
 
 	code := resp.StatusCode
-	return code >= 200 && code < 300, elapsedMs(start), &code
+	result := PushResult{OK: code >= 200 && code < 300, LatencyMs: elapsedMs(start), Status: &code}
+	if result.OK && payload.PushOnly && len(raw) > 0 {
+		result.Reply = c.readReply(resp.Header, raw)
+	}
+	return result
+}
+
+// readReply accepts a sync reply only when it is signed with the shared
+// secret. The peers it names are where this node will send its own data next,
+// so an unsigned list would let anybody on the path redirect it.
+func (c *Client) readReply(header http.Header, raw []byte) *model.SyncReply {
+	if err := c.signer.Verify(header.Get(auth.HeaderTimestamp), header.Get(auth.HeaderSignature),
+		ReplyPath, raw, time.Now()); err != nil {
+		return nil
+	}
+	var reply model.SyncReply
+	if err := json.Unmarshal(raw, &reply); err != nil {
+		return nil
+	}
+	return &reply
 }
 
 // newRequest builds a signed POST for the given API path.

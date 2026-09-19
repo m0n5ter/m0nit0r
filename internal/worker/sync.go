@@ -15,9 +15,21 @@ import (
 // offers a peer, covering a short restart without replaying everything.
 const backfillWindow = 10 * time.Minute
 
+// minPushGrace is the floor on how long a push-only peer may go unheard before
+// it counts as down. See Sync.pushGrace.
+const minPushGrace = 30 * time.Second
+
 // Sync pushes locally produced data to every configured peer. The push itself
 // is also this server's availability probe, so each round yields one
 // reachability record per peer.
+//
+// Peers that are push-only cannot be probed that way, having no address. For
+// them the round records instead whether their own pushes are still arriving,
+// which gives them the same one record per round and so the same matrix cell,
+// online state and alerts as any other peer.
+//
+// When this node is itself push-only it learns the mesh from the replies to its
+// pushes, since nobody can reach it to introduce the rest.
 type Sync struct {
 	Store      *store.Store
 	Client     *peer.Client
@@ -27,8 +39,13 @@ type Sync struct {
 	Location   string
 	PublicURL  string
 	Alerts     bool
+	PushOnly   bool
 	Interval   time.Duration
 	Log        *slog.Logger
+
+	// When the worker started. A push-only peer's last push predates it by
+	// however long this node was down, which says nothing about the peer.
+	started time.Time
 
 	// Watermarks of what has already been offered to peers. Advancing them by
 	// the newest row actually sent — rather than by wall clock — means samples
@@ -43,7 +60,8 @@ type Sync struct {
 func (w *Sync) Run(ctx context.Context) {
 	w.Log.Info("peer sync started", "interval", w.Interval)
 
-	start := model.At(time.Now().Add(-backfillWindow))
+	w.started = time.Now()
+	start := model.At(w.started.Add(-backfillWindow))
 	w.lastMetric, w.lastAvail, w.lastNotice = start, start, start
 
 	// Let the first metrics land before the opening round, so a fresh peer is
@@ -73,6 +91,12 @@ func (w *Sync) Run(ctx context.Context) {
 }
 
 func (w *Sync) round(ctx context.Context) error {
+	timestamp := model.Now()
+
+	if err := w.watchPushOnly(timestamp); err != nil {
+		w.Log.Error("check push-only peers", "err", err)
+	}
+
 	peers, err := w.Store.ListPeers()
 	if err != nil {
 		return err
@@ -86,20 +110,90 @@ func (w *Sync) round(ctx context.Context) error {
 		return err
 	}
 
-	timestamp := model.Now()
+	replies := make([]*model.SyncReply, len(peers))
 	var wg sync.WaitGroup
-	for _, p := range peers {
+	for i, p := range peers {
 		wg.Add(1)
-		go func(target model.Server) {
+		go func(i int, target model.Server) {
 			defer wg.Done()
-			w.push(ctx, target, payload, timestamp)
-		}(p)
+			replies[i] = w.push(ctx, target, payload, timestamp)
+		}(i, p)
 	}
 	wg.Wait()
 
 	w.lastMetric, w.lastAvail, w.lastNotice = marks.metric, marks.avail, marks.notice
 	w.Log.Debug("sync round complete", "metrics", len(payload.Metrics), "peers", len(peers))
+
+	if w.PushOnly {
+		w.learnPeers(replies)
+	}
 	return nil
+}
+
+// pushGrace is how long a push-only peer may go unheard before it counts as
+// down: three of this node's rounds, so that one push lost to a slow link or a
+// restart does not register, and never less than minPushGrace, so that a node
+// configured to sync faster than its push-only peers does not mark every gap
+// between their pushes as an outage.
+func (w *Sync) pushGrace() time.Duration {
+	return max(3*w.Interval, minPushGrace)
+}
+
+// watchPushOnly records, for each push-only peer, whether it has pushed here
+// recently. There is no round trip to time, so the observation carries no
+// latency; the dashboard shows such an edge as received rather than measured.
+func (w *Sync) watchPushOnly(timestamp model.Time) error {
+	grace := w.pushGrace()
+	// Right after start-up every peer's last push is as old as this node's own
+	// downtime. Recording that as the peer being down would put a false
+	// outage in the matrix after every restart.
+	if timestamp.Sub(w.started) < grace {
+		return nil
+	}
+
+	pushing, err := w.Store.ListPushOnly()
+	if err != nil {
+		return err
+	}
+	if len(pushing) == 0 {
+		return nil
+	}
+
+	observations := make([]store.Observation, 0, len(pushing))
+	for _, p := range pushing {
+		observations = append(observations, store.Observation{
+			ToServerID:  p.ID,
+			Timestamp:   timestamp,
+			IsAvailable: timestamp.Sub(p.LastSeen.Time) <= grace,
+		})
+	}
+	return w.Store.InsertAvailability(w.ServerID, observations)
+}
+
+// learnPeers registers the peers named in the replies this push-only node got
+// back, so that it starts pushing to the whole mesh after being pointed at any
+// one node of it. A server already known is left alone, which is what keeps a
+// peer the operator removed here from being brought back by a neighbour.
+func (w *Sync) learnPeers(replies []*model.SyncReply) {
+	for _, reply := range replies {
+		if reply == nil {
+			continue
+		}
+		for _, p := range reply.Peers {
+			url := peer.NormalizeURL(p.URL)
+			if p.ServerID == "" || p.ServerID == w.ServerUID || url == "" {
+				continue
+			}
+			added, err := w.Store.AddPeerIfUnknown(p.ServerID, p.ServerName, p.Location, url, p.Alerts)
+			if err != nil {
+				w.Log.Error("learn peer", "peer", p.ServerID, "err", err)
+				continue
+			}
+			if added {
+				w.Log.Info("learned peer from sync reply", "peer", p.ServerName, "url", url)
+			}
+		}
+	}
 }
 
 // watermarks is how far each of the three streams has been offered to peers.
@@ -113,27 +207,30 @@ func advance(mark *model.Time, t model.Time) {
 	}
 }
 
-func (w *Sync) push(ctx context.Context, target model.Server, payload model.SyncPayload, timestamp model.Time) {
-	ok, latencyMs, status := w.Client.PushSync(ctx, target.URL, payload)
+// push sends one round's payload to one peer, records how it went, and hands
+// back whatever the peer replied with.
+func (w *Sync) push(ctx context.Context, target model.Server, payload model.SyncPayload, timestamp model.Time) *model.SyncReply {
+	res := w.Client.PushSync(ctx, target.URL, payload)
 
 	if err := w.Store.InsertAvailability(w.ServerID, []store.Observation{{
 		ToServerID:  target.ID,
 		Timestamp:   timestamp,
-		IsAvailable: ok,
-		LatencyMs:   &latencyMs,
-		HTTPStatus:  status,
+		IsAvailable: res.OK,
+		LatencyMs:   &res.LatencyMs,
+		HTTPStatus:  res.Status,
 	}}); err != nil {
 		w.Log.Error("record availability", "peer", target.Name, "err", err)
-		return
+		return res.Reply
 	}
 
-	if ok {
+	if res.OK {
 		if err := w.Store.TouchLastSeen(target.ID, timestamp); err != nil {
 			w.Log.Error("touch peer last seen", "peer", target.Name, "err", err)
 		}
 	}
 
-	w.Log.Debug("sync push", "peer", target.Name, "ok", ok, "latencyMs", latencyMs)
+	w.Log.Debug("sync push", "peer", target.Name, "ok", res.OK, "latencyMs", res.LatencyMs)
+	return res.Reply
 }
 
 // buildPayload gathers everything produced locally since the last round, and
@@ -176,6 +273,7 @@ func (w *Sync) buildPayload() (model.SyncPayload, watermarks, error) {
 		Location:     w.Location,
 		SelfURL:      w.PublicURL,
 		Alerts:       w.Alerts,
+		PushOnly:     w.PushOnly,
 		Metrics:      metrics,
 		Availability: availability,
 		Notices:      notices,

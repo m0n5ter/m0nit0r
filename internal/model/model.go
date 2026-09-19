@@ -97,6 +97,10 @@ type Snapshot struct {
 // else; UID is the identity the node was given at first start and the one that
 // travels, so it is what the peer protocol and the dashboard both speak. The
 // tables reference servers by ID, which is why the two are carried together.
+//
+// PushOnly marks a node that has no address anybody can reach - a machine on a
+// dynamic IP or behind a NAT it does not control. It pushes to its peers and
+// is never pushed to; its peers judge it by whether its pushes keep arriving.
 type Server struct {
 	ID       int64
 	UID      string
@@ -105,6 +109,7 @@ type Server struct {
 	URL      string
 	IsSelf   bool
 	Alerts   bool
+	PushOnly bool
 	LastSeen Time
 }
 
@@ -152,6 +157,7 @@ type SyncPayload struct {
 	Location     string         `json:"location"`
 	SelfURL      string         `json:"selfUrl"`
 	Alerts       bool           `json:"alerts"`
+	PushOnly     bool           `json:"pushOnly"`
 	Metrics      []Metric       `json:"metrics"`
 	Availability []Availability `json:"availability"`
 	Notices      []Notice       `json:"notices"`
@@ -163,6 +169,27 @@ type IntroduceRequest struct {
 	ServerName string `json:"serverName"`
 	Location   string `json:"location"`
 	SelfURL    string `json:"selfUrl"`
+	Alerts     bool   `json:"alerts"`
+	PushOnly   bool   `json:"pushOnly"`
+}
+
+// SyncReply is the body a node answers a push-only peer's POST /api/sync with.
+//
+// A push-only node cannot be reached, so nobody can introduce the rest of the
+// mesh to it the way an ordinary node is introduced. What it learns instead
+// comes back on its own pushes: each peer it syncs with names the peers that
+// peer syncs with, and it starts pushing to the ones it did not know.
+// An ordinary node is answered with an empty body, as it always was.
+type SyncReply struct {
+	Peers []PeerInfo `json:"peers"`
+}
+
+// PeerInfo is one reachable node, as named in a SyncReply.
+type PeerInfo struct {
+	ServerID   string `json:"serverId"`
+	ServerName string `json:"serverName"`
+	Location   string `json:"location"`
+	URL        string `json:"url"`
 	Alerts     bool   `json:"alerts"`
 }
 

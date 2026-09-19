@@ -1143,10 +1143,16 @@ function renderMatrix(list, matrix) {
             // A link that is up right now but has been flapping is worth
             // distinguishing from one that has been solid all hour.
             const cls = !e.isAvailable ? 'down' : e.availabilityPercent < 100 ? 'deg' : 'up';
-            const main = e.isAvailable ? ms(e.lastLatencyMs) : 'down';
+            // A push-only node cannot be reached, so the edge towards it is not
+            // a timed round trip but a record of whether its pushes arrive.
+            const passive = to.pushOnly && e.lastLatencyMs == null;
+            const main = !e.isAvailable ? 'down' : passive ? 'push' : ms(e.lastLatencyMs);
             const sub = e.availabilityPercent < 100 ? e.availabilityPercent.toFixed(0) + '% up' : '';
-            const title = from.name + ' → ' + to.name + ' · ' + e.availabilityPercent.toFixed(0) +
-                '% of recent checks succeeded · last check ' + formatRelative(e.lastCheck);
+            const title = (passive
+                ? to.name + ' is push-only · ' + from.name + ' received ' +
+                  e.availabilityPercent.toFixed(0) + '% of its expected pushes'
+                : from.name + ' → ' + to.name + ' · ' + e.availabilityPercent.toFixed(0) +
+                  '% of recent checks succeeded') + ' · last check ' + formatRelative(e.lastCheck);
 
             html += '<td class="cell ' + cls + band + '" title="' + esc(title) + '" ' +
                 'data-from="' + esc(from.id) + '" data-to="' + esc(to.id) + '" ' +
@@ -1214,8 +1220,9 @@ async function renderPeers() {
                 'data-node="' + esc(p.id) + '" title="' + esc(p.name) + '">' +
                 esc(p.name) + '</button></td>' +
             '<td class="text-dim">' + esc(p.location || '—') + '</td>' +
-            '<td class="text-dim mono small col-url" title="' + esc(p.url) + '">' +
-                (p.url ? urlLink(p.url) : '—') + '</td>' +
+            '<td class="text-dim mono small col-url" title="' +
+                esc(p.pushOnly ? 'push-only: no inbound address, pushes to this node' : p.url) + '">' +
+                (p.url ? urlLink(p.url) : p.pushOnly ? '<span class="text-faint">push-only</span>' : '—') + '</td>' +
             '<td class="text-faint mono small" title="' + esc(p.id) + '">' + esc(shortId) + '</td>' +
             '<td class="text-dim">' + formatRelative(p.lastSeen) + '</td>' +
             '<td class="text-end pe-3">' +
@@ -1401,7 +1408,8 @@ function renderDetailSummary(s) {
 
     const facts = [
         ['Location', esc(s.location || '\u2014')],
-        ['URL', s.url ? '<span class="mono">' + urlLink(s.url) + '</span>' : '<span class="text-faint">not advertised</span>'],
+        ['URL', s.url ? '<span class="mono">' + urlLink(s.url) + '</span>'
+            : '<span class="text-faint">' + (s.pushOnly ? 'push-only, no inbound address' : 'not advertised') + '</span>'],
         ['Server ID', '<span class="mono">' + esc(s.id) + '</span>'],
         ['Last seen', s.isSelf ? 'this host' : esc(formatRelative(s.lastSeen))],
     ].map(([k, v]) => '<div class="fact"><dt>' + k + '</dt><dd>' + v + '</dd></div>').join('');

@@ -99,11 +99,30 @@ func runApp(parent context.Context, log *slog.Logger, opts config.Options, baseD
 	// each of them has to know which of the others are alerting at all.
 	alerts := opts.Telegram.Enabled()
 
+	// A push-only node has no address to publish, whatever the file says: an
+	// address it published would have every peer pushing to it and recording
+	// the failures. Nor does it alert. Nobody pushes to it, so the notices the
+	// other alerting nodes send never reach it, and it would repeat every
+	// message they had already sent.
+	publicURL := peer.NormalizeURL(opts.PublicURL)
+	if opts.PushOnly {
+		if publicURL != "" {
+			log.Warn("PushOnly is set, so PublicUrl is ignored", "publicUrl", publicURL)
+			publicURL = ""
+		}
+		if alerts {
+			log.Warn("PushOnly is set, so Telegram alerts are disabled on this node")
+			alerts = false
+		}
+	}
+
 	// The row id this resolves to is what every table is keyed by, so it is
 	// read once here and handed to the workers and the API rather than looked
 	// up again on each write.
-	serverID, err := st.UpsertSelf(opts.ServerID, opts.ServerName, opts.Location,
-		peer.NormalizeURL(opts.PublicURL), alerts)
+	serverID, err := st.UpsertSelf(opts.ServerID, opts.ServerName, opts.Location, publicURL, alerts)
+	if err == nil {
+		err = st.SetPushOnly(serverID, opts.PushOnly)
+	}
 	if err != nil {
 		return err
 	}
@@ -112,6 +131,7 @@ func runApp(parent context.Context, log *slog.Logger, opts config.Options, baseD
 		"serverId", opts.ServerID,
 		"name", opts.ServerName,
 		"location", opts.Location,
+		"pushOnly", opts.PushOnly,
 		"database", dbPath)
 
 	signer := auth.New(opts.SharedSecret)
@@ -129,8 +149,9 @@ func runApp(parent context.Context, log *slog.Logger, opts config.Options, baseD
 		ServerUID:  opts.ServerID,
 		ServerName: opts.ServerName,
 		Location:   opts.Location,
-		PublicURL:  peer.NormalizeURL(opts.PublicURL),
+		PublicURL:  publicURL,
 		Alerts:     alerts,
+		PushOnly:   opts.PushOnly,
 		Log:        log,
 	}
 
@@ -166,8 +187,9 @@ func runApp(parent context.Context, log *slog.Logger, opts config.Options, baseD
 			ServerUID:  opts.ServerID,
 			ServerName: opts.ServerName,
 			Location:   opts.Location,
-			PublicURL:  peer.NormalizeURL(opts.PublicURL),
+			PublicURL:  publicURL,
 			Alerts:     alerts,
+			PushOnly:   opts.PushOnly,
 			Interval:   time.Duration(opts.SyncIntervalSeconds) * time.Second,
 			Log:        log,
 		}).Run,
@@ -185,7 +207,7 @@ func runApp(parent context.Context, log *slog.Logger, opts config.Options, baseD
 			Stagger:    time.Duration(opts.Telegram.StaggerSeconds) * time.Second,
 			Log:        log,
 		}).Run)
-	} else {
+	} else if !opts.Telegram.Enabled() {
 		log.Info("telegram alerts disabled: no BotToken and ChatId configured")
 	}
 

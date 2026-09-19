@@ -85,7 +85,9 @@ func (w *Alerts) round(ctx context.Context) error {
 		// with no address is one that was removed or that only ever arrived as
 		// a third-party mention: nothing probes it, so its last observation
 		// stays whatever it was and would otherwise be alerted on for ever.
-		if srv.IsSelf || srv.URL == "" {
+		// A push-only peer has no address either, but it is watched: the sync
+		// worker records whether its pushes keep arriving.
+		if srv.IsSelf || (srv.URL == "" && !srv.PushOnly) {
 			continue
 		}
 		if err := w.consider(ctx, srv, delay); err != nil {

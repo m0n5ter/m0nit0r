@@ -47,6 +47,7 @@ type Server struct {
 	Location   string
 	PublicURL  string
 	Alerts     bool
+	PushOnly   bool
 	Log        *slog.Logger
 }
 
@@ -122,10 +123,17 @@ func (s *Server) handleIntroduce(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// An introduction without a reachable address tells us nothing worth
-	// storing, so record the caller only when both id and URL are present.
-	if req.ServerID != "" && req.ServerID != s.ServerUID && peer.NormalizeURL(req.SelfURL) != "" {
-		if _, err := s.Store.UpsertPeer(req.ServerID, req.ServerName, req.Location,
-			peer.NormalizeURL(req.SelfURL), req.Alerts, model.Now()); err != nil {
+	// storing, so record the caller only when both id and URL are present -
+	// or when it is a push-only node, which has no address by design and is
+	// worth knowing about before its first push arrives.
+	if req.ServerID != "" && req.ServerID != s.ServerUID &&
+		(peer.NormalizeURL(req.SelfURL) != "" || req.PushOnly) {
+		id, err := s.Store.UpsertPeer(req.ServerID, req.ServerName, req.Location,
+			peer.NormalizeURL(req.SelfURL), req.Alerts, model.Now())
+		if err == nil {
+			err = s.Store.SetPushOnly(id, req.PushOnly)
+		}
+		if err != nil {
 			s.Log.Error("record introducing peer", "peer", req.ServerID, "err", err)
 			http.Error(w, "failed to record peer", http.StatusInternalServerError)
 			return
@@ -151,6 +159,9 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 
 	peerID, err := s.Store.UpsertPeer(payload.ServerID, payload.ServerName, payload.Location,
 		peer.NormalizeURL(payload.SelfURL), payload.Alerts, model.Now())
+	if err == nil {
+		err = s.Store.SetPushOnly(peerID, payload.PushOnly)
+	}
 	if err != nil {
 		s.Log.Error("record syncing peer", "peer", payload.ServerID, "err", err)
 		http.Error(w, "failed to record peer", http.StatusInternalServerError)
@@ -173,7 +184,55 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if payload.PushOnly {
+		s.replyWithPeers(w, payload.ServerID)
+		return
+	}
 	w.WriteHeader(http.StatusOK)
+}
+
+// replyWithPeers answers a push-only node with the peers this node pushes to,
+// which is the only way such a node learns of the rest of the mesh: nobody can
+// reach it to introduce them. The reply is signed, because the sender will
+// start pushing its data to whatever addresses it names.
+func (s *Server) replyWithPeers(w http.ResponseWriter, callerUID string) {
+	peers, err := s.Store.ListPeers()
+	if err != nil {
+		// The data is already stored; failing the push over the peer list
+		// would record an outage that did not happen.
+		s.Log.Error("list peers for sync reply", "err", err)
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	reply := model.SyncReply{Peers: make([]model.PeerInfo, 0, len(peers))}
+	for _, p := range peers {
+		if p.UID == callerUID {
+			continue
+		}
+		reply.Peers = append(reply.Peers, model.PeerInfo{
+			ServerID:   p.UID,
+			ServerName: p.Name,
+			Location:   p.Location,
+			URL:        p.URL,
+			Alerts:     p.Alerts,
+		})
+	}
+
+	body, err := json.Marshal(reply)
+	if err != nil {
+		s.Log.Error("encode sync reply", "err", err)
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	if s.Signer.Enabled() {
+		timestamp, signature := s.Signer.Sign(peer.ReplyPath, body)
+		w.Header().Set(auth.HeaderTimestamp, timestamp)
+		w.Header().Set(auth.HeaderSignature, signature)
+	}
+	w.WriteHeader(http.StatusOK)
+	w.Write(body)
 }
 
 // storeSyncedMetrics inserts only samples newer than what is already held for
@@ -284,6 +343,7 @@ type serverView struct {
 	Location string        `json:"location"`
 	URL      string        `json:"url"`
 	IsSelf   bool          `json:"isSelf"`
+	PushOnly bool          `json:"pushOnly"`
 	LastSeen model.Time    `json:"lastSeen"`
 	IsOnline bool          `json:"isOnline"`
 	Latest   *model.Metric `json:"latest"`
@@ -322,6 +382,7 @@ func (s *Server) handleServers(w http.ResponseWriter, r *http.Request) {
 			Location: srv.Location,
 			URL:      srv.URL,
 			IsSelf:   srv.IsSelf,
+			PushOnly: srv.PushOnly,
 			LastSeen: srv.LastSeen,
 			IsOnline: online,
 			Latest:   latest,
@@ -458,6 +519,7 @@ type peerView struct {
 	Name     string     `json:"name"`
 	Location string     `json:"location"`
 	URL      string     `json:"url"`
+	PushOnly bool       `json:"pushOnly"`
 	LastSeen model.Time `json:"lastSeen"`
 }
 
@@ -467,10 +529,17 @@ func (s *Server) handleListPeers(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, "list peers", err)
 		return
 	}
+	// Push-only peers have no address, which is what ListPeers selects on,
+	// but they are peers all the same and removable like any other.
+	pushing, err := s.Store.ListPushOnly()
+	if err != nil {
+		s.fail(w, "list push-only peers", err)
+		return
+	}
 
-	views := make([]peerView, 0, len(peers))
-	for _, p := range peers {
-		views = append(views, peerView{p.UID, p.Name, p.Location, p.URL, p.LastSeen})
+	views := make([]peerView, 0, len(peers)+len(pushing))
+	for _, p := range append(peers, pushing...) {
+		views = append(views, peerView{p.UID, p.Name, p.Location, p.URL, p.PushOnly, p.LastSeen})
 	}
 	writeJSON(w, http.StatusOK, views)
 }
@@ -498,6 +567,7 @@ func (s *Server) handleAddPeer(w http.ResponseWriter, r *http.Request) {
 		Location:   s.Location,
 		SelfURL:    s.PublicURL,
 		Alerts:     s.Alerts,
+		PushOnly:   s.PushOnly,
 	})
 	if err != nil {
 		s.Log.Warn("introduce to new peer failed", "url", url, "err", err)
@@ -589,9 +659,15 @@ func (s *Server) handleRemovePeer(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Clearing the address stops syncing but keeps the collected history, which
-	// is what the dashboard warns the operator will happen.
+	// is what the dashboard warns the operator will happen. A push-only peer
+	// has no address to clear; dropping the flag is what stops it being
+	// watched for pushes. Either comes back if the node keeps syncing here.
 	if err := s.Store.SetPeerURL(srv.ID, ""); err != nil {
 		s.fail(w, "clear peer url", err)
+		return
+	}
+	if err := s.Store.SetPushOnly(srv.ID, false); err != nil {
+		s.fail(w, "clear push-only", err)
 		return
 	}
 	w.WriteHeader(http.StatusOK)

@@ -155,6 +155,7 @@ func toIntegerKeys(db *sql.DB) error {
 func addColumns(db *sql.DB) error {
 	for _, col := range []struct{ table, name, decl string }{
 		{"Servers", "Alerts", `"Alerts" INTEGER NOT NULL DEFAULT 0`},
+		{"Servers", "PushOnly", `"PushOnly" INTEGER NOT NULL DEFAULT 0`},
 	} {
 		present, err := hasColumn(db, col.table, col.name)
 		if err != nil {

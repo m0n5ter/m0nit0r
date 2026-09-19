@@ -47,6 +47,7 @@ launches it.
 | `ServerName` | `My Server` | Human-readable name shown in the dashboard |
 | `Location` | `Unknown` | Geographic location label |
 | `PublicUrl` | empty | This server's address as peers should reach it. Without it, peers you add cannot add you back automatically |
+| `PushOnly` | `false` | This node has no address peers can reach (dynamic IP, NAT it does not control). It pushes its data and is never polled. See [Push-only nodes](#push-only-nodes) |
 | `ListenAddress` | `0.0.0.0` | Interface to bind. Set to `127.0.0.1` to keep the API off the network |
 | `ListenPort` | `5001` | HTTP port for dashboard and peer API |
 | `SharedSecret` | empty | Shared secret authenticating the peer protocol. Must be identical on every node. Empty disables authentication |
@@ -195,6 +196,46 @@ latency and status code become an availability record. The matrix on the dashboa
 therefore genuinely per-direction — it shows how each node sees each other node, not
 one node's opinion broadcast to the rest.
 
+## Push-only nodes
+
+A node on a dynamic IP, or behind a NAT whose ports you cannot forward, has no
+address the rest of the mesh can reach. Set `"PushOnly": true` on it and it only ever
+pushes: it syncs its data out on the usual schedule and is never pushed to.
+
+```json
+{ "Monitor": { "ServerName": "Laptop", "PushOnly": true, "SharedSecret": "…",
+               "ListenAddress": "127.0.0.1" } }
+```
+
+Then add any one reachable node as its peer, from its own dashboard or with
+`POST /api/peers`. Nothing has to be configured on the other side:
+
+- **It joins the whole mesh from one peer.** A node answers a push-only node's sync with
+  the list of peers it pushes to, signed with the shared secret, and the push-only node
+  starts pushing to the ones it did not know. A peer removed on the push-only node stays
+  removed; hearing about it from a neighbour does not bring it back.
+- **The mesh watches its pushes instead of probing it.** Every other node records, each
+  sync round, whether that node's pushes are still arriving. It goes down once nothing has
+  arrived for three rounds (never less than 30 seconds) — so keep its
+  `SyncIntervalSeconds` no longer than the other nodes'. That record feeds the matrix,
+  the online state and Telegram alerts exactly as a probe would. In the matrix such a cell
+  reads `push` rather than a latency, since there is no round trip to time.
+- **It never publishes an address and never alerts.** `PublicUrl` is ignored. Telegram is
+  switched off because the alert notices of the other nodes are never pushed to it, so it
+  would repeat every message they had already sent.
+- **Its own dashboard shows only itself** and its links outwards, for the same reason. Look
+  at it from any other node, which holds its metrics like any peer's.
+  `ListenAddress: 127.0.0.1` is a sensible default for it.
+
+A node that switches from push-only back to a published address is picked up on its next
+sync. Removing a push-only peer from a dashboard stops it being watched; if it is still
+running, its next push registers it again, as with any peer — stop the agent first.
+
+Nodes that take pushes from a dynamic address cannot restrict their port to a list of
+source addresses, so `-RestrictFirewall` and a push-only node do not mix: the address it
+pushes from changes. Leave the port open and set `DashboardPassword` instead; `/api/sync`
+stays authenticated by the shared secret either way.
+
 ## Deployment
 
 `deploy/Deploy-M0nit0r.ps1` builds and installs the agent across every node in one
@@ -323,7 +364,7 @@ to write to, so logs go to `monitor.log` beside the executable instead, rotated 
 |---|---|---|
 | GET | `/api/health` | Server identity |
 | POST | `/api/introduce` | Exchange identities with a peer; records the caller |
-| POST | `/api/sync` | Receive metrics, availability records and alert notices from a peer |
+| POST | `/api/sync` | Receive metrics, availability records and alert notices from a peer. A push-only sender is answered with a signed `{"peers":[…]}` |
 | GET | `/api/servers` | All servers with their latest metrics |
 | GET | `/api/servers/{id}/metrics?hours=24` | Time-series metrics. Raw samples for an hour; longer windows come back averaged into buckets wide enough to keep the series around 360 points |
 | GET | `/api/availability/matrix` | Availability matrix, last hour |
@@ -350,6 +391,10 @@ HMAC-SHA256 signature over the request timestamp, path and body, sent as:
 X-M0nit0r-Timestamp: <unix seconds>
 X-M0nit0r-Signature: <hex hmac-sha256(secret, timestamp + "\n" + path + "\n" + body)>
 ```
+
+The reply to a push-only node's sync is signed the same way, over `/api/sync#reply` in
+place of the path, and a reply that fails the check is ignored: the peers it names are
+where that node will send its data next.
 
 Signatures older or newer than five minutes are refused, so a captured request stops
 working quickly and clock skew between nodes gets reported as such rather than as a

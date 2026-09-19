@@ -18,6 +18,7 @@ type Options struct {
 	ServerName            string `json:"serverName"`
 	Location              string `json:"location"`
 	PublicURL             string `json:"publicUrl"`
+	PushOnly              bool   `json:"pushOnly"`
 	ListenPort            int    `json:"listenPort"`
 	ListenAddress         string `json:"listenAddress"`
 	SharedSecret          string `json:"sharedSecret"`

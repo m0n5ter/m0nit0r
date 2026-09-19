@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS "Servers" (
     "Url"      TEXT NULL,
     "IsSelf"   INTEGER NOT NULL,
     "Alerts"   INTEGER NOT NULL DEFAULT 0,
+    "PushOnly" INTEGER NOT NULL DEFAULT 0,
     "LastSeen" INTEGER NOT NULL
 );
 
@@ -296,6 +297,43 @@ func (s *Store) SetPeerURL(id int64, url string) error {
 	return nil
 }
 
+// SetPushOnly records whether a server is one that only ever pushes. Marking it
+// also drops any address it had: a node that has gone push-only no longer
+// answers at the one it used to publish, and leaving it in place would keep
+// every sync round pushing to it and recording the failure. The update is
+// skipped when nothing changes, since every sync carries the flag.
+func (s *Store) SetPushOnly(id int64, pushOnly bool) error {
+	_, err := s.db.Exec(`
+		UPDATE "Servers" SET
+			"PushOnly"=?1,
+			"Url"=CASE WHEN ?1 THEN NULL ELSE "Url" END
+		WHERE "Id"=?2 AND ("PushOnly"<>?1 OR (?1 AND "Url" IS NOT NULL))`, pushOnly, id)
+	if err != nil {
+		return fmt.Errorf("set push-only %d: %w", id, err)
+	}
+	return nil
+}
+
+// AddPeerIfUnknown registers a peer that some other node named, and reports
+// whether it was new. A server this node already holds a row for is left
+// exactly as it is - in particular one whose address was cleared when it was
+// removed, which hearing about it second-hand must not undo.
+func (s *Store) AddPeerIfUnknown(uid, name, location, url string, alerts bool) (bool, error) {
+	res, err := s.db.Exec(`
+		INSERT INTO "Servers" ("Uid","Name","Location","Url","IsSelf","Alerts","LastSeen")
+		VALUES (?,?,?,NULLIF(?,''),0,?,?)
+		ON CONFLICT("Uid") DO NOTHING`,
+		uid, name, location, url, alerts, model.Time{}.DB())
+	if err != nil {
+		return false, fmt.Errorf("add peer %s: %w", uid, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("add peer %s: %w", uid, err)
+	}
+	return n > 0, nil
+}
+
 // TouchLastSeen records that a server was reachable at t.
 func (s *Store) TouchLastSeen(id int64, t model.Time) error {
 	_, err := s.db.Exec(`UPDATE "Servers" SET "LastSeen"=? WHERE "Id"=?`, t.DB(), id)
@@ -305,7 +343,7 @@ func (s *Store) TouchLastSeen(id int64, t model.Time) error {
 	return nil
 }
 
-const selectServer = `SELECT "Id","Uid","Name","Location",COALESCE("Url",''),"IsSelf","Alerts","LastSeen" FROM "Servers"`
+const selectServer = `SELECT "Id","Uid","Name","Location",COALESCE("Url",''),"IsSelf","Alerts","PushOnly","LastSeen" FROM "Servers"`
 
 // ServerByUID returns the server published under uid. The bool reports whether
 // it existed, which is how the dashboard and peer endpoints turn the identity
@@ -329,6 +367,12 @@ func (s *Store) ListServers() ([]model.Server, error) {
 // ListPeers returns non-self servers that still have an address configured.
 func (s *Store) ListPeers() ([]model.Server, error) {
 	return s.queryServers(selectServer + ` WHERE "IsSelf"=0 AND "Url" IS NOT NULL AND "Url"<>'' ORDER BY "Name"`)
+}
+
+// ListPushOnly returns the peers that push to this node without being reachable
+// from it, which are the ones it can only judge by what arrives.
+func (s *Store) ListPushOnly() ([]model.Server, error) {
+	return s.queryServers(selectServer + ` WHERE "IsSelf"=0 AND "PushOnly"=1 ORDER BY "Name"`)
 }
 
 func (s *Store) queryServers(query string, args ...any) ([]model.Server, error) {
@@ -358,7 +402,7 @@ func scanServer(sc scanner) (model.Server, error) {
 		lastSeen int64
 	)
 	if err := sc.Scan(&srv.ID, &srv.UID, &srv.Name, &srv.Location, &srv.URL, &srv.IsSelf,
-		&srv.Alerts, &lastSeen); err != nil {
+		&srv.Alerts, &srv.PushOnly, &lastSeen); err != nil {
 		return model.Server{}, err
 	}
 	srv.LastSeen = model.FromDB(lastSeen)
