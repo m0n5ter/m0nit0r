@@ -1,6 +1,7 @@
 package com.m0n5ter.monitor.ui.connection
 
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
@@ -34,6 +35,8 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 
 @Composable
@@ -46,6 +49,7 @@ fun ConnectionScreen(
     val connectionState by viewModel.connectionState.collectAsState()
     val connectResult by viewModel.connectResult.collectAsState()
     var input by remember { mutableStateOf("") }
+    var password by remember { mutableStateOf("") }
 
     // A successful connect() saves the URL, which flips ConnectionStore.State
     // .activeUrl; MonitorApp watches that and swaps this screen out on its
@@ -86,9 +90,20 @@ fun ConnectionScreen(
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth(),
             )
+            Spacer(Modifier.size(8.dp))
+            OutlinedTextField(
+                value = password,
+                onValueChange = { password = it },
+                label = { Text("Password") },
+                supportingText = { Text("The mesh's dashboard password. Leave empty if it has none.") },
+                singleLine = true,
+                visualTransformation = PasswordVisualTransformation(),
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                modifier = Modifier.fillMaxWidth(),
+            )
             Spacer(Modifier.size(12.dp))
             Button(
-                onClick = { viewModel.connect(input) },
+                onClick = { viewModel.connect(input, password) },
                 enabled = input.isNotBlank() && connectResult != ConnectResult.Connecting,
                 modifier = Modifier.fillMaxWidth(),
             ) {

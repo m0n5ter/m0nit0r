@@ -11,5 +11,10 @@ fun Throwable.toUserMessage(): String = when (this) {
     is java.net.ConnectException -> "Can't reach the server. Check the address and that it's running."
     is java.net.SocketTimeoutException -> "The server didn't respond in time."
     is java.net.UnknownHostException -> "Unknown host. Check the address."
+    is retrofit2.HttpException -> when (code()) {
+        401 -> "The server rejected the password. Reconnect from Settings with the current one."
+        429 -> "Too many failed logins from this address. Wait a few minutes and try again."
+        else -> "Server responded with an error (${code()})."
+    }
     else -> message ?: "Something went wrong."
 }

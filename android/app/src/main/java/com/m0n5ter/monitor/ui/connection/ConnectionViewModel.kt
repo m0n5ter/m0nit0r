@@ -3,6 +3,8 @@ package com.m0n5ter.monitor.ui.connection
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.m0n5ter.monitor.data.model.HealthResponse
+import com.m0n5ter.monitor.data.network.authenticatedClient
+import com.m0n5ter.monitor.data.repository.MonitorRepository
 import com.m0n5ter.monitor.data.settings.ConnectionStore
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -31,15 +33,20 @@ class ConnectionViewModel(private val store: ConnectionStore) : ViewModel() {
     private val _connectResult = MutableStateFlow<ConnectResult>(ConnectResult.Idle)
     val connectResult: StateFlow<ConnectResult> = _connectResult
 
-    /** Verifies the address answers /api/health before saving it, so a typo fails fast. */
-    fun connect(rawUrl: String) {
+    /**
+     * Verifies the address answers before saving it, so a typo fails fast: the
+     * health check first, which needs no password and tells a wrong address
+     * from a wrong password, then one authenticated read to check the password.
+     */
+    fun connect(rawUrl: String, password: String) {
         val url = ConnectionStore.normalize(rawUrl)
         if (url.isBlank()) return
         viewModelScope.launch {
             _connectResult.value = ConnectResult.Connecting
             try {
                 healthCheck(url)
-                store.setActive(url)
+                MonitorRepository(url, password).servers()
+                store.setActive(url, password)
                 _connectResult.value = ConnectResult.Idle
             } catch (e: Exception) {
                 _connectResult.value = ConnectResult.Failed(describe(e))
@@ -60,13 +67,18 @@ class ConnectionViewModel(private val store: ConnectionStore) : ViewModel() {
         val normalized = if (url.endsWith("/")) url else "$url/"
         val retrofit = Retrofit.Builder()
             .baseUrl(normalized)
+            .client(authenticatedClient(null))
             .addConverterFactory(json.asConverterFactory("application/json".toMediaType()))
             .build()
         return retrofit.create(HealthApi::class.java).health()
     }
 
     private fun describe(e: Exception): String = when (e) {
-        is HttpException -> "Server responded with an error (${e.code()})."
+        is HttpException -> when (e.code()) {
+            401 -> "Wrong password, or this server needs one."
+            429 -> "Too many failed logins from this address. Wait a few minutes and try again."
+            else -> "Server responded with an error (${e.code()})."
+        }
         is java.net.ConnectException -> "Can't reach that address. Check the host, port and that the server is running."
         is java.net.UnknownHostException -> "Unknown host."
         is java.net.SocketTimeoutException -> "Timed out waiting for a response."

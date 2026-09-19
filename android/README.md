@@ -83,8 +83,10 @@ back to the default install location (`~/Android/Sdk`,
    `https://monitor.example.com`. A scheme is optional - `http://` is assumed,
    matching how the server itself listens by default (see the root README's
    [Configuration](../README.md#configuration-appsettingsjson) table).
-2. The app calls `GET /api/health` to confirm the address answers before
-   saving it.
+   Enter the mesh's dashboard password too (`deploy/.dashboard-password`), or leave
+   it empty for a mesh without one. It is saved per address.
+2. The app calls `GET /api/health` to confirm the address answers, then one
+   authenticated read to check the password, before saving it.
 3. Browse **Servers**, tap one for its history, check **Matrix** for
    reachability between every pair, and manage peers under **Mesh**.
 

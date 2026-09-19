@@ -76,8 +76,9 @@ fun MonitorApp() {
         // Keying the whole authenticated app on the active URL forces every
         // screen's ViewModel to be rebuilt against the new repository when the
         // person switches servers, instead of quietly polling the old one.
-        key(activeUrl) {
-            val repository = remember(activeUrl) { MonitorRepository(activeUrl) }
+        val activePassword = connectionState.activePassword
+        key(activeUrl, activePassword) {
+            val repository = remember(activeUrl, activePassword) { MonitorRepository(activeUrl, activePassword) }
             MainScaffold(repository, connectionViewModel, activeUrl)
         }
     }

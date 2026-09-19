@@ -13,8 +13,8 @@ import com.m0n5ter.monitor.data.network.ApiClientFactory
  * one node's base URL. Any node in the mesh answers for the whole fleet, so
  * this is the only network dependency the rest of the app needs.
  */
-class MonitorRepository(baseUrl: String) {
-    private val api = ApiClientFactory.forBaseUrl(baseUrl)
+class MonitorRepository(baseUrl: String, password: String?) {
+    private val api = ApiClientFactory.forBaseUrl(baseUrl, password)
 
     suspend fun servers(): List<ServerView> = api.getServers()
 
