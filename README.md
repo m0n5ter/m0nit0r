@@ -239,10 +239,10 @@ A node that switches from push-only back to a published address is picked up on 
 sync. Removing a push-only peer from a dashboard stops it being watched; if it is still
 running, its next push registers it again, as with any peer — stop the agent first.
 
-Nodes that take pushes from a dynamic address cannot restrict their port to a list of
-source addresses, so `-RestrictFirewall` and a push-only node do not mix: the address it
-pushes from changes. Leave the port open and set `DashboardPassword` instead; `/api/sync`
-stays authenticated by the shared secret either way.
+A push-only node arrives from whatever address it happens to have, so nothing about it
+can be pinned to a source address — which is one reason every node leaves its port open
+and relies on `DashboardPassword` instead. `/api/sync` stays authenticated by the shared
+secret either way.
 
 ## Installing a node
 
@@ -339,26 +339,21 @@ and its `-wal` and `-shm` files, and deploy: the node keeps its id, and `-Mesh` 
 the peers back.
 
 ```powershell
-.\deploy\Deploy-M0nit0r.ps1 -Mesh                   # all nodes, then introduce them
-.\deploy\Deploy-M0nit0r.ps1 -Mesh -RestrictFirewall # ...and admit only the nodes
-.\deploy\Deploy-M0nit0r.ps1 -Only Proxmox           # one node
+.\deploy\Deploy-M0nit0r.ps1 -Mesh         # all nodes, then introduce them
+.\deploy\Deploy-M0nit0r.ps1 -Only Proxmox # one node
 ```
 
-Without `-RestrictFirewall` the port is opened to any source, which is what push-only
-nodes on dynamic addresses need. The dashboards are then protected by the password the
-script generates on first run and stores in `deploy/.dashboard-password` (gitignored,
-like `deploy/.secret`), written to every node as `DashboardPassword`.
+The listening port is opened to any source, which is what push-only nodes on dynamic
+addresses need and what saves an allowlist from having to be reapplied every time one
+of those addresses changes. The dashboards are protected by the password the script
+generates on first run and stores in `deploy/.dashboard-password` (gitignored, like
+`deploy/.secret`), written to every node as `DashboardPassword`; the peer protocol is
+signed with the shared secret.
 
-`-RestrictFirewall` narrows the listening port to the nodes' own addresses instead, which
-also hides it from scanners and keeps the password from being tried at all. It resolves each node's address, then configures ufw or
-firewalld on Linux and the inbound rule on Windows. Add `-AllowFrom <ip>` for an extra
-address you want to reach the dashboards from.
-
-It only ever narrows a firewall that is already running. A host with no active
-firewall manager is reported and left alone, because enabling one over SSH without
-first admitting SSH locks you out of the machine. Note that the allowlist is built
-from the full inventory even on an `-Only` run, and that it has to be reapplied
-whenever one of those addresses changes — otherwise the mesh stops syncing silently.
+The port is opened in ufw or firewalld on Linux and in the inbound rule on Windows,
+and only on a firewall that is already running. A host with no active firewall manager
+is reported and left alone, because enabling one over SSH without first admitting SSH
+locks you out of the machine.
 
 Windows nodes carrying `LibreHardwareMonitor = $true` in the inventory also get that
 tool installed, at a pinned version whose archive is checked against the digest GitHub
@@ -390,9 +385,7 @@ Those two also reach each other through that same public address, because a node
 advertises one address to the whole mesh and re-asserts it on every sync — there is
 no second, local address a peer could learn instead. So the router has to hairpin the
 connection. If every edge of the matrix is green except the one between the two
-machines standing a metre apart, that is why; their LAN addresses are already in the
-firewall allowlist, for the case where the router hairpins without rewriting the
-source.
+machines standing a metre apart, that is why.
 
 Run the script unelevated: the Linux nodes are reached with your own SSH keys, and
 only the Windows service and firewall steps elevate, in a separate process.

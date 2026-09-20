@@ -5,6 +5,17 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="color-scheme" content="dark light" />
     <title>Dashboard - m0nit0r</title>
+    <!-- The stored theme is applied before the first paint; the script below
+         re-applies it on load for the icon and the resolved chart colours. -->
+    <script>
+        try {
+            const t = localStorage.getItem('m0nit0r-theme');
+            if (t === 'light' || t === 'dark') {
+                document.documentElement.dataset.theme = t;
+                document.documentElement.dataset.bsTheme = t;
+            }
+        } catch (e) {}
+    </script>
     <link rel="stylesheet" href="/assets/bootstrap.min.css" />
     <link rel="stylesheet" href="/assets/bootstrap-icons.min.css" />
     <style>
@@ -503,6 +514,12 @@ main { padding: 1.1rem 1.25rem 3rem; display: flex; flex-direction: column; gap:
     background: var(--bg); padding: 16px;
 }
 .login-screen.show { display: grid; }
+/* A signed-out browser is served the same page as a signed-in one, so the
+   cover goes up in the markup and comes down only once /api/session has
+   answered - otherwise the dashboard paints for a frame before the form
+   arrives. While the answer is pending the cover is blank: showing the form
+   to someone who turns out to be signed in is the same flicker in reverse. */
+.login-screen.checking .login-card { visibility: hidden; }
 .login-card {
     width: min(360px, 100%);
     background: var(--surface); border: 1px solid var(--border);
@@ -531,7 +548,7 @@ main { padding: 1.1rem 1.25rem 3rem; display: flex; flex-direction: column; gap:
 </head>
 <body>
 
-<div class="login-screen" id="login-screen" role="dialog" aria-modal="true" aria-labelledby="login-title">
+<div class="login-screen show checking" id="login-screen" role="dialog" aria-modal="true" aria-labelledby="login-title">
     <form class="login-card" id="login-form">
         <div class="brand" id="login-title">
             <span class="brand-mark"><i class="bi bi-activity"></i></span>m0nit0r
@@ -961,8 +978,10 @@ function showLogin(message) {
     document.getElementById('login-user').value = location.host;
     loginError(message || '');
     const screen = document.getElementById('login-screen');
-    if (!screen.classList.contains('show')) {
-        screen.classList.add('show');
+    const covered = screen.classList.contains('show') && !screen.classList.contains('checking');
+    screen.classList.remove('checking');
+    screen.classList.add('show');
+    if (!covered) {
         // Unticked once, it stays unticked on this browser - the box is a
         // statement about the machine, not about one visit.
         document.getElementById('login-remember').checked =
@@ -971,6 +990,14 @@ function showLogin(message) {
         input.value = '';
         input.focus();
     }
+}
+
+// hideLogin takes the cover down, whether it was holding a form or was still
+// the blank one the markup ships with.
+function hideLogin() {
+    const screen = document.getElementById('login-screen');
+    screen.classList.remove('show');
+    screen.classList.remove('checking');
 }
 
 function loginError(text) {
@@ -993,7 +1020,7 @@ async function signIn(e) {
             body: JSON.stringify({ password: input.value, remember }),
         });
         if (r.ok) {
-            document.getElementById('login-screen').classList.remove('show');
+            hideLogin();
             document.getElementById('btn-logout').hidden = false;
             start();
             return;
@@ -1881,8 +1908,9 @@ document.addEventListener('DOMContentLoaded', () => {
     fetch('/api/session').then(r => r.json()).then(session => {
         if (session.passwordRequired && !session.signedIn) { showLogin(); return; }
         document.getElementById('btn-logout').hidden = !session.passwordRequired;
+        hideLogin();
         start();
-    }).catch(() => start());
+    }).catch(() => { hideLogin(); start(); });
 });
 </script>
 </body>
