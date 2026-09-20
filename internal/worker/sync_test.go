@@ -103,9 +103,9 @@ func TestWatchPushOnlyWaitsOutItsOwnRestart(t *testing.T) {
 	}
 }
 
-// TestLearnPeersAddsOnlyTheUnknown: the push-only node learns the mesh from the
-// replies to its pushes, but a peer its operator removed has to stay removed
-// however often a neighbour mentions it.
+// TestLearnPeersAddsOnlyTheUnknown: a node learns the mesh from the replies to
+// its pushes, but a peer its operator removed has to stay removed however often
+// a neighbour mentions it.
 func TestLearnPeersAddsOnlyTheUnknown(t *testing.T) {
 	s, err := store.Open(filepath.Join(t.TempDir(), "monitor.db"))
 	if err != nil {
@@ -140,5 +140,40 @@ func TestLearnPeersAddsOnlyTheUnknown(t *testing.T) {
 	}
 	if peers[0].URL != "http://hub:5001" {
 		t.Errorf("learned address %q was not normalised", peers[0].URL)
+	}
+}
+
+// TestLearnPeersCompletesAPlaceholder: the ids of nodes this one has not met
+// arrive first inside a neighbour's reachability reports, which leaves a row
+// named after the id and reachable at nothing. Being told who that is has to
+// finish the row, or the mesh stays a pair of nodes surrounded by bare ids.
+func TestLearnPeersCompletesAPlaceholder(t *testing.T) {
+	s, err := store.Open(filepath.Join(t.TempDir(), "monitor.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+
+	if _, err := s.UpsertSelf(testSelfUID, "hub", "Lab", "http://hub:5001", false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.EnsureServer(testOtherUID); err != nil {
+		t.Fatal(err)
+	}
+
+	w := &Sync{Store: s, ServerUID: testSelfUID, Log: slog.New(slog.DiscardHandler)}
+	w.learnPeers([]*model.SyncReply{{Peers: []model.PeerInfo{
+		{ServerID: testOtherUID, ServerName: "third", Location: "Roof", URL: "http://third:5001"},
+	}}})
+
+	peers, err := s.ListPeers()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(peers) != 1 {
+		t.Fatalf("peers after learning = %+v, want the completed placeholder", peers)
+	}
+	if peers[0].Name != "third" || peers[0].Location != "Roof" || peers[0].URL != "http://third:5001" {
+		t.Errorf("the placeholder was not completed: %+v", peers[0])
 	}
 }

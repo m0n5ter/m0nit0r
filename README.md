@@ -192,6 +192,12 @@ That is enough. Adding a peer introduces the two nodes to each other, and also
 introduces the newcomer to every peer already in the mesh, in both directions — so a
 mesh assembles from a single action rather than from pairwise configuration.
 
+Whatever that first exchange misses, syncing then repairs: every push is answered with
+the peers the receiver syncs with, and the sender adopts the ones it did not know. So a
+node joined through one neighbour of an established mesh is pushing to all of them, and
+being pushed to by all of them, within a round or two — including the nodes that were
+offline when it joined.
+
 Availability is measured as a side effect of syncing: each push is timed, and success,
 latency and status code become an availability record. The matrix on the dashboard is
 therefore genuinely per-direction — it shows how each node sees each other node, not
@@ -211,10 +217,11 @@ pushes: it syncs its data out on the usual schedule and is never pushed to.
 Then add any one reachable node as its peer, from its own dashboard or with
 `POST /api/peers`. Nothing has to be configured on the other side:
 
-- **It joins the whole mesh from one peer.** A node answers a push-only node's sync with
-  the list of peers it pushes to, signed with the shared secret, and the push-only node
-  starts pushing to the ones it did not know. A peer removed on the push-only node stays
-  removed; hearing about it from a neighbour does not bring it back.
+- **It joins the whole mesh from one peer.** This is the same reply every node is
+  answered with — the list of peers the receiver pushes to, signed with the shared
+  secret — but for a push-only node it is the only way in, since nobody can reach it to
+  introduce anything to it. A peer removed on the push-only node stays removed; hearing
+  about it from a neighbour does not bring it back.
 - **The mesh watches its pushes instead of probing it.** Every other node records, each
   sync round, whether that node's pushes are still arriving. It goes down once nothing has
   arrived for three rounds (never less than 30 seconds) — so keep its
@@ -270,8 +277,11 @@ curl -fsSL .../install.sh | sudo sh -s -- \
     --peer http://5.6.7.8:5001
 ```
 
-`--peer` (`-Peer`) introduces the new node to the mesh once it is up. One peer is
-enough: the introduction reaches every node already in it, in both directions.
+`--peer` (`-Peer`) introduces the new node to the mesh once it is up, and a fresh
+install asks for it when the flag is absent. One peer is enough: the introduction
+reaches every node already in it, in both directions, and syncing closes whatever gaps
+are left. Answering with nothing leaves the node in a mesh of its own, which is what
+the first node of a new mesh wants.
 
 **Updating is the same command.** It downloads the release, replaces the binary and
 restarts the service. `appsettings.json`, `server-id.txt` and `monitor.db` are left
@@ -442,7 +452,7 @@ to write to, so logs go to `monitor.log` beside the executable instead, rotated 
 | POST | `/api/login` | Sign in to the dashboard, body `{"password":"…"}`; sets the session cookie |
 | POST | `/api/logout` | Sign out; clears the session cookie |
 | POST | `/api/introduce` | Exchange identities with a peer; records the caller |
-| POST | `/api/sync` | Receive metrics, availability records and alert notices from a peer. A push-only sender is answered with a signed `{"peers":[…]}` |
+| POST | `/api/sync` | Receive metrics, availability records and alert notices from a peer. The sender is answered with a signed `{"peers":[…]}` naming the nodes this one syncs with |
 | GET | `/api/servers` | All servers with their latest metrics |
 | GET | `/api/servers/{id}/metrics?hours=24` | Time-series metrics. Raw samples for an hour; longer windows come back averaged into buckets wide enough to keep the series around 360 points |
 | GET | `/api/availability/matrix` | Availability matrix, last hour |

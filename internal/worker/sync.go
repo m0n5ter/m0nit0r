@@ -28,8 +28,10 @@ const minPushGrace = 30 * time.Second
 // which gives them the same one record per round and so the same matrix cell,
 // online state and alerts as any other peer.
 //
-// When this node is itself push-only it learns the mesh from the replies to its
-// pushes, since nobody can reach it to introduce the rest.
+// Every push is answered with the peers the other end syncs with, and this node
+// adopts the ones it does not know, so the mesh closes over itself from any one
+// introduction. A push-only node has no other way to learn it at all, since
+// nobody can reach it to introduce the rest.
 type Sync struct {
 	Store      *store.Store
 	Client     *peer.Client
@@ -124,9 +126,7 @@ func (w *Sync) round(ctx context.Context) error {
 	w.lastMetric, w.lastAvail, w.lastNotice = marks.metric, marks.avail, marks.notice
 	w.Log.Debug("sync round complete", "metrics", len(payload.Metrics), "peers", len(peers))
 
-	if w.PushOnly {
-		w.learnPeers(replies)
-	}
+	w.learnPeers(replies)
 	return nil
 }
 
@@ -170,10 +170,17 @@ func (w *Sync) watchPushOnly(timestamp model.Time) error {
 	return w.Store.InsertAvailability(w.ServerID, observations)
 }
 
-// learnPeers registers the peers named in the replies this push-only node got
-// back, so that it starts pushing to the whole mesh after being pointed at any
-// one node of it. A server already known is left alone, which is what keeps a
-// peer the operator removed here from being brought back by a neighbour.
+// learnPeers registers the peers named in the replies to this round's pushes,
+// so that a node pointed at any one member of a mesh ends up pushing to all of
+// them - and so that the members end up pushing back, each of them learning
+// this node from the replies to their own pushes. Without it a node joined
+// through a single neighbour stays a mesh of two, while the ids of everybody
+// else trickle in through that neighbour's reachability reports as nameless
+// rows nothing is ever collected for.
+//
+// A server already known is left alone, apart from one that is only such a
+// nameless row; that is what keeps a peer the operator removed here from being
+// brought back by a neighbour.
 func (w *Sync) learnPeers(replies []*model.SyncReply) {
 	for _, reply := range replies {
 		if reply == nil {

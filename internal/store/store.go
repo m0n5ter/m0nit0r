@@ -318,11 +318,30 @@ func (s *Store) SetPushOnly(id int64, pushOnly bool) error {
 // whether it was new. A server this node already holds a row for is left
 // exactly as it is - in particular one whose address was cleared when it was
 // removed, which hearing about it second-hand must not undo.
+//
+// The exception is a row EnsureServer put there: an id seen in somebody's
+// reachability report, standing in for its own name and carrying no address.
+// That is not a node anybody chose to keep or to drop, only one this node has
+// not been introduced to yet, so the introduction is allowed to complete it -
+// which is what turns the bare ids a new neighbour brings with it into nodes
+// this one syncs with. The conditions are what distinguish such a row from a
+// removed peer: that one keeps the name it was known by, and the time it was
+// last reached - the unset stamp compared against here being the very one an
+// unmet node is registered with.
 func (s *Store) AddPeerIfUnknown(uid, name, location, url string, alerts bool) (bool, error) {
 	res, err := s.db.Exec(`
 		INSERT INTO "Servers" ("Uid","Name","Location","Url","IsSelf","Alerts","LastSeen")
-		VALUES (?,?,?,NULLIF(?,''),0,?,?)
-		ON CONFLICT("Uid") DO NOTHING`,
+		VALUES (?1,?2,?3,NULLIF(?4,''),0,?5,?6)
+		ON CONFLICT("Uid") DO UPDATE SET
+			"Name"=excluded."Name",
+			"Location"=excluded."Location",
+			"Url"=excluded."Url",
+			"Alerts"=excluded."Alerts"
+		WHERE "Servers"."IsSelf"=0
+			AND "Servers"."PushOnly"=0
+			AND "Servers"."Url" IS NULL
+			AND "Servers"."LastSeen"=?6
+			AND "Servers"."Name"="Servers"."Uid"`,
 		uid, name, location, url, alerts, model.Time{}.DB())
 	if err != nil {
 		return false, fmt.Errorf("add peer %s: %w", uid, err)

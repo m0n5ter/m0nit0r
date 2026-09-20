@@ -9,8 +9,8 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/m0n5ter/m0nit0r/master/install/install.sh | sudo sh
 #
-# On a fresh node it asks for the shared secret, the dashboard password and how
-# the node should present itself. Every answer can be given as a flag instead,
+# On a fresh node it asks for the shared secret, the dashboard password, how
+# the node should present itself and which node to join the mesh through. Every answer can be given as a flag instead,
 # which is also the only way to install where there is no terminal to ask at:
 #
 #   ... | sudo sh -s -- --secret XXX --password YYY --name Berlin-1 \
@@ -23,7 +23,9 @@
 #   --location VALUE    free-form location, e.g. "Frankfurt, DE"
 #   --url VALUE         PublicUrl: how other nodes reach this one
 #   --push-only         this node only pushes and is never reached (no --url)
-#   --peer URL          after starting, join the mesh through this peer
+#   --peer URL          after starting, join the mesh through this peer. One is
+#                       enough: the two ends tell each other about the rest.
+#                       Empty leaves the node in a mesh of its own.
 #   --port N            port to listen on (default 5001)
 #   --version TAG       install this release instead of the latest
 #   --dir PATH          install directory (default /opt/m0nit0r)
@@ -259,6 +261,13 @@ if [ "$WRITE_CONFIG" -eq 1 ]; then
         [ -n "$PUBLIC_URL" ] || PUSH_ONLY=1
     fi
 
+    # Asked here rather than left to a flag because a node installed without it
+    # comes up alone and looks like a mesh of one: it is the answer a fresh node
+    # is most easily installed without and least useful without.
+    if [ -z "$PEER" ]; then
+        PEER=$(ask 'Address of a node already in the mesh (empty = start a new mesh)' '')
+    fi
+
     while [ -z "$SECRET" ]; do
         SECRET=$(ask_secret 'Shared secret (same on every node)')
     done
@@ -378,7 +387,7 @@ if [ -n "$PEER" ]; then
         -H 'Content-Type: application/json' \
         -d "{\"url\":\"$(json "$PEER")\"}" 2>/dev/null || true)
     if [ "$CODE" = 200 ]; then
-        ok "introduced to $PEER — the rest of the mesh follows from there"
+        ok "introduced to $PEER — the rest of the mesh follows within a sync round"
     elif [ "$CODE" = 400 ]; then
         warn "this node cannot reach $PEER (firewall, or the wrong address)"
     else

@@ -173,13 +173,16 @@ type IntroduceRequest struct {
 	PushOnly   bool   `json:"pushOnly"`
 }
 
-// SyncReply is the body a node answers a push-only peer's POST /api/sync with.
+// SyncReply is the body a node answers a POST /api/sync with.
 //
-// A push-only node cannot be reached, so nobody can introduce the rest of the
-// mesh to it the way an ordinary node is introduced. What it learns instead
-// comes back on its own pushes: each peer it syncs with names the peers that
-// peer syncs with, and it starts pushing to the ones it did not know.
-// An ordinary node is answered with an empty body, as it always was.
+// Each peer a node syncs with names the peers that peer syncs with, and the
+// node starts pushing to the ones it did not know. That is how a mesh closes
+// over itself out of a single introduction, and the only way a push-only node
+// learns of the mesh at all: it cannot be reached, so nobody can introduce the
+// rest of it the way an ordinary node is introduced.
+//
+// A node too old to send one answers with an empty body, which reads as no
+// peers rather than as an error.
 type SyncReply struct {
 	Peers []PeerInfo `json:"peers"`
 }

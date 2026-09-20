@@ -42,7 +42,8 @@
 
 .PARAMETER Peer
     After starting, join the mesh through this peer's URL. One is enough: the
-    introduction propagates to every node already in the mesh.
+    two ends tell each other about the rest within a sync round. Empty leaves
+    the node in a mesh of its own.
 
 .PARAMETER Version
     Install this release tag instead of the latest one.
@@ -248,6 +249,13 @@ try {
             $PublicUrl = Read-Value 'Public URL other nodes reach this one at (empty = push-only)' ''
             if (-not $PublicUrl) { $PushOnly = [switch]$true }
         }
+        # Asked here rather than left to a parameter because a node installed
+        # without it comes up alone and looks like a mesh of one: it is the
+        # answer a fresh node is most easily installed without and least useful
+        # without.
+        if (-not $Peer) {
+            $Peer = Read-Value 'Address of a node already in the mesh (empty = start a new mesh)' ''
+        }
         while (-not $Secret)   { $Secret   = Read-Hidden 'Shared secret (same on every node)' }
         while (-not $Password) { $Password = Read-Hidden 'Dashboard password' }
 
@@ -342,7 +350,7 @@ try {
         try {
             Invoke-RestMethod -Uri "http://127.0.0.1:$Port/api/peers" -Method Post `
                 -ContentType 'application/json' -Body $body -TimeoutSec 30 | Out-Null
-            Write-Ok "introduced to $Peer - the rest of the mesh follows from there"
+            Write-Ok "introduced to $Peer - the rest of the mesh follows within a sync round"
         } catch {
             $code = try { $_.Exception.Response.StatusCode.value__ } catch { $null }
             if ($code -eq 400) {

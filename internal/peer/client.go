@@ -73,8 +73,9 @@ func (c *Client) Introduce(ctx context.Context, baseURL string, req model.Introd
 // server's availability probe for that peer, so a failure is a normal result
 // rather than an error: latency and status are reported either way.
 //
-// Reply is what the peer answered with, when it answered a push-only sender
-// and its answer carried a valid signature; it is nil otherwise.
+// Reply is the peer list the peer answered with, when its answer carried a
+// valid signature; it is nil otherwise, which is also what a peer too old to
+// answer with one yields.
 type PushResult struct {
 	OK        bool
 	LatencyMs float64
@@ -108,7 +109,7 @@ func (c *Client) PushSync(ctx context.Context, baseURL string, payload model.Syn
 
 	code := resp.StatusCode
 	result := PushResult{OK: code >= 200 && code < 300, LatencyMs: elapsedMs(start), Status: &code}
-	if result.OK && payload.PushOnly && len(raw) > 0 {
+	if result.OK && len(raw) > 0 {
 		result.Reply = c.readReply(resp.Header, raw)
 	}
 	return result

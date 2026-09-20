@@ -297,17 +297,15 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if payload.PushOnly {
-		s.replyWithPeers(w, payload.ServerID)
-		return
-	}
-	w.WriteHeader(http.StatusOK)
+	s.replyWithPeers(w, payload.ServerID)
 }
 
-// replyWithPeers answers a push-only node with the peers this node pushes to,
-// which is the only way such a node learns of the rest of the mesh: nobody can
-// reach it to introduce them. The reply is signed, because the sender will
-// start pushing its data to whatever addresses it names.
+// replyWithPeers answers a sync with the peers this node pushes to, which is
+// how the mesh closes over itself: whoever joins through any one node is
+// pushing to all of them within a round or two, and a push-only node - which
+// nobody can reach to introduce anything to - learns of the mesh this way and
+// no other. The reply is signed, because the sender will start pushing its
+// data to whatever addresses it names.
 func (s *Server) replyWithPeers(w http.ResponseWriter, callerUID string) {
 	peers, err := s.Store.ListPeers()
 	if err != nil {

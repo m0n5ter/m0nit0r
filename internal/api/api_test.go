@@ -251,6 +251,45 @@ func TestPushOnlyNodeIsRecordedAndToldAboutTheMesh(t *testing.T) {
 	}
 }
 
+// TestSyncReplyNamesTheMeshToAnyPeer: a node joined through a single neighbour
+// has to be told the rest, the same way a push-only one is. Without it the
+// newcomer only ever syncs with the one node it was pointed at, and the others
+// reach it as bare ids inside that node's reachability reports.
+func TestSyncReplyNamesTheMeshToAnyPeer(t *testing.T) {
+	const secret = "s3cret"
+	hub := newSecretNode(t, "11111111-1111-4111-8111-111111111111", "hub", false, secret)
+	other := newSecretNode(t, "22222222-2222-4222-8222-222222222222", "other", false, secret)
+	joiner := "33333333-3333-4333-8333-333333333333"
+
+	if _, err := hub.store.UpsertPeer(other.uid, "other", "Lab", other.server.URL, false, model.Now()); err != nil {
+		t.Fatal(err)
+	}
+
+	res := peer.New(secret).PushSync(t.Context(), hub.server.URL, model.SyncPayload{
+		ServerID:   joiner,
+		ServerName: "joiner",
+		Location:   "Roof",
+		SelfURL:    "http://joiner:5001",
+	})
+	if !res.OK {
+		t.Fatalf("push failed, status %v", res.Status)
+	}
+	if res.Reply == nil {
+		t.Fatal("an ordinary node got no signed reply, so it can never learn the rest of the mesh")
+	}
+
+	var named []string
+	for _, p := range res.Reply.Peers {
+		named = append(named, p.ServerID)
+		if p.ServerID == other.uid && p.URL != other.server.URL {
+			t.Errorf("other named at %q, want %q", p.URL, other.server.URL)
+		}
+	}
+	if len(named) != 1 || named[0] != other.uid {
+		t.Errorf("reply names %v, want only the other node", named)
+	}
+}
+
 // TestUnsignedSyncReplyIsIgnored: the peers a reply names are where the
 // push-only node will send its data next, so a reply the shared secret does not
 // vouch for must not be acted on - even when the push itself went through.
