@@ -3,12 +3,14 @@ package worker
 import (
 	"context"
 	"log/slog"
+	"maps"
 	"net/http"
 	"sync"
 	"time"
 
 	"github.com/m0n5ter/m0nit0r/internal/model"
 	"github.com/m0n5ter/m0nit0r/internal/peer"
+	"github.com/m0n5ter/m0nit0r/internal/series"
 	"github.com/m0n5ter/m0nit0r/internal/store"
 )
 
@@ -57,6 +59,12 @@ type Sync struct {
 	lastMetric model.Time
 	lastAvail  model.Time
 	lastNotice model.Time
+
+	// How far each peer has been brought up to date in the series streams,
+	// keyed by its row id. Unlike the three above this cannot be one mark for
+	// everybody: a bucket is published once and not re-offered, so a peer that
+	// joined late or was unreachable has to be owed exactly what it missed.
+	peerMarks map[int64]seriesMarks
 }
 
 // Run synchronises until ctx is cancelled.
@@ -64,6 +72,7 @@ func (w *Sync) Run(ctx context.Context) {
 	w.Log.Info("peer sync started", "interval", w.Interval)
 
 	w.started = time.Now()
+	w.peerMarks = map[int64]seriesMarks{}
 	start := model.At(w.started.Add(-backfillWindow))
 	w.lastMetric, w.lastAvail, w.lastNotice = start, start, start
 
@@ -108,27 +117,151 @@ func (w *Sync) round(ctx context.Context) error {
 		return nil
 	}
 
-	payload, marks, err := w.buildPayload()
+	// The original form of the payload is filled only while somebody in the
+	// mesh still reads it. Once every peer speaks the series form it is dead
+	// weight in every round, and the two queries behind it stop being run.
+	legacy := false
+	for _, p := range peers {
+		if p.Protocol < model.ProtocolVersion {
+			legacy = true
+			break
+		}
+	}
+
+	payload, marks, err := w.buildPayload(legacy)
 	if err != nil {
 		return err
 	}
 
+	// The series streams are cut per peer, because how far each of them has
+	// been brought up to date is a fact about that peer and not about this
+	// node. A neighbour met a minute ago is owed the history; one synced with
+	// all along is owed the last thirty seconds.
+	sent := make([]seriesMarks, len(peers))
+	payloads := make([]model.SyncPayload, len(peers))
+	for i, p := range peers {
+		payloads[i], sent[i], err = w.forPeer(payload, p)
+		if err != nil {
+			return err
+		}
+	}
+
 	replies := make([]*model.SyncReply, len(peers))
+	delivered := make([]bool, len(peers))
 	var wg sync.WaitGroup
 	for i, p := range peers {
 		wg.Add(1)
 		go func(i int, target model.Server) {
 			defer wg.Done()
-			replies[i] = w.push(ctx, target, payload, timestamp)
+			replies[i], delivered[i] = w.push(ctx, target, payloads[i], timestamp)
 		}(i, p)
 	}
 	wg.Wait()
 
 	w.lastMetric, w.lastAvail, w.lastNotice = marks.metric, marks.avail, marks.notice
+
+	// Only what arrived counts as offered. The three original streams advance
+	// regardless, as they always have - they are a window that the next round
+	// re-offers anyway - but a bucket is published once, so a peer that was
+	// unreachable this round has to be owed it again next round.
+	for i := range peers {
+		if delivered[i] {
+			w.peerMarks[peers[i].ID] = sent[i]
+		}
+	}
+
 	w.Log.Debug("sync round complete", "metrics", len(payload.Metrics), "peers", len(peers))
 
 	w.learnPeers(replies)
 	return nil
+}
+
+// maxSeriesRows caps how much of the series store one push may carry.
+//
+// A peer meeting this node for the first time is owed everything the ladder
+// holds, which is a year of daily rows and a fortnight of finer ones for every
+// node in the mesh. Sent in one request that would be megabytes; sent a
+// capped slice at a time it is a handful of rounds, and the high-water mark
+// coming back from each query is what makes the next round resume exactly
+// where this one stopped.
+const maxSeriesRows = 4000
+
+// seriesMarks is how far one peer has been brought up to date: the newest
+// reading it has been offered, and the newest bucket at each rung.
+type seriesMarks struct {
+	sample model.Time
+	bucket map[series.Level]int64
+	known  bool
+}
+
+// forPeer cuts the payload down to what this particular peer is owed.
+func (w *Sync) forPeer(base model.SyncPayload, target model.Server) (model.SyncPayload, seriesMarks, error) {
+	payload := base
+	marks := w.peerMarks[target.ID]
+
+	// A peer too old to understand the series form gets the original one and
+	// nothing else. It is the only reason the original is still filled.
+	if target.Protocol < model.ProtocolVersion {
+		return payload, marks, nil
+	}
+	payload.Metrics, payload.Availability = nil, nil
+
+	if !marks.known {
+		marks = w.openingMarks()
+	}
+	// A map is a reference, so advancing the copy would advance what is stored
+	// whether or not the push ever arrives. This round works on its own.
+	marks.bucket = maps.Clone(marks.bucket)
+	if marks.bucket == nil {
+		marks.bucket = map[series.Level]int64{}
+	}
+
+	samples, high, err := w.Store.OwnSamplesSince(w.ServerID, marks.sample, maxSeriesRows)
+	if err != nil {
+		return payload, marks, err
+	}
+	payload.Samples, marks.sample = samples, high
+
+	// Coarsest first, so that a node joining a mesh shows a year of history
+	// within a round or two and fills the detail in behind it.
+	budget := maxSeriesRows
+	nowMs := model.Now().DB()
+	for i := len(series.Ladder) - 1; i >= 0 && budget > 0; i-- {
+		rung := series.Ladder[i]
+		rows, high, err := w.Store.OwnRollups(w.ServerID, rung.Level,
+			marks.bucket[rung.Level], series.SealedThrough(nowMs, rung.Level), budget)
+		if err != nil {
+			return payload, marks, err
+		}
+		payload.Rollups = append(payload.Rollups, rows...)
+		marks.bucket[rung.Level] = high
+		budget -= len(rows)
+	}
+
+	return payload, marks, nil
+}
+
+// openingMarks is where a peer never synced with before is started from: far
+// enough back that it receives the history this node holds rather than only
+// what happens from now on.
+func (w *Sync) openingMarks() seriesMarks {
+	marks := seriesMarks{
+		sample: model.At(time.Now().Add(-backfillWindow)),
+		bucket: map[series.Level]int64{},
+		known:  true,
+	}
+	for _, rung := range series.Ladder {
+		oldest, ok, err := w.Store.OldestOwnBucket(w.ServerID, rung.Level)
+		if err != nil {
+			w.Log.Error("oldest own bucket", "level", rung.Level, "err", err)
+			continue
+		}
+		if ok {
+			// Exclusive, so the oldest bucket itself is included.
+			marks.bucket[rung.Level] = oldest - 1
+		}
+	}
+	return marks
 }
 
 // pushGrace is how long a push-only peer may go unheard before it counts as
@@ -218,7 +351,7 @@ func advance(mark *model.Time, t model.Time) {
 
 // push sends one round's payload to one peer, records how it went, and hands
 // back whatever the peer replied with.
-func (w *Sync) push(ctx context.Context, target model.Server, payload model.SyncPayload, timestamp model.Time) *model.SyncReply {
+func (w *Sync) push(ctx context.Context, target model.Server, payload model.SyncPayload, timestamp model.Time) (*model.SyncReply, bool) {
 	res := w.Client.PushSync(ctx, target.URL, payload)
 
 	// The peer says this node was removed from its mesh. That is not an
@@ -232,7 +365,7 @@ func (w *Sync) push(ctx context.Context, target model.Server, payload model.Sync
 		if err := w.Store.ForgetPeer(target.ID); err != nil {
 			w.Log.Error("forget peer", "peer", target.Name, "err", err)
 		}
-		return nil
+		return nil, false
 	}
 
 	if err := w.Store.InsertAvailability(w.ServerID, []store.Observation{{
@@ -243,7 +376,7 @@ func (w *Sync) push(ctx context.Context, target model.Server, payload model.Sync
 		HTTPStatus:  res.Status,
 	}}); err != nil {
 		w.Log.Error("record availability", "peer", target.Name, "err", err)
-		return res.Reply
+		return res.Reply, res.OK
 	}
 
 	if res.OK {
@@ -253,22 +386,31 @@ func (w *Sync) push(ctx context.Context, target model.Server, payload model.Sync
 	}
 
 	w.Log.Debug("sync push", "peer", target.Name, "ok", res.OK, "latencyMs", res.LatencyMs)
-	return res.Reply
+	return res.Reply, res.OK
 }
 
 // buildPayload gathers everything produced locally since the last round, and
 // reports the newest timestamp in each stream so the watermarks can advance.
-func (w *Sync) buildPayload() (model.SyncPayload, watermarks, error) {
+func (w *Sync) buildPayload(legacy bool) (model.SyncPayload, watermarks, error) {
 	marks := watermarks{w.lastMetric, w.lastAvail, w.lastNotice}
 
-	metrics, err := w.Store.MetricsSince(w.ServerID, w.lastMetric)
-	if err != nil {
-		return model.SyncPayload{}, marks, err
-	}
-
-	availability, err := w.Store.OwnAvailabilitySince(w.ServerID, w.lastAvail)
-	if err != nil {
-		return model.SyncPayload{}, marks, err
+	// Both come out of the series store, not the tables the first build kept
+	// them in. Which form of the payload a peer understands is a question
+	// about the wire; where the readings are held is not its business, and
+	// keeping the two separate is what lets those tables be dropped while
+	// nodes that predate them are still being spoken to.
+	var (
+		metrics      []model.Metric
+		availability []model.Availability
+		err          error
+	)
+	if legacy {
+		if metrics, err = w.Store.MetricsRaw(w.ServerID, w.lastMetric); err != nil {
+			return model.SyncPayload{}, marks, err
+		}
+		if availability, err = w.Store.OwnReachabilitySince(w.ServerID, w.lastAvail); err != nil {
+			return model.SyncPayload{}, marks, err
+		}
 	}
 
 	// What this node has already announced about its peers. Carried so that
@@ -303,6 +445,7 @@ func (w *Sync) buildPayload() (model.SyncPayload, watermarks, error) {
 
 	return model.SyncPayload{
 		ServerID:     w.ServerUID,
+		Protocol:     model.ProtocolVersion,
 		ServerName:   w.ServerName,
 		Location:     w.Location,
 		SelfURL:      w.PublicURL,

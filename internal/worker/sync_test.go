@@ -74,7 +74,7 @@ func TestWatchPushOnlyJudgesAPeerByItsPushes(t *testing.T) {
 			if err := w.watchPushOnly(model.At(now)); err != nil {
 				t.Fatal(err)
 			}
-			available, found, err := s.LatestAvailability(w.ServerID, roamer)
+			available, found, err := s.LatestEdge(w.ServerID, roamer)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -99,7 +99,7 @@ func TestWatchPushOnlyWaitsOutItsOwnRestart(t *testing.T) {
 	if err := w.watchPushOnly(model.At(now)); err != nil {
 		t.Fatal(err)
 	}
-	if _, found, err := s.LatestAvailability(w.ServerID, roamer); err != nil {
+	if _, found, err := s.LatestEdge(w.ServerID, roamer); err != nil {
 		t.Fatal(err)
 	} else if found {
 		t.Error("an observation was recorded before the grace period since start-up had passed")
@@ -209,7 +209,7 @@ func TestPushDroppedByAPeerThatRemovedThisNode(t *testing.T) {
 			t.Errorf("still syncing with the peer that turned this node away: %+v", p)
 		}
 	}
-	history, err := s.AvailabilityHistory(w.ServerID, target, model.At(time.Now().Add(-time.Hour)))
+	history, err := s.EdgeRaw(w.ServerID, target, model.At(time.Now().Add(-time.Hour)))
 	if err != nil {
 		t.Fatal(err)
 	}

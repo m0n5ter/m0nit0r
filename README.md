@@ -56,7 +56,7 @@ launches it.
 | `LibreHardwareMonitorUrl` | empty | Address of a LibreHardwareMonitor web server to read the CPU die temperature from, e.g. `http://127.0.0.1:8085`. Windows only in practice; empty uses the built-in probe |
 | `MetricIntervalSeconds` | `5` | How often to sample CPU, memory, disk and temperature |
 | `SyncIntervalSeconds` | `10` | How often to push data to peers |
-| `RetentionDays` | `7` | How long to keep history, in days. Also the ceiling: a larger value, or none, is treated as 7 |
+| `RetentionDays` | `7` | Legacy. How long the compatibility tables keep history, capped at one day. Real retention is the [aggregation ladder](#how-history-is-stored), which is fixed and keeps a year |
 | `Telegram.BotToken` | empty | Bot token from [@BotFather](https://t.me/BotFather). Empty on both this and `ChatId` disables alerting on this node |
 | `Telegram.ChatId` | empty | Chat to send alerts to — your own user id, or a group/channel id (negative, e.g. `-1001234567890`) |
 | `Telegram.DownAfterSeconds` | `120` | How long a peer has to stay unreachable before it is reported |
@@ -352,19 +352,6 @@ the binary and a per-node configuration over SSH, installs the systemd unit or W
 service, and restarts it. `server-id.txt` and `monitor.db` are never overwritten, so
 nodes keep their identity and history across deployments.
 
-A database from an older build is upgraded on the first start, in place and inside one
-transaction, whenever that can be done without losing anything. The move to integer
-server ids and millisecond timestamps is such a case: every table is rewritten, the
-file is compacted — it ends up around 40% smaller — and both the peer register and the
-history come across.
-
-The one exception is a schema whose contents this build cannot read back at all.
-Rather than migrate, it refuses to open such a database and names the file, because a
-node that starts and then fails every insert looks healthy while recording nothing.
-Retention keeps a week at most, so the fix is to stop the service, delete `monitor.db`
-and its `-wal` and `-shm` files, and deploy: the node keeps its id, and `-Mesh` puts
-the peers back.
-
 ```powershell
 .\deploy\Deploy-M0nit0r.ps1 -Mesh         # all nodes, then introduce them
 .\deploy\Deploy-M0nit0r.ps1 -Only Proxmox # one node
@@ -416,6 +403,83 @@ machines standing a metre apart, that is why.
 
 Run the script unelevated: the Linux nodes are reached with your own SSH keys, and
 only the Windows service and firewall steps elevate, in a separate process.
+
+## How history is stored
+
+Everything measured lives in one table, in one shape: a parameter, up to two dimensions
+(the node observed, for reachability; the drive, for a volume), a time and a number.
+CPU, memory, temperatures and latency are all the same kind of row.
+
+Raw readings are kept for twenty minutes. Behind them is a ladder of aggregates, each
+rung built from the one below it:
+
+| Rung | Kept for |
+|---|---|
+| 30 seconds | 6 hours |
+| 5 minutes | 2 days |
+| 1 hour | 30 days |
+| 1 day | 1 year |
+
+A bucket stores the smallest and largest reading in it, the **sum** rather than the
+average, and three counters: how many checks it holds, how many succeeded, and how many
+produced a number. The sum is what makes folding one rung into the next exact addition;
+the three counters are three different questions — a bucket with fewer readings than
+expected has a gap in it, successes over checks is a route's availability, and only the
+readings that produced a number may divide the sum, because a probe that timed out has
+no latency to average and a push-only peer that answered was never timed at all.
+
+A bucket is written only once it can no longer change, which is twelve minutes after it
+ends — long enough that a peer restarting and replaying its backfill window still lands
+inside it. So anything that has to be current — the matrix, the node cards, the alert
+thresholds, the live chart — reads the raw readings, and only the wider ranges read the
+ladder.
+
+Values are stored as scaled integers rather than floats: SQLite spends eight bytes on
+every `REAL` whatever its value and as few as one on an integer, so a percentage kept to
+a hundredth costs two bytes instead of eight. Every scale is finer than the sensor behind
+it.
+
+This replaced a table of whole-machine snapshots and one row per reachability check,
+both kept at full resolution for a week. On an eight-node mesh that was 305 MB; the same
+history plus a year of it is about 15 MB.
+
+### Upgrading
+
+The history does not come across. The tables the first build used are kept for two days
+after an upgrade, so that a build rolled back inside that window finds its history where
+it left it, and are then dropped and the file compacted. Nothing reads them in the
+meantime: the dashboard, the alerts and the peer protocol are all answered from the
+series store from the first start.
+
+What that means in practice is that the charts fill in as the ladder does. The live view
+is complete within minutes, the day view within a day. The peer register — who is in the
+mesh, and which nodes were removed from it — is untouched and carries across as it always
+has.
+
+### Between versions
+
+Nodes announce which revision of the peer protocol they speak. A node that has been
+upgraded goes on sending the original form of the payload to any peer that has not, and
+sends the series form to those that have, so a mesh is upgraded one machine at a time
+with nothing coordinated. Once every peer speaks the newer form, the older one stops
+being filled.
+
+A node meeting a peer for the first time — or coming back after being down — is sent the
+ladder from the coarsest rung down, a few thousand rows per round, so it shows a year of
+history within a round or two and fills the detail in behind it.
+
+A database from an older build is upgraded on the first start, in place and inside one
+transaction, whenever that can be done without losing anything. The move to integer
+server ids and millisecond timestamps is such a case: every table is rewritten, the
+file is compacted — it ends up around 40% smaller — and both the peer register and the
+history come across.
+
+The one exception is a schema whose contents this build cannot read back at all.
+Rather than migrate, it refuses to open such a database and names the file, because a
+node that starts and then fails every insert looks healthy while recording nothing.
+No history is older than a year and most of it far less, so the fix is to stop the
+service, delete `monitor.db` and its `-wal` and `-shm` files, and deploy: the node keeps
+its id, and `-Mesh` puts the peers back.
 
 ## Install as a service
 
@@ -474,7 +538,7 @@ to write to, so logs go to `monitor.log` beside the executable instead, rotated 
 | POST | `/api/introduce` | Exchange identities with a peer; records the caller, or answers `410 Gone` if it was removed from the mesh |
 | POST | `/api/sync` | Receive metrics, availability records, alert notices and membership decisions from a peer. The sender is answered with a signed `{"peers":[…]}` naming the nodes this one syncs with, or with `410 Gone` if it was removed from the mesh |
 | GET | `/api/servers` | All servers with their latest metrics |
-| GET | `/api/servers/{id}/metrics?hours=24` | Time-series metrics. Raw samples for an hour; longer windows come back averaged into buckets wide enough to keep the series around 360 points |
+| GET | `/api/servers/{id}/metrics?hours=24` | Time-series metrics. Raw readings for an hour; longer windows come back from the [aggregation ladder](#how-history-is-stored), at the finest rung that stays inside the chart's point budget |
 | GET | `/api/availability/matrix` | Availability matrix, last hour |
 | GET | `/api/availability/history/{from}/{to}?hours=24` | Availability history for one edge |
 | GET | `/api/peers` | Configured peers |

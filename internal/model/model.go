@@ -117,6 +117,12 @@ type Server struct {
 	PushOnly bool
 	Removed  bool
 	LastSeen Time
+
+	// The revision of the peer protocol this node last spoke here. Zero for a
+	// node that has never pushed and for one built before versions were sent,
+	// which are the same thing for what it decides: whether to go on filling
+	// the original form of the payload for its benefit.
+	Protocol int
 }
 
 // Metric is a stored sample, for either this server or a peer. The volumes are
@@ -181,6 +187,20 @@ type SyncPayload struct {
 	SelfURL      string         `json:"selfUrl"`
 	Alerts       bool           `json:"alerts"`
 	PushOnly     bool           `json:"pushOnly"`
+	// Which revision the sender speaks. Absent from a node built before the
+	// series form existed, which reads back as zero - the same as one, for the
+	// only decision it drives.
+	Protocol int `json:"protocol,omitempty"`
+
+	// The series form: raw readings, and buckets that can no longer change.
+	// Both are empty towards a peer too old to understand them.
+	Samples []SampleRow `json:"samples,omitempty"`
+	Rollups []RollupRow `json:"rollups,omitempty"`
+
+	// The original form. Still filled while any node in the mesh is old enough
+	// to need it, and dropped once none is - a node that has upgraded goes on
+	// sending both until its peers have too, which is what lets a mesh be
+	// upgraded one machine at a time with nothing coordinated.
 	Metrics      []Metric       `json:"metrics"`
 	Availability []Availability `json:"availability"`
 	Notices      []Notice       `json:"notices"`
@@ -234,4 +254,58 @@ type HealthResponse struct {
 	Location   string `json:"location"`
 	Alerts     bool   `json:"alerts"`
 	Timestamp  Time   `json:"timestamp"`
+}
+
+// ProtocolVersion is the revision of the peer protocol this build speaks.
+//
+// One is the original: whole-machine snapshots and one row per reachability
+// check. Two adds the series form - raw readings and sealed aggregates - and
+// is what lets a node that has been down for a day be handed a day of history
+// rather than the ten minutes a snapshot stream can carry.
+//
+// It is sent in every push and remembered against the peer, because a node
+// cannot stop speaking the older form until it knows nobody is still listening
+// for it.
+const ProtocolVersion = 2
+
+// SampleRow is one reading on the wire.
+//
+// The keys are a letter each, which is worth doing here and nowhere else: this
+// is the long form, so a round carries one of these per parameter per sample
+// rather than one per sample, and the names would outweigh the numbers.
+//
+// The node that measured it is not carried - it is always the node sending the
+// payload, because only a node's own readings are its to forward. Peer names
+// the other end of an edge, Volume the drive, and each is empty when the
+// parameter has no such dimension.
+type SampleRow struct {
+	Param     uint8  `json:"p"`
+	Peer      string `json:"s,omitempty"`
+	Volume    string `json:"v,omitempty"`
+	Timestamp Time   `json:"t"`
+
+	// Absent when the reading was attempted and produced no number: a probe
+	// that failed, a sensor that is not there. Distinct from the row being
+	// missing, which means no reading was attempted at all.
+	Value *int64 `json:"x,omitempty"`
+	Ok    bool   `json:"o"`
+}
+
+// RollupRow is one sealed bucket on the wire.
+//
+// Only sealed buckets travel. A bucket still open can still change, and the
+// high-water mark these are offered under only ever moves forward, so a
+// half-filled bucket sent now could never be corrected later.
+type RollupRow struct {
+	Param    uint8  `json:"p"`
+	Peer     string `json:"s,omitempty"`
+	Volume   string `json:"v,omitempty"`
+	Level    uint8  `json:"l"`
+	Bucket   int64  `json:"b"`
+	Mn       *int64 `json:"n,omitempty"`
+	Mx       *int64 `json:"x,omitempty"`
+	Sum      int64  `json:"m"`
+	Count    int64  `json:"c"`
+	CountOk  int64  `json:"k"`
+	CountVal int64  `json:"w"`
 }

@@ -59,10 +59,13 @@ type file struct {
 	Monitor Options `json:"monitor"`
 }
 
-// maxRetentionDays caps how much history a node keeps, whatever the
-// configuration file asks for. Sampling is frequent enough that a longer
-// window is mostly disk, and seven days is already the widest range the
-// dashboard can plot.
+// maxRetentionDays caps what RetentionDays is allowed to ask for.
+//
+// It no longer decides how much history a node keeps: that is the aggregation
+// ladder in the series package, which is fixed and keeps a year. What is left
+// for this to bound is the tables the first build stored readings in, which
+// are written for a short while after an upgrade so that a build rolled back
+// finds its history, and then dropped. The worker clamps it further still.
 const maxRetentionDays = 7
 
 // Defaults returns the built-in configuration.

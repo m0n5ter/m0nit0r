@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/m0n5ter/m0nit0r/internal/model"
+	"github.com/m0n5ter/m0nit0r/internal/series"
 )
 
 // legacySchema is MetricSnapshots as builds before the disk split created it:
@@ -98,12 +99,12 @@ func TestOpenIsIdempotent(t *testing.T) {
 	}
 }
 
-// A bucketed query is the dashboard's wide ranges, where the point of the
-// aggregate is that some columns cannot be averaged: a set of drives and a
-// monotonic uptime counter have to come from one real sample, and the query
-// leans on a SQLite rule about bare columns to get them from the newest one in
-// the bucket. That rule is what this covers.
-func TestMetricsBucketedAveragesAndKeepsTheNewestSample(t *testing.T) {
+// The dashboard's wide ranges are answered from an aggregate, where the point
+// is that some columns cannot be averaged: a monotonic uptime counter has to
+// come from the newest reading in the bucket, and a parameter that stopped
+// being reported has to stay absent rather than average to a zero the chart
+// would draw as a cold machine.
+func TestRollingUpAveragesAndKeepsTheNewestReading(t *testing.T) {
 	s, err := Open(filepath.Join(t.TempDir(), "monitor.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -115,18 +116,18 @@ func TestMetricsBucketedAveragesAndKeepsTheNewestSample(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	base := time.Date(2026, 8, 1, 10, 0, 0, 0, time.UTC)
+	// Two whole thirty-second buckets, twelve readings in each.
+	start := time.Date(2026, 8, 1, 10, 0, 0, 0, time.UTC)
 	samples := make([]model.Metric, 0, 24)
 	for i := range 24 {
 		m := model.Metric{
-			Timestamp:     model.At(base.Add(time.Duration(i) * 5 * time.Second)),
+			Timestamp:     model.At(start.Add(time.Duration(i) * 2500 * time.Millisecond)),
 			CpuPercent:    float64(i),
 			UptimeSeconds: float64(100 + i),
-			Disks:         []model.Disk{{Name: "/", TotalGb: 100, UsedGb: float64(i), UsagePercent: float64(i)}},
+			Disks:         []model.Disk{{Name: "/", TotalGb: 100, UsedGb: float64(i)}},
 		}
-		// Only the first minute has a temperature, so the second bucket covers
-		// the host that reports none: averaging nothing has to stay nil rather
-		// than become a zero the chart would draw as a cold drive.
+		// Only the first bucket has a temperature, so the second covers a host
+		// that reports none.
 		if i < 12 {
 			temp := float64(50 + i)
 			m.CpuTempC = &temp
@@ -137,42 +138,45 @@ func TestMetricsBucketedAveragesAndKeepsTheNewestSample(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	since := model.At(base.Add(-time.Hour))
+	first := series.Bucket(model.At(start).DB(), series.L30s)
+	if _, err := s.RollSamples(first, first+2); err != nil {
+		t.Fatal(err)
+	}
 
-	raw, err := s.MetricsBucketed(node, since, 0)
+	raw, err := s.MetricsRaw(node, model.At(start.Add(-time.Hour)))
 	if err != nil {
-		t.Fatalf("bucket of zero: %v", err)
+		t.Fatal(err)
 	}
 	if len(raw) != 24 {
-		t.Errorf("bucket of zero returned %d samples, want the 24 stored", len(raw))
+		t.Errorf("the raw view returned %d readings, want the 24 stored", len(raw))
 	}
 
-	got, err := s.MetricsBucketed(node, since, time.Minute)
+	got, err := s.MetricsAtLevel(node, series.L30s, first, first+1)
 	if err != nil {
-		t.Fatalf("one-minute buckets: %v", err)
+		t.Fatal(err)
 	}
 	if len(got) != 2 {
-		t.Fatalf("got %d buckets over two minutes of samples, want 2", len(got))
+		t.Fatalf("got %d buckets over a minute of readings, want 2", len(got))
 	}
 
-	// Twelve samples numbered 0..11, then 12..23.
+	// Twelve readings numbered 0..11, then 12..23.
 	if got[0].CpuPercent != 5.5 || got[1].CpuPercent != 17.5 {
 		t.Errorf("bucket averages are %v and %v, want 5.5 and 17.5", got[0].CpuPercent, got[1].CpuPercent)
 	}
 	if got[0].UptimeSeconds != 111 {
-		t.Errorf("uptime is %v, want 111 from the newest sample in the bucket", got[0].UptimeSeconds)
+		t.Errorf("uptime is %v, want 111 from the newest reading in the bucket", got[0].UptimeSeconds)
 	}
-	if len(got[0].Disks) != 1 || got[0].Disks[0].UsedGb != 11 {
-		t.Errorf("disks are %+v, want the single volume of the newest sample in the bucket, at 11 GB used", got[0].Disks)
+	if len(got[0].Disks) != 1 || got[0].Disks[0].UsedGb != 5.5 {
+		t.Errorf("disks are %+v, want the volume averaged over the bucket", got[0].Disks)
 	}
-	if want := base.Add(55 * time.Second); !got[0].Timestamp.Equal(want) {
-		t.Errorf("bucket is stamped %s, want %s, its newest sample", got[0].Timestamp, want)
+	if want := model.FromDB(series.BucketEnd(first, series.L30s) - 1); !got[0].Timestamp.Equal(want.Time) {
+		t.Errorf("bucket is stamped %s, want %s, the moment it closes", got[0].Timestamp, want)
 	}
 	if got[0].CpuTempC == nil || *got[0].CpuTempC != 55.5 {
 		t.Errorf("temperature is %v, want the 55.5 average", got[0].CpuTempC)
 	}
 	if got[1].CpuTempC != nil {
-		t.Errorf("temperature is %v over samples that reported none, want nil", *got[1].CpuTempC)
+		t.Errorf("temperature is %v over readings that carried none, want nil", *got[1].CpuTempC)
 	}
 }
 
@@ -307,11 +311,10 @@ func TestOpenMigratesTextIdsAndTimestamps(t *testing.T) {
 		t.Fatalf("peers are %+v, want the one address the register held", peers)
 	}
 
-	// A sample keeps its reading, its sub-second stamp and its volumes.
-	metric, err := s.LatestMetric(self.ID)
-	if err != nil || metric == nil {
-		t.Fatalf("latest metric: %+v %v", metric, err)
-	}
+	// A sample keeps its reading, its sub-second stamp and its volumes. Read
+	// straight out of the tables the migration rewrites: they are what it is
+	// about, and nothing in the running code reads them any more.
+	metric := legacyLatestMetric(t, s, self.ID)
 	if want := time.Date(2026, 8, 1, 10, 0, 5, 123_000_000, time.UTC); !metric.Timestamp.Equal(want) {
 		t.Errorf("sample stamped %s, want %s to the millisecond", metric.Timestamp, want)
 	}
@@ -323,15 +326,23 @@ func TestOpenMigratesTextIdsAndTimestamps(t *testing.T) {
 	}
 
 	// The observation is still an edge between the same two nodes.
-	rows, err := s.AvailabilitySince(model.At(time.Date(2026, 8, 1, 9, 0, 0, 0, time.UTC)))
-	if err != nil {
+	var (
+		fromUID, toUID string
+		latency        float64
+		up             bool
+	)
+	if err := s.db.QueryRow(`
+		SELECT f."Uid", t."Uid", a."LatencyMs", a."IsAvailable"
+		FROM "AvailabilityRecords" a
+		JOIN "Servers" f ON f."Id"=a."FromServerId"
+		JOIN "Servers" t ON t."Id"=a."ToServerId"`).Scan(&fromUID, &toUID, &latency, &up); err != nil {
 		t.Fatal(err)
 	}
-	if len(rows) != 1 || rows[0].FromUID != uidSelf || rows[0].ToUID != uidPeer {
-		t.Fatalf("availability is %+v, want the one edge, both ends resolved", rows)
+	if fromUID != uidSelf || toUID != uidPeer {
+		t.Fatalf("availability runs %s->%s, want the one edge with both ends resolved", fromUID, toUID)
 	}
-	if rows[0].LatencyMs == nil || *rows[0].LatencyMs != 12.5 || !rows[0].IsAvailable {
-		t.Errorf("observation is %+v, want its reading unchanged", rows[0])
+	if latency != 12.5 || !up {
+		t.Errorf("observation is %v ms up=%v, want its reading unchanged", latency, up)
 	}
 
 	// A snapshot whose server was never registered has nothing to point at, and
@@ -373,13 +384,47 @@ func TestOpenMigratesTextIdsAndTimestamps(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	latest, err := again.LatestMetric(migrated.ID)
-	if err != nil || latest == nil {
-		t.Fatalf("latest metric after migration: %+v %v", latest, err)
-	}
+	latest := legacyLatestMetric(t, again, migrated.ID)
 	if len(latest.Disks) != 1 || latest.Disks[0].Name != "/data" {
 		t.Errorf("the new sample carries %+v, want only its own volume", latest.Disks)
 	}
+}
+
+// legacyLatestMetric reads the newest whole-machine sample out of the tables
+// the first build stored them in. It exists only for the migration tests: the
+// running code reads the series store, and these tables are dropped once the
+// grace after an upgrade has passed.
+func legacyLatestMetric(t *testing.T, s *Store, serverID int64) model.Metric {
+	t.Helper()
+
+	var (
+		id int64
+		ts int64
+		m  model.Metric
+	)
+	err := s.db.QueryRow(`
+		SELECT "Id","Timestamp","CpuPercent","CpuTempC" FROM "MetricSnapshots"
+		WHERE "ServerId"=? ORDER BY "Timestamp" DESC LIMIT 1`, serverID).Scan(
+		&id, &ts, &m.CpuPercent, &m.CpuTempC)
+	if err != nil {
+		t.Fatalf("latest compatibility snapshot for %d: %v", serverID, err)
+	}
+	m.Timestamp = model.FromDB(ts)
+
+	rows, err := s.db.Query(`
+		SELECT "Name","TotalGb","UsedGb" FROM "MetricDisks" WHERE "MetricId"=? ORDER BY "Id"`, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var d model.Disk
+		if err := rows.Scan(&d.Name, &d.TotalGb, &d.UsedGb); err != nil {
+			t.Fatal(err)
+		}
+		m.Disks = append(m.Disks, d)
+	}
+	return m
 }
 
 // A peer forwards what it can see, which can include a node this one has not
@@ -444,11 +489,11 @@ func alertingFixture(t *testing.T) (*Store, int64, int64) {
 	return s, self, other
 }
 
-// TestStreakFindsWhereTheCurrentRunBegan is the reading the alert thresholds
+// TestEdgeStreakFindsWhereTheCurrentRunBegan is the reading the alert thresholds
 // are measured against, so what it has to get right is the start of the run and
 // not merely its state: a node that has been down for an hour and one that
 // failed its first check a moment ago look identical in the newest record.
-func TestStreakFindsWhereTheCurrentRunBegan(t *testing.T) {
+func TestEdgeStreakFindsWhereTheCurrentRunBegan(t *testing.T) {
 	s, self, other := alertingFixture(t)
 
 	base := time.Date(2026, 8, 27, 12, 0, 0, 0, time.UTC)
@@ -467,15 +512,15 @@ func TestStreakFindsWhereTheCurrentRunBegan(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	available, since, found, err := s.Streak(self, other)
+	available, since, found, err := s.EdgeStreak(self, other)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !found {
-		t.Fatal("Streak found nothing on an edge with a dozen observations")
+		t.Fatal("EdgeStreak found nothing on an edge with a dozen observations")
 	}
 	if available {
-		t.Error("Streak reports the peer available, but the newest check failed")
+		t.Error("EdgeStreak reports the peer available, but the newest check failed")
 	}
 	// The sixth reading, at 60s, is the last success; the seventh is where the
 	// outage begins and is what its duration has to be measured from.
@@ -493,22 +538,22 @@ func TestStreakFindsWhereTheCurrentRunBegan(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	available, since, _, err = s.Streak(self, other)
+	available, since, _, err = s.EdgeStreak(self, other)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !available {
-		t.Error("Streak reports the peer down after two successful checks")
+		t.Error("EdgeStreak reports the peer down after two successful checks")
 	}
 	if !since.Equal(recovered.Time) {
 		t.Errorf("the recovery begins at %s, want %s", since.UTC(), recovered.UTC())
 	}
 }
 
-func TestStreakReportsNothingForAnUnmeasuredEdge(t *testing.T) {
+func TestEdgeStreakReportsNothingForAnUnmeasuredEdge(t *testing.T) {
 	s, self, other := alertingFixture(t)
 
-	_, _, found, err := s.Streak(self, other)
+	_, _, found, err := s.EdgeStreak(self, other)
 	if err != nil {
 		t.Fatal(err)
 	}

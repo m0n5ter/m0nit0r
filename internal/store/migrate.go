@@ -160,6 +160,12 @@ func addColumns(db *sql.DB) error {
 		{"Servers", "PushOnly", `"PushOnly" INTEGER NOT NULL DEFAULT 0`},
 		{"Servers", "Removed", `"Removed" INTEGER NOT NULL DEFAULT 0`},
 		{"Servers", "MemberAt", `"MemberAt" INTEGER NOT NULL DEFAULT 0`},
+		// Which revision of the peer protocol a node last spoke here. Zero is
+		// a node that has never pushed, or one old enough to send no version
+		// at all - which are the same thing for the only decision this drives:
+		// whether every peer is new enough that the tables the first build
+		// stored its readings in have stopped being anybody's history.
+		{"Servers", "Protocol", `"Protocol" INTEGER NOT NULL DEFAULT 0`},
 	} {
 		present, err := hasColumn(db, col.table, col.name)
 		if err != nil {

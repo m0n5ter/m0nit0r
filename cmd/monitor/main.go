@@ -181,11 +181,19 @@ func runApp(parent context.Context, log *slog.Logger, opts config.Options, baseD
 				LibreHardwareMonitorURL: opts.LibreHardwareMonitor,
 				Log:                     log,
 			}),
-			ServerID:  serverID,
-			Interval:  time.Duration(opts.MetricIntervalSeconds) * time.Second,
+			ServerID: serverID,
+			Interval: time.Duration(opts.MetricIntervalSeconds) * time.Second,
+			// Bounds the compatibility tables only. How much history this node
+			// actually keeps is the aggregation ladder, which is not
+			// configurable - see internal/series.
 			Retention: time.Duration(opts.RetentionDays) * 24 * time.Hour,
 			Log:       log,
 		}).Run,
+		// Folds the raw readings up the aggregation ladder and enforces each
+		// rung's retention. Independent of the sampler: it works from what is
+		// stored, so it can fall behind a restart or a slow disk and catch up
+		// without anything being lost or counted twice.
+		(&worker.Rollup{Store: st, Log: log}).Run,
 		(&worker.Sync{
 			Store:      st,
 			Client:     client,

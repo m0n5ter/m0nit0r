@@ -19,6 +19,7 @@ import (
 	"github.com/m0n5ter/m0nit0r/internal/auth"
 	"github.com/m0n5ter/m0nit0r/internal/model"
 	"github.com/m0n5ter/m0nit0r/internal/peer"
+	"github.com/m0n5ter/m0nit0r/internal/series"
 	"github.com/m0n5ter/m0nit0r/internal/store"
 	"github.com/m0n5ter/m0nit0r/internal/web"
 )
@@ -28,10 +29,12 @@ import (
 const maxBodyBytes = 8 << 20
 
 // matrixWindow is how far back the availability matrix looks.
-const matrixWindow = time.Hour
-
-// matrixSamples is how many recent checks per edge feed the percentage.
-const matrixSamples = 10
+//
+// It used to be an hour, of which only the last ten checks per edge were used;
+// now it is the span those ten checks actually cover, because the rows are read
+// per edge rather than filtered afterwards. At a ten-second sync that is a
+// dozen checks, which is what the percentage in a cell is out of.
+const matrixWindow = 2 * time.Minute
 
 // Server wires the HTTP handlers to storage and the peer client.
 //
@@ -292,21 +295,38 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 	if err == nil {
 		err = s.Store.SetPushOnly(peerID, payload.PushOnly)
 	}
+	if err == nil {
+		// Remembered before anything is read out of the payload, because it
+		// is what decides how the rest of it is read - and what this node
+		// will send back in the other direction from the next round on.
+		err = s.Store.SetProtocol(peerID, payload.Protocol)
+	}
 	if err != nil {
 		s.Log.Error("record syncing peer", "peer", payload.ServerID, "err", err)
 		http.Error(w, "failed to record peer", http.StatusInternalServerError)
 		return
 	}
 
-	if err := s.storeSyncedMetrics(peerID, payload); err != nil {
-		s.Log.Error("store synced metrics", "peer", payload.ServerID, "err", err)
-		http.Error(w, "failed to store metrics", http.StatusInternalServerError)
+	if err := s.storeSyncedSeries(peerID, payload); err != nil {
+		s.Log.Error("store synced series", "peer", payload.ServerID, "err", err)
+		http.Error(w, "failed to store series", http.StatusInternalServerError)
 		return
 	}
-	if err := s.storeSyncedAvailability(peerID, payload); err != nil {
-		s.Log.Error("store synced availability", "peer", payload.ServerID, "err", err)
-		http.Error(w, "failed to store availability", http.StatusInternalServerError)
-		return
+
+	// The original form is read only from a peer that speaks nothing else. A
+	// node sending both would otherwise have every reading stored twice, once
+	// as it measured it and once as this node re-derived it from the snapshot.
+	if payload.Protocol < model.ProtocolVersion {
+		if err := s.storeSyncedMetrics(peerID, payload); err != nil {
+			s.Log.Error("store synced metrics", "peer", payload.ServerID, "err", err)
+			http.Error(w, "failed to store metrics", http.StatusInternalServerError)
+			return
+		}
+		if err := s.storeSyncedAvailability(peerID, payload); err != nil {
+			s.Log.Error("store synced availability", "peer", payload.ServerID, "err", err)
+			http.Error(w, "failed to store availability", http.StatusInternalServerError)
+			return
+		}
 	}
 	if err := s.storeSyncedNotices(peerID, payload); err != nil {
 		s.Log.Error("store synced notices", "peer", payload.ServerID, "err", err)
@@ -413,6 +433,19 @@ func (s *Server) replyWithPeers(w http.ResponseWriter, callerUID string) {
 	w.Write(body)
 }
 
+// storeSyncedSeries takes in the readings and the sealed buckets a peer sent.
+//
+// Neither needs a high-water mark of its own. Both are written by the identity
+// of what they measure - a series, an instant or a bucket - so a row arriving
+// twice is written over itself, and the sender's own mark is what keeps that
+// from happening every round anyway.
+func (s *Server) storeSyncedSeries(peerID int64, payload model.SyncPayload) error {
+	if err := s.Store.StoreSamples(peerID, payload.Samples); err != nil {
+		return err
+	}
+	return s.Store.StoreRollups(peerID, payload.Rollups)
+}
+
 // storeSyncedMetrics inserts only samples newer than what is already held for
 // that peer. Peers resend an overlapping window every round, so this is what
 // keeps the table free of duplicates.
@@ -421,7 +454,7 @@ func (s *Server) storeSyncedMetrics(peerID int64, payload model.SyncPayload) err
 		return nil
 	}
 
-	watermark, ok, err := s.Store.MaxMetricTimestamp(peerID)
+	watermark, ok, err := s.Store.MaxSampleTimestamp(peerID, series.CPUPercent)
 	if err != nil {
 		return err
 	}
@@ -447,7 +480,7 @@ func (s *Server) storeSyncedAvailability(peerID int64, payload model.SyncPayload
 		return nil
 	}
 
-	watermark, ok, err := s.Store.MaxAvailabilityTimestamp(peerID)
+	watermark, ok, err := s.Store.MaxSampleTimestamp(peerID, series.LatencyMs)
 	if err != nil {
 		return err
 	}
@@ -536,7 +569,7 @@ func (s *Server) handleServers(w http.ResponseWriter, r *http.Request) {
 
 	views := make([]serverView, 0, len(servers))
 	for _, srv := range servers {
-		latest, err := s.Store.LatestMetric(srv.ID)
+		latest, err := s.Store.LatestMetricSeries(srv.ID)
 		if err != nil {
 			s.fail(w, "latest metric", err)
 			return
@@ -546,7 +579,7 @@ func (s *Server) handleServers(w http.ResponseWriter, r *http.Request) {
 		if !srv.IsSelf {
 			// Reachability is whatever this server last observed; a peer's own
 			// opinion of itself is not evidence it is reachable from here.
-			available, _, err := s.Store.LatestAvailability(s.ServerID, srv.ID)
+			available, _, err := s.Store.LatestEdge(s.ServerID, srv.ID)
 			if err != nil {
 				s.fail(w, "latest availability", err)
 				return
@@ -584,12 +617,25 @@ func (s *Server) handleServerMetrics(w http.ResponseWriter, r *http.Request) {
 	window := hoursParam(r)
 	since := model.At(time.Now().Add(-window))
 
-	metrics, err := s.Store.MetricsBucketed(srv.ID, since, bucketFor(window))
+	// Which rung to read, rather than how wide to group: the aggregate the
+	// chart wants has already been computed, so the only question left is
+	// which one. An hour or less is served from the raw checks, because the
+	// live view is the one place the sampling cadence is the point.
+	metrics, err := s.metricsFor(srv.ID, window, since)
 	if err != nil {
 		s.fail(w, "server metrics", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, metrics)
+}
+
+func (s *Server) metricsFor(serverID int64, window time.Duration, since model.Time) ([]model.Metric, error) {
+	level, aggregated := series.LevelFor(window)
+	if !aggregated {
+		return s.Store.MetricsRaw(serverID, since)
+	}
+	return s.Store.MetricsAtLevel(serverID, level,
+		series.Bucket(since.DB(), level), series.Bucket(model.Now().DB(), level))
 }
 
 type matrixEntry struct {
@@ -601,45 +647,31 @@ type matrixEntry struct {
 	IsAvailable         bool       `json:"isAvailable"`
 }
 
+// handleAvailabilityMatrix draws every route in the mesh at once.
+//
+// It reads raw checks rather than the aggregates, and has to: a bucket is not
+// written until it can no longer change, which is minutes after it ends, and a
+// cell that went red a minute ago has to be red now.
 func (s *Server) handleAvailabilityMatrix(w http.ResponseWriter, r *http.Request) {
-	rows, err := s.Store.AvailabilitySince(model.At(time.Now().Add(-matrixWindow)))
+	states, err := s.Store.EdgeStates(model.At(time.Now().Add(-matrixWindow)))
 	if err != nil {
 		s.fail(w, "availability matrix", err)
 		return
 	}
 
-	type edge struct{ from, to string }
-	grouped := map[edge][]store.AvailabilityRow{}
-	for _, row := range rows {
-		key := edge{row.FromUID, row.ToUID}
-		grouped[key] = append(grouped[key], row)
-	}
-
-	entries := make([]matrixEntry, 0, len(grouped))
-	for key, group := range grouped {
-		sort.Slice(group, func(i, j int) bool {
-			return group[i].Timestamp.After(group[j].Timestamp.Time)
-		})
-		if len(group) > matrixSamples {
-			group = group[:matrixSamples]
+	entries := make([]matrixEntry, 0, len(states))
+	for _, e := range states {
+		entry := matrixEntry{
+			FromServerID:  e.FromUID,
+			ToServerID:    e.ToUID,
+			LastCheck:     e.LastCheck,
+			LastLatencyMs: e.LastLatency,
+			IsAvailable:   e.LastWasUp,
 		}
-
-		up := 0
-		for _, row := range group {
-			if row.IsAvailable {
-				up++
-			}
+		if e.Checks > 0 {
+			entry.AvailabilityPercent = round1(float64(e.Successes) / float64(e.Checks) * 100)
 		}
-
-		last := group[0]
-		entries = append(entries, matrixEntry{
-			FromServerID:        key.from,
-			ToServerID:          key.to,
-			AvailabilityPercent: round1(float64(up) / float64(len(group)) * 100),
-			LastCheck:           last.Timestamp,
-			LastLatencyMs:       last.LatencyMs,
-			IsAvailable:         last.IsAvailable,
-		})
+		entries = append(entries, entry)
 	}
 
 	// Stable output keeps the rendered matrix from reshuffling between polls.
@@ -653,10 +685,19 @@ func (s *Server) handleAvailabilityMatrix(w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusOK, entries)
 }
 
+// historyEntry is one point on a route's chart.
+//
+// Availability and MaxLatencyMs are new alongside the three the first build
+// sent, and mean something only once a point covers an interval rather than an
+// instant: how much of it the route was reachable for, and the worst any one
+// check in it cost. A mean alone hides exactly the spike the chart is being
+// looked at for.
 type historyEntry struct {
-	Timestamp   model.Time `json:"timestamp"`
-	IsAvailable bool       `json:"isAvailable"`
-	LatencyMs   *float64   `json:"latencyMs"`
+	Timestamp    model.Time `json:"timestamp"`
+	IsAvailable  bool       `json:"isAvailable"`
+	LatencyMs    *float64   `json:"latencyMs"`
+	MaxLatencyMs *float64   `json:"maxLatencyMs"`
+	Availability float64    `json:"availability"`
 }
 
 func (s *Server) handleAvailabilityHistory(w http.ResponseWriter, r *http.Request) {
@@ -675,17 +716,36 @@ func (s *Server) handleAvailabilityHistory(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	since := model.At(time.Now().Add(-hoursParam(r)))
+	window := hoursParam(r)
+	since := model.At(time.Now().Add(-window))
 
-	rows, err := s.Store.AvailabilityHistory(from.ID, to.ID, since)
-	if err != nil {
-		s.fail(w, "availability history", err)
+	// The same choice of rung the metric charts make. This one used to be the
+	// exception: it returned every stored check, so a week-long window meant
+	// sixty thousand points for one route.
+	var (
+		points []store.EdgePoint
+		err2   error
+	)
+	if level, aggregated := series.LevelFor(window); aggregated {
+		points, err2 = s.Store.EdgeAtLevel(from.ID, to.ID, level,
+			series.Bucket(since.DB(), level), series.Bucket(model.Now().DB(), level))
+	} else {
+		points, err2 = s.Store.EdgeRaw(from.ID, to.ID, since)
+	}
+	if err2 != nil {
+		s.fail(w, "availability history", err2)
 		return
 	}
 
-	entries := make([]historyEntry, 0, len(rows))
-	for _, row := range rows {
-		entries = append(entries, historyEntry{row.Timestamp, row.IsAvailable, row.LatencyMs})
+	entries := make([]historyEntry, 0, len(points))
+	for _, p := range points {
+		entries = append(entries, historyEntry{
+			Timestamp:    p.Timestamp,
+			IsAvailable:  p.IsAvailable,
+			LatencyMs:    p.LatencyMs,
+			MaxLatencyMs: p.MaxLatencyMs,
+			Availability: p.Availability,
+		})
 	}
 	writeJSON(w, http.StatusOK, entries)
 }
@@ -874,29 +934,6 @@ func hoursParam(r *http.Request) time.Duration {
 		hours = 24
 	}
 	return time.Duration(max(1, min(hours, 168))) * time.Hour
-}
-
-// maxPoints is roughly how many samples a chart in the dashboard should have
-// to draw. Chosen for the eye rather than the renderer: past a few hundred
-// points a line is denser than the plot is wide, so the extra samples cost
-// time without showing anything.
-const maxPoints = 360
-
-// bucketFor picks how wide a metric bucket has to be for a window of this
-// length to stay that size. An hour is served raw, because the live view is
-// the one place the five-second cadence is the point; every longer window is
-// rounded up to a bucket a person can name, so the tooltip reads as "one of
-// the fifteen-minute averages" rather than an arbitrary span.
-func bucketFor(window time.Duration) time.Duration {
-	if window <= time.Hour {
-		return 0
-	}
-	for _, bucket := range []time.Duration{time.Minute, 5 * time.Minute, 15 * time.Minute, 30 * time.Minute} {
-		if window/maxPoints <= bucket {
-			return bucket
-		}
-	}
-	return time.Hour
 }
 
 func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {

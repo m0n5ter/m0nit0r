@@ -17,6 +17,15 @@ import (
 // every sample would cost more than the extra minute of history it trims.
 const pruneInterval = time.Minute
 
+// maxLegacyRetention caps how long the tables the first build stored readings
+// in are allowed to keep, whatever the configuration says.
+//
+// Nothing reads them: the dashboard, the alerts and the peer protocol are all
+// answered from the series store. They are written only so that a build rolled
+// back within the grace period finds its history, and a day of it is more than
+// that needs - the ladder is what keeps the year.
+const maxLegacyRetention = 24 * time.Hour
+
 // Metrics samples the local host on a fixed interval and enforces retention.
 type Metrics struct {
 	Store     *store.Store
@@ -87,5 +96,7 @@ func (w *Metrics) prune() error {
 		return nil
 	}
 	w.lastPrune = now
-	return w.Store.Prune(model.At(now.Add(-w.Retention)))
+	return w.Store.Prune(
+		model.At(now.Add(-min(w.Retention, maxLegacyRetention))),
+		model.At(now.Add(-w.Retention)))
 }

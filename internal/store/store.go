@@ -13,8 +13,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"strings"
-	"time"
 
 	"github.com/m0n5ter/m0nit0r/internal/model"
 	_ "modernc.org/sqlite" // pure-Go driver, registered as "sqlite"
@@ -43,6 +41,151 @@ CREATE TABLE IF NOT EXISTS "Servers" (
     "LastSeen" INTEGER NOT NULL
 );
 
+-- One row per alert a node actually sent out, replicated across the mesh the
+-- same way observations are. Several nodes may be configured to raise alerts,
+-- and they all watch the same set of peers, so without a record of what has
+-- already been announced one outage would arrive as one message per alerting
+-- node. A node reads this table to find out whether somebody has already said
+-- what it was about to say.
+--
+-- Deliberately not keyed by outage: two nodes notice the same node failing a
+-- few seconds apart and would compute different start times for it. "The most
+-- recent thing anyone announced about this node" needs no such agreement.
+CREATE TABLE IF NOT EXISTS "AlertNotices" (
+    "Id"           INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+    "FromServerId" INTEGER NOT NULL REFERENCES "Servers"("Id"),
+    "ToServerId"   INTEGER NOT NULL REFERENCES "Servers"("Id"),
+    "Timestamp"    INTEGER NOT NULL,
+    "IsDown"       INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS "IX_AlertNotices_ToServerId_Timestamp"
+    ON "AlertNotices" ("ToServerId", "Timestamp");
+
+CREATE INDEX IF NOT EXISTS "IX_AlertNotices_FromServerId_Timestamp"
+    ON "AlertNotices" ("FromServerId", "Timestamp");
+
+-- ── The series store ────────────────────────────────────────────────────────
+--
+-- Everything measured, in one shape: a parameter, up to two dimensions, a
+-- time, and a number. The three tables above record the same readings in the
+-- shape the first build stored them, and are kept in step until every node in
+-- a mesh is new enough to have stopped needing them.
+
+-- A drive's name is a string, and putting it in the key of every row that
+-- mentions it would cost more than the reading. Here it becomes a small
+-- integer, once.
+CREATE TABLE IF NOT EXISTS "Volumes" (
+    "Id"       INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+    "ServerId" INTEGER NOT NULL REFERENCES "Servers"("Id"),
+    "Name"     TEXT NOT NULL,
+    UNIQUE ("ServerId","Name")
+);
+
+-- Raw readings, kept for twenty minutes. Separate from the aggregates because
+-- they churn: written every few seconds and deleted just as fast, where the
+-- aggregates are written once and read for a year. In one B-tree that delete
+-- traffic would fragment the pages holding the daily rows.
+--
+-- Value is the reading multiplied by the parameter's scale, because SQLite
+-- spends eight bytes on every REAL and as few as one on an integer. It is NULL
+-- when the reading was attempted and produced nothing - a host with no
+-- temperature sensor, a probe that timed out - which is a different thing from
+-- the row being absent, and that difference is what the counters downstream
+-- are built from.
+--
+-- Server2 names the node observed, for edge parameters; Volume names the
+-- drive, for disk parameters; both are 0 otherwise. They are never both used,
+-- but they are kept apart rather than overloaded into one column: a column
+-- whose meaning depends on another column is a query waiting to join against
+-- the wrong table.
+CREATE TABLE IF NOT EXISTS "Samples" (
+    "Param"     INTEGER NOT NULL,
+    "Server1"   INTEGER NOT NULL REFERENCES "Servers"("Id"),
+    "Server2"   INTEGER NOT NULL,
+    "Volume"    INTEGER NOT NULL,
+    "Timestamp" INTEGER NOT NULL,
+    "Value"     INTEGER NULL,
+    "IsOk"      INTEGER NOT NULL,
+    PRIMARY KEY ("Server1","Param","Server2","Volume","Timestamp")
+) WITHOUT ROWID;
+
+-- The matrix asks for every route at once over the last couple of minutes,
+-- which the key above cannot serve: it leads with the node doing the
+-- observing, so the time it selects on is its last column and the whole table
+-- has to be walked. This orders the same rows by time.
+--
+-- Partial, over the one parameter drawn that way. The readings about a machine
+-- are only ever asked for one machine at a time, which the key already
+-- answers, and they carry no entry here.
+CREATE INDEX IF NOT EXISTS "IX_Samples_Latency_Timestamp"
+    ON "Samples" ("Timestamp") WHERE "Param"=9;
+
+-- The aggregation ladder, every level in one table.
+--
+-- No row id: the key is natural, so WITHOUT ROWID makes the table itself the
+-- B-tree over it. The column order is the one a chart asks in - a node, one
+-- parameter, a range of buckets, one contiguous walk - which is why Server1
+-- leads and Bucket trails. A key led by Param instead would put every node's
+-- readings for one parameter together, which is an order nothing asks for.
+--
+-- Sum rather than an average. Rolling thirty seconds into five minutes is then
+-- addition, exact and unweighted, and two views of the same bucket combine by
+-- adding; an average would have to be weighted by hand at every rung and would
+-- drift a little at each one.
+--
+-- Three counters, because there are three questions and one flag cannot answer
+-- them. Count is how many readings were attempted, and a bucket with fewer
+-- than expected has a gap in it. CountOk is how many succeeded, and for an
+-- edge CountOk/Count is exactly its availability. CountVal is how many
+-- produced a number, which is the only correct divisor for Sum - a probe that
+-- timed out records a latency that must not reach the average, and a push-only
+-- peer's successful check records no latency at all.
+CREATE TABLE IF NOT EXISTS "Rollups" (
+    "Param"    INTEGER NOT NULL,
+    "Server1"  INTEGER NOT NULL REFERENCES "Servers"("Id"),
+    "Server2"  INTEGER NOT NULL,
+    "Volume"   INTEGER NOT NULL,
+    "Level"    INTEGER NOT NULL,
+    "Bucket"   INTEGER NOT NULL,
+    "Mn"       INTEGER NULL,
+    "Mx"       INTEGER NULL,
+    "Sum"      INTEGER NOT NULL,
+    "Count"    INTEGER NOT NULL,
+    "CountOk"  INTEGER NOT NULL,
+    "CountVal" INTEGER NOT NULL,
+    PRIMARY KEY ("Server1","Param","Server2","Volume","Level","Bucket")
+) WITHOUT ROWID;
+
+-- The matrix asks the opposite way round from a chart: every edge at once, for
+-- one recent window. Under the primary key that is a seek per edge, because
+-- the time it selects on is the last column. This orders the same rows by time
+-- instead.
+--
+-- Partial, and only over the finest level, which is what makes it affordable:
+-- the coarser levels are never asked for this way and carry no entry at all.
+-- It is also what retention deletes the finest level through. Every coarser
+-- level holds a tenth of the rows or fewer and is swept on a slower schedule,
+-- where a scan costs less than an index would have cost all along.
+CREATE INDEX IF NOT EXISTS "IX_Rollups_L0_Bucket"
+    ON "Rollups" ("Bucket") WHERE "Level"=0;
+
+-- Watermarks and other single facts about this database, so that the roll-up
+-- can resume where it stopped rather than rescanning its retention window on
+-- every start.
+CREATE TABLE IF NOT EXISTS "Meta" (
+    "Key"   TEXT NOT NULL PRIMARY KEY,
+    "Value" INTEGER NOT NULL
+) WITHOUT ROWID;
+`
+
+// compatSchema is the three tables the first build stored readings in.
+//
+// Apart from the rest of the schema because they are the only ones this build
+// may drop, and CREATE TABLE IF NOT EXISTS would put them back on the next
+// start. Open runs this only while they are still wanted - see RetireLegacy
+// for what "wanted" means and how long it lasts.
+const compatSchema = `
 CREATE TABLE IF NOT EXISTS "MetricSnapshots" (
     "Id"            INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
     "ServerId"      INTEGER NOT NULL REFERENCES "Servers"("Id"),
@@ -91,34 +234,13 @@ CREATE TABLE IF NOT EXISTS "AvailabilityRecords" (
 CREATE INDEX IF NOT EXISTS "IX_AvailabilityRecords_FromServerId_ToServerId_Timestamp"
     ON "AvailabilityRecords" ("FromServerId", "ToServerId", "Timestamp");
 
--- One row per alert a node actually sent out, replicated across the mesh the
--- same way observations are. Several nodes may be configured to raise alerts,
--- and they all watch the same set of peers, so without a record of what has
--- already been announced one outage would arrive as one message per alerting
--- node. A node reads this table to find out whether somebody has already said
--- what it was about to say.
---
--- Deliberately not keyed by outage: two nodes notice the same node failing a
--- few seconds apart and would compute different start times for it. "The most
--- recent thing anyone announced about this node" needs no such agreement.
-CREATE TABLE IF NOT EXISTS "AlertNotices" (
-    "Id"           INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
-    "FromServerId" INTEGER NOT NULL REFERENCES "Servers"("Id"),
-    "ToServerId"   INTEGER NOT NULL REFERENCES "Servers"("Id"),
-    "Timestamp"    INTEGER NOT NULL,
-    "IsDown"       INTEGER NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS "IX_AlertNotices_ToServerId_Timestamp"
-    ON "AlertNotices" ("ToServerId", "Timestamp");
-
-CREATE INDEX IF NOT EXISTS "IX_AlertNotices_FromServerId_Timestamp"
-    ON "AlertNotices" ("FromServerId", "Timestamp");
 `
 
 // Store owns the database handle.
 type Store struct {
 	db *sql.DB
+	volumeCache
+	legacyState
 }
 
 // Open connects to the SQLite file at path and ensures the schema exists.
@@ -198,7 +320,54 @@ func Open(path string) (*Store, error) {
 		return nil, err
 	}
 
-	return &Store{db: db}, nil
+	s := &Store{db: db}
+
+	// When this database first had a series store. Written once and never
+	// again: it is what the grace before the original tables are dropped is
+	// measured from, so an upgraded node starts its window at the upgrade.
+	_, dated, err := s.MetaGet(seriesSince)
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+
+	// Retired, rather than merely absent: a database that has been through
+	// RetireLegacy carries the stamp above but not the tables, where one being
+	// created from nothing carries neither. Only the first must not have them
+	// built again, which is why they are not in the schema run above.
+	present, err := hasTable(db, "MetricSnapshots")
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	if !(dated && !present) {
+		if _, err := db.Exec(compatSchema); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("create compatibility schema: %w", err)
+		}
+		s.legacy = true
+	}
+
+	if !dated {
+		if err := s.MetaSet(seriesSince, model.Now().DB()); err != nil {
+			db.Close()
+			return nil, err
+		}
+	}
+
+	return s, nil
+}
+
+// hasTable reports whether a table exists, which is how the tables this build
+// may have dropped are told from the ones it always creates.
+func hasTable(db *sql.DB, name string) (bool, error) {
+	var n int
+	err := db.QueryRow(
+		`SELECT COUNT(*) FROM "sqlite_master" WHERE "type"='table' AND "name"=?`, name).Scan(&n)
+	if err != nil {
+		return false, fmt.Errorf("inspect schema for %s: %w", name, err)
+	}
+	return n > 0, nil
 }
 
 // hasColumn reports whether a table already carries a column, which is how a
@@ -479,7 +648,7 @@ func (s *Store) TouchLastSeen(id int64, t model.Time) error {
 	return nil
 }
 
-const selectServer = `SELECT "Id","Uid","Name","Location",COALESCE("Url",''),"IsSelf","Alerts","PushOnly","Removed","LastSeen" FROM "Servers"`
+const selectServer = `SELECT "Id","Uid","Name","Location",COALESCE("Url",''),"IsSelf","Alerts","PushOnly","Removed","LastSeen","Protocol" FROM "Servers"`
 
 // present is what every listing adds to its own conditions: a removed node is
 // not one of this mesh's servers any more, so it appears in no list, is probed
@@ -543,7 +712,7 @@ func scanServer(sc scanner) (model.Server, error) {
 		lastSeen int64
 	)
 	if err := sc.Scan(&srv.ID, &srv.UID, &srv.Name, &srv.Location, &srv.URL, &srv.IsSelf,
-		&srv.Alerts, &srv.PushOnly, &srv.Removed, &lastSeen); err != nil {
+		&srv.Alerts, &srv.PushOnly, &srv.Removed, &lastSeen, &srv.Protocol); err != nil {
 		return model.Server{}, err
 	}
 	srv.LastSeen = model.FromDB(lastSeen)
@@ -555,9 +724,21 @@ func scanServer(sc scanner) (model.Server, error) {
 // InsertMetrics appends samples for serverID and reports how many were
 // written. A sample's volumes go in the same transaction, so a snapshot never
 // exists without the disks it reported.
+// The series store is written first, and the tables below it second. The
+// order matters on failure: a series write is an upsert keyed by the reading's
+// own identity, so repeating it changes nothing, while these tables accept the
+// same sample twice. Writing the idempotent half first means a caller that
+// retries after an error cannot end up with two copies of a snapshot.
 func (s *Store) InsertMetrics(serverID int64, metrics []model.Metric) (int, error) {
 	if len(metrics) == 0 {
 		return 0, nil
+	}
+
+	if err := s.RecordSnapshots(serverID, metrics); err != nil {
+		return 0, err
+	}
+	if !s.LegacyActive() {
+		return len(metrics), nil
 	}
 
 	tx, err := s.db.Begin()
@@ -608,180 +789,6 @@ func (s *Store) InsertMetrics(serverID int64, metrics []model.Metric) (int, erro
 	return len(metrics), nil
 }
 
-// MaxMetricTimestamp returns the newest stored sample time for a server. The
-// bool is false when the server has no samples yet.
-//
-// Peers resend an overlapping window on every sync, so this is the high-water
-// mark used to discard duplicates. Comparing against one value keeps the cost
-// constant regardless of how much history has accumulated.
-func (s *Store) MaxMetricTimestamp(serverID int64) (model.Time, bool, error) {
-	return s.maxTimestamp(`SELECT MAX("Timestamp") FROM "MetricSnapshots" WHERE "ServerId"=?`,
-		"max metric timestamp", serverID)
-}
-
-// LatestMetric returns the newest sample for a server, or nil if there is none.
-func (s *Store) LatestMetric(serverID int64) (*model.Metric, error) {
-	metrics, err := s.queryMetrics(`
-		SELECT "Id","Timestamp","CpuPercent","CpuTempC","MemoryPercent","MemoryTotalMb","MemoryUsedMb","UptimeSeconds"
-		FROM "MetricSnapshots" WHERE "ServerId"=?
-		ORDER BY "Timestamp" DESC LIMIT 1`, serverID)
-	if err != nil {
-		return nil, fmt.Errorf("latest metric %d: %w", serverID, err)
-	}
-	if len(metrics) == 0 {
-		return nil, nil
-	}
-	return &metrics[0], nil
-}
-
-// MetricsSince returns a server's samples from since onwards, oldest first.
-func (s *Store) MetricsSince(serverID int64, since model.Time) ([]model.Metric, error) {
-	metrics, err := s.queryMetrics(`
-		SELECT "Id","Timestamp","CpuPercent","CpuTempC","MemoryPercent","MemoryTotalMb","MemoryUsedMb","UptimeSeconds"
-		FROM "MetricSnapshots"
-		WHERE "ServerId"=? AND "Timestamp">=?
-		ORDER BY "Timestamp"`, serverID, since.DB())
-	if err != nil {
-		return nil, fmt.Errorf("metrics since: %w", err)
-	}
-	return metrics, nil
-}
-
-// MetricsBucketed returns a server's samples from since onwards, oldest first,
-// averaged into buckets of the given width. A bucket of zero returns the raw
-// samples. It exists because the wide ranges are otherwise unusable: a week of
-// five-second samples is over a hundred thousand points per chart, which the
-// browser spends its time drawing and no eye can read.
-//
-// Readings worth averaging are averaged; the rest come from the newest sample
-// in the bucket, which is what the bare "UptimeSeconds" and "Id" columns
-// select. SQLite fills a bare column from the row that produced the query's
-// single min() or max() aggregate - here MAX("Timestamp"). A second min() or
-// max() would leave which row that is undefined, so the uptime has to stay a
-// bare column rather than becoming a MAX of its own. The id carries that same
-// row's volumes, so the disks reported for a bucket are one real reading
-// rather than a blend of drives that were never mounted at the same time.
-//
-// Grouping is integer division on the stored millisecond count. It used to go
-// through strftime, which had to parse a date string per row before it could
-// divide anything.
-func (s *Store) MetricsBucketed(serverID int64, since model.Time, bucket time.Duration) ([]model.Metric, error) {
-	width := bucket.Milliseconds()
-	if width <= 0 {
-		return s.MetricsSince(serverID, since)
-	}
-
-	metrics, err := s.queryMetrics(`
-		SELECT "Id",MAX("Timestamp"),AVG("CpuPercent"),AVG("CpuTempC"),AVG("MemoryPercent"),
-		       AVG("MemoryTotalMb"),AVG("MemoryUsedMb"),"UptimeSeconds"
-		FROM "MetricSnapshots"
-		WHERE "ServerId"=? AND "Timestamp">=?
-		GROUP BY "Timestamp"/?
-		ORDER BY MAX("Timestamp")`, serverID, since.DB(), width)
-	if err != nil {
-		return nil, fmt.Errorf("metrics bucketed: %w", err)
-	}
-	return metrics, nil
-}
-
-// queryMetrics runs a statement selecting the columns scanMetric expects, the
-// row id first, and fills in each sample's volumes.
-func (s *Store) queryMetrics(query string, args ...any) ([]model.Metric, error) {
-	rows, err := s.db.Query(query, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	ids := []int64{}
-	metrics := []model.Metric{}
-	for rows.Next() {
-		id, m, err := scanMetric(rows)
-		if err != nil {
-			return nil, fmt.Errorf("scan metric: %w", err)
-		}
-		ids = append(ids, id)
-		metrics = append(metrics, m)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	if err := s.attachDisks(ids, metrics); err != nil {
-		return nil, err
-	}
-	return metrics, nil
-}
-
-// diskBatch caps how many ids go into one IN clause. SQLite's older default
-// parameter limit is 999, and a raw hour of five-second samples already spends
-// most of that.
-const diskBatch = 500
-
-// attachDisks fills in the volumes of each sample, where ids[i] identifies
-// metrics[i]. Batched rather than queried per sample: a chart's range is
-// hundreds of samples, and asking for each one's disks separately is the usual
-// N+1.
-func (s *Store) attachDisks(ids []int64, metrics []model.Metric) error {
-	byMetric := make(map[int64][]model.Disk, len(ids))
-
-	for start := 0; start < len(ids); start += diskBatch {
-		batch := ids[start:min(start+diskBatch, len(ids))]
-
-		args := make([]any, len(batch))
-		for i, id := range batch {
-			args[i] = id
-		}
-
-		rows, err := s.db.Query(`
-			SELECT "MetricId","Name","TotalGb","UsedGb","FreeGb","UsagePercent","TempC"
-			FROM "MetricDisks"
-			WHERE "MetricId" IN (`+strings.TrimPrefix(strings.Repeat(",?", len(batch)), ",")+`)
-			ORDER BY "Id"`, args...)
-		if err != nil {
-			return fmt.Errorf("query disks: %w", err)
-		}
-
-		for rows.Next() {
-			var (
-				metricID int64
-				disk     model.Disk
-			)
-			if err := rows.Scan(&metricID, &disk.Name, &disk.TotalGb, &disk.UsedGb,
-				&disk.FreeGb, &disk.UsagePercent, &disk.TempC); err != nil {
-				rows.Close()
-				return fmt.Errorf("scan disk: %w", err)
-			}
-			byMetric[metricID] = append(byMetric[metricID], disk)
-		}
-		// Closed here rather than deferred: this runs once per batch, and a
-		// deferred close would hold every batch open until the function ended.
-		err = rows.Err()
-		rows.Close()
-		if err != nil {
-			return fmt.Errorf("read disks: %w", err)
-		}
-	}
-
-	for i, id := range ids {
-		metrics[i].Disks = byMetric[id]
-	}
-	return nil
-}
-
-func scanMetric(sc scanner) (int64, model.Metric, error) {
-	var (
-		m  model.Metric
-		id int64
-		ts int64
-	)
-	if err := sc.Scan(&id, &ts, &m.CpuPercent, &m.CpuTempC, &m.MemoryPercent, &m.MemoryTotalMb,
-		&m.MemoryUsedMb, &m.UptimeSeconds); err != nil {
-		return 0, model.Metric{}, err
-	}
-	m.Timestamp = model.FromDB(ts)
-	return id, m, nil
-}
-
 // ── Availability ────────────────────────────────────────────────────────────
 
 // Observation is one reachability reading about a server in this database,
@@ -795,21 +802,17 @@ type Observation struct {
 	HTTPStatus  *int
 }
 
-// AvailabilityRow is one stored observation with both ends resolved to the ids
-// their nodes publish, which is what the dashboard's matrix is drawn from - it
-// spans the whole mesh, so neither end is known in advance.
-type AvailabilityRow struct {
-	FromUID     string
-	ToUID       string
-	Timestamp   model.Time
-	IsAvailable bool
-	LatencyMs   *float64
-	HTTPStatus  *int
-}
-
-// InsertAvailability appends observations made by fromServerID.
+// InsertAvailability appends observations made by fromServerID. The series
+// store is written first, for the reason given on InsertMetrics.
 func (s *Store) InsertAvailability(fromServerID int64, records []Observation) error {
 	if len(records) == 0 {
+		return nil
+	}
+
+	if err := s.RecordProbes(fromServerID, records); err != nil {
+		return err
+	}
+	if !s.LegacyActive() {
 		return nil
 	}
 
@@ -841,13 +844,6 @@ func (s *Store) InsertAvailability(fromServerID int64, records []Observation) er
 	return nil
 }
 
-// MaxAvailabilityTimestamp returns the newest observation time recorded by a
-// given origin server, used to drop duplicates arriving from a peer resync.
-func (s *Store) MaxAvailabilityTimestamp(fromServerID int64) (model.Time, bool, error) {
-	return s.maxTimestamp(`SELECT MAX("Timestamp") FROM "AvailabilityRecords" WHERE "FromServerId"=?`,
-		"max availability timestamp", fromServerID)
-}
-
 // maxTimestamp runs a MAX("Timestamp") query, reporting through the bool
 // whether there was any row to take a maximum of.
 func (s *Store) maxTimestamp(query, what string, args ...any) (model.Time, bool, error) {
@@ -859,158 +855,6 @@ func (s *Store) maxTimestamp(query, what string, args ...any) (model.Time, bool,
 		return model.Time{}, false, nil
 	}
 	return model.FromDB(raw.Int64), true, nil
-}
-
-// AvailabilitySince returns every observation newer than since, from any
-// origin, for the dashboard's matrix. Edges touching a node the mesh has
-// removed are left out: the matrix is drawn from the servers that are listed,
-// and an edge to one that is not would be a cell with nowhere to go.
-func (s *Store) AvailabilitySince(since model.Time) ([]AvailabilityRow, error) {
-	rows, err := s.db.Query(`
-		SELECT f."Uid",t."Uid",a."Timestamp",a."IsAvailable",a."LatencyMs",a."HttpStatus"
-		FROM "AvailabilityRecords" a
-		JOIN "Servers" f ON f."Id"=a."FromServerId"
-		JOIN "Servers" t ON t."Id"=a."ToServerId"
-		WHERE a."Timestamp">=? AND f."Removed"=0 AND t."Removed"=0
-		ORDER BY a."Timestamp"`, since.DB())
-	if err != nil {
-		return nil, fmt.Errorf("availability since: %w", err)
-	}
-	defer rows.Close()
-
-	out := []AvailabilityRow{}
-	for rows.Next() {
-		var (
-			r  AvailabilityRow
-			ts int64
-		)
-		if err := rows.Scan(&r.FromUID, &r.ToUID, &ts, &r.IsAvailable, &r.LatencyMs, &r.HTTPStatus); err != nil {
-			return nil, fmt.Errorf("scan availability: %w", err)
-		}
-		r.Timestamp = model.FromDB(ts)
-		out = append(out, r)
-	}
-	return out, rows.Err()
-}
-
-// OwnAvailabilitySince returns the observations fromServerID itself made from
-// since onwards, in the form a peer is sent them.
-//
-// Only a node's own readings are its to forward - relaying what a peer reported
-// would duplicate it around the mesh - so the origin is a condition on the
-// index rather than a filter applied to every row afterwards.
-func (s *Store) OwnAvailabilitySince(fromServerID int64, since model.Time) ([]model.Availability, error) {
-	rows, err := s.db.Query(`
-		SELECT t."Uid",a."Timestamp",a."IsAvailable",a."LatencyMs",a."HttpStatus"
-		FROM "AvailabilityRecords" a
-		JOIN "Servers" t ON t."Id"=a."ToServerId"
-		WHERE a."FromServerId"=? AND a."Timestamp">=?
-		ORDER BY a."Timestamp"`, fromServerID, since.DB())
-	if err != nil {
-		return nil, fmt.Errorf("own availability since: %w", err)
-	}
-	defer rows.Close()
-
-	out := []model.Availability{}
-	for rows.Next() {
-		var (
-			a  model.Availability
-			ts int64
-		)
-		if err := rows.Scan(&a.ToServerID, &ts, &a.IsAvailable, &a.LatencyMs, &a.HTTPStatus); err != nil {
-			return nil, fmt.Errorf("scan own availability: %w", err)
-		}
-		a.Timestamp = model.FromDB(ts)
-		out = append(out, a)
-	}
-	return out, rows.Err()
-}
-
-// LatestAvailability reports the most recent observation on one edge of the
-// mesh. The second bool is false when that pair has never been measured, which
-// is not the same as having been measured as down.
-func (s *Store) LatestAvailability(fromServerID, toServerID int64) (available, found bool, err error) {
-	err = s.db.QueryRow(`
-		SELECT "IsAvailable" FROM "AvailabilityRecords"
-		WHERE "FromServerId"=? AND "ToServerId"=?
-		ORDER BY "Timestamp" DESC LIMIT 1`, fromServerID, toServerID).Scan(&available)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, false, nil
-	}
-	if err != nil {
-		return false, false, fmt.Errorf("latest availability %d->%d: %w", fromServerID, toServerID, err)
-	}
-	return available, true, nil
-}
-
-// Streak reports how one edge of the mesh currently stands and when it came to
-// stand that way: available is the state of the newest observation, and since
-// is the timestamp of the first observation in the unbroken run of that state.
-// found is false when the pair has never been measured.
-//
-// A node that has been unreachable for longer than the retention window has no
-// surviving observation of it being up, so the run appears to begin at the
-// oldest record still held. The reported duration is then a floor rather than
-// the true one, which for an outage already a week old is a distinction without
-// a difference.
-func (s *Store) Streak(fromServerID, toServerID int64) (available bool, since model.Time, found bool, err error) {
-	var newest int64
-	err = s.db.QueryRow(`
-		SELECT "IsAvailable","Timestamp" FROM "AvailabilityRecords"
-		WHERE "FromServerId"=? AND "ToServerId"=?
-		ORDER BY "Timestamp" DESC LIMIT 1`, fromServerID, toServerID).Scan(&available, &newest)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, model.Time{}, false, nil
-	}
-	if err != nil {
-		return false, model.Time{}, false, fmt.Errorf("streak %d->%d: %w", fromServerID, toServerID, err)
-	}
-
-	// The run began at the oldest observation newer than the last one that
-	// disagreed with it. The subquery is over the same index as the outer
-	// query, which is what keeps this two seeks rather than a scan.
-	var start sql.NullInt64
-	err = s.db.QueryRow(`
-		SELECT MIN("Timestamp") FROM "AvailabilityRecords"
-		WHERE "FromServerId"=? AND "ToServerId"=? AND "IsAvailable"=?
-		  AND "Timestamp" > COALESCE((
-		      SELECT MAX("Timestamp") FROM "AvailabilityRecords"
-		      WHERE "FromServerId"=? AND "ToServerId"=? AND "IsAvailable"<>?), -1)`,
-		fromServerID, toServerID, available, fromServerID, toServerID, available).Scan(&start)
-	if err != nil {
-		return false, model.Time{}, false, fmt.Errorf("streak start %d->%d: %w", fromServerID, toServerID, err)
-	}
-	if !start.Valid {
-		// Cannot happen while the row read above is still there, but a
-		// concurrent prune is cheaper to tolerate than to exclude.
-		return available, model.FromDB(newest), true, nil
-	}
-	return available, model.FromDB(start.Int64), true, nil
-}
-
-// AvailabilityHistory returns one edge's observations from since onwards.
-func (s *Store) AvailabilityHistory(fromServerID, toServerID int64, since model.Time) ([]Observation, error) {
-	rows, err := s.db.Query(`
-		SELECT "Timestamp","IsAvailable","LatencyMs","HttpStatus"
-		FROM "AvailabilityRecords"
-		WHERE "FromServerId"=? AND "ToServerId"=? AND "Timestamp">=?
-		ORDER BY "Timestamp"`, fromServerID, toServerID, since.DB())
-	if err != nil {
-		return nil, fmt.Errorf("availability history: %w", err)
-	}
-	defer rows.Close()
-
-	out := []Observation{}
-	for rows.Next() {
-		o := Observation{ToServerID: toServerID}
-		var ts int64
-		if err := rows.Scan(&ts, &o.IsAvailable, &o.LatencyMs, &o.HTTPStatus); err != nil {
-			return nil, fmt.Errorf("scan availability history: %w", err)
-		}
-		o.Timestamp = model.FromDB(ts)
-		out = append(out, o)
-	}
-	return out, rows.Err()
 }
 
 // ── Alert notices ───────────────────────────────────────────────────────────
@@ -1116,8 +960,19 @@ func (s *Store) OwnNoticesSince(fromServerID int64, since model.Time) ([]model.N
 
 // ── Retention ───────────────────────────────────────────────────────────────
 
-// Prune deletes metric and availability rows older than cutoff.
-func (s *Store) Prune(cutoff model.Time) error {
+// Prune enforces retention on the two things that are not in the series store.
+//
+// The cutoffs differ because the tables do. The compatibility tables are
+// written for a rollback that will not happen after the first day, so they are
+// swept aggressively; what the mesh has already announced has to outlive the
+// interval an alert repeats on, which an operator may set to days, so it is
+// swept at whatever the configuration asks for.
+func (s *Store) Prune(legacy, notices model.Time) error {
+	if !s.LegacyActive() {
+		return s.pruneNotices(notices)
+	}
+	cutoff := legacy
+
 	// Before their snapshots: once the rows identifying them are gone, the
 	// volumes cannot be found to delete.
 	if _, err := s.db.Exec(`
@@ -1131,6 +986,13 @@ func (s *Store) Prune(cutoff model.Time) error {
 	if _, err := s.db.Exec(`DELETE FROM "AvailabilityRecords" WHERE "Timestamp"<?`, cutoff.DB()); err != nil {
 		return fmt.Errorf("prune availability: %w", err)
 	}
+	return s.pruneNotices(notices)
+}
+
+// pruneNotices sweeps the one table that outlives the retirement of the other
+// three: what the mesh has already announced is not a measurement, so it has
+// no series to move into.
+func (s *Store) pruneNotices(cutoff model.Time) error {
 	if _, err := s.db.Exec(`DELETE FROM "AlertNotices" WHERE "Timestamp"<?`, cutoff.DB()); err != nil {
 		return fmt.Errorf("prune alert notices: %w", err)
 	}

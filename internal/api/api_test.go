@@ -12,39 +12,9 @@ import (
 	"github.com/m0n5ter/m0nit0r/internal/auth"
 	"github.com/m0n5ter/m0nit0r/internal/model"
 	"github.com/m0n5ter/m0nit0r/internal/peer"
+	"github.com/m0n5ter/m0nit0r/internal/series"
 	"github.com/m0n5ter/m0nit0r/internal/store"
 )
-
-// The dashboard's presets are the windows this has to answer for, and what
-// matters is the same for each: a bucket a person can name, and few enough
-// points that the chart is drawing data rather than pixels. The hour is
-// exempt by design - it is the live view, where every sample is the point.
-func TestBucketForKeepsThePresetsDrawable(t *testing.T) {
-	for _, tc := range []struct {
-		hours int
-		want  time.Duration
-	}{
-		{1, 0},
-		{6, time.Minute},
-		{24, 5 * time.Minute},
-		{72, 15 * time.Minute},
-		{168, 30 * time.Minute},
-	} {
-		window := time.Duration(tc.hours) * time.Hour
-
-		got := bucketFor(window)
-		if got != tc.want {
-			t.Errorf("bucketFor(%dh) = %v, want %v", tc.hours, got, tc.want)
-			continue
-		}
-		if got == 0 {
-			continue
-		}
-		if points := int(window / got); points > maxPoints {
-			t.Errorf("%dh in %v buckets is %d points, over the %d budget", tc.hours, got, points, maxPoints)
-		}
-	}
-}
 
 // node is one m0nit0r instance served over a real HTTP listener, which is what
 // makes the exchange below the actual peer protocol rather than two stores
@@ -242,7 +212,7 @@ func TestPushOnlyNodeIsRecordedAndToldAboutTheMesh(t *testing.T) {
 		}
 	}
 
-	latest, err := hub.store.LatestMetric(srv.ID)
+	latest, err := hub.store.LatestMetricSeries(srv.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -611,5 +581,167 @@ func TestRemovalTravelsTheMeshAndTheRemovedNodeIsTurnedAway(t *testing.T) {
 		ServerID: victim.uid, SelfURL: victim.server.URL,
 	}); !res.OK {
 		t.Errorf("the readmitted node is still turned away, status %v", res.Status)
+	}
+}
+
+// ── The series form on the wire ─────────────────────────────────────────────
+
+// TestSeriesCrossTheWire is the whole of the second revision of the protocol
+// in one exchange: a node's readings and its sealed buckets reach a peer, come
+// out of the peer's own store as the same numbers, and do so without the
+// original form of the payload being sent at all.
+func TestSeriesCrossTheWire(t *testing.T) {
+	sender := newNode(t, "11111111-1111-4111-8111-111111111111", "sender", false)
+	receiver := newNode(t, "22222222-2222-4222-8222-222222222222", "receiver", false)
+
+	base := model.At(time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC))
+
+	// A minute of the sender's own readings, rolled up the way its own worker
+	// would once the buckets had sealed.
+	metrics := make([]model.Metric, 0, 12)
+	for i := range 12 {
+		temp := float64(40 + i)
+		metrics = append(metrics, model.Metric{
+			Timestamp:     model.At(base.Add(time.Duration(i) * 5 * time.Second)),
+			CpuPercent:    float64(i),
+			CpuTempC:      &temp,
+			MemoryPercent: 50,
+			MemoryTotalMb: 16384,
+			MemoryUsedMb:  8192,
+			UptimeSeconds: float64(1000 + i*5),
+			Disks:         []model.Disk{{Name: "/", TotalGb: 500, UsedGb: float64(100 + i)}},
+		})
+	}
+	if err := sender.store.RecordSnapshots(sender.id, metrics); err != nil {
+		t.Fatal(err)
+	}
+
+	first := series.Bucket(base.DB(), series.L30s)
+	if _, err := sender.store.RollSamples(first, first+2); err != nil {
+		t.Fatal(err)
+	}
+
+	samples, _, err := sender.store.OwnSamplesSince(sender.id, model.At(base.Add(-time.Hour)), 10000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rollups, _, err := sender.store.OwnRollups(sender.id, series.L30s, first-1, first+1, 10000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(samples) == 0 || len(rollups) == 0 {
+		t.Fatalf("nothing to send: %d samples, %d buckets", len(samples), len(rollups))
+	}
+
+	sender.sync(t, receiver, model.SyncPayload{
+		Protocol: model.ProtocolVersion,
+		Samples:  samples,
+		Rollups:  rollups,
+	})
+
+	// The receiver has to have resolved the sender to one of its own rows, and
+	// the drive to one of its own volume ids, without either travelling as a
+	// number that only means something where it came from.
+	stored, found, err := receiver.store.ServerByUID(sender.uid)
+	if err != nil || !found {
+		t.Fatalf("the sender is not in the receiver's register: found=%v err=%v", found, err)
+	}
+	if stored.Protocol != model.ProtocolVersion {
+		t.Errorf("the receiver recorded protocol %d, want %d", stored.Protocol, model.ProtocolVersion)
+	}
+
+	raw, err := receiver.store.MetricsRaw(stored.ID, model.At(base.Add(-time.Hour)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(raw) != 12 {
+		t.Fatalf("the receiver holds %d of the sender's 12 readings", len(raw))
+	}
+	if raw[0].CpuPercent != 0 || raw[11].CpuPercent != 11 {
+		t.Errorf("readings came back as %v..%v, want 0..11", raw[0].CpuPercent, raw[11].CpuPercent)
+	}
+	if raw[0].CpuTempC == nil || *raw[0].CpuTempC != 40 {
+		t.Errorf("temperature came back as %v, want 40", raw[0].CpuTempC)
+	}
+	if len(raw[11].Disks) != 1 || raw[11].Disks[0].Name != "/" || raw[11].Disks[0].UsedGb != 111 {
+		t.Errorf("the drive came back as %+v, want / at 111 GB used", raw[11].Disks)
+	}
+
+	// And the aggregates arrive as aggregates, not as something recomputed
+	// here from the samples that happened to come with them.
+	buckets, err := receiver.store.MetricsAtLevel(stored.ID, series.L30s, first, first+1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(buckets) != 2 {
+		t.Fatalf("the receiver holds %d of the sender's 2 buckets", len(buckets))
+	}
+	if buckets[0].CpuPercent != 2.5 || buckets[1].CpuPercent != 8.5 {
+		t.Errorf("bucket averages are %v and %v, want 2.5 and 8.5",
+			buckets[0].CpuPercent, buckets[1].CpuPercent)
+	}
+	if buckets[1].UptimeSeconds != 1055 {
+		t.Errorf("uptime is %v, want 1055 from the newest reading in the bucket", buckets[1].UptimeSeconds)
+	}
+}
+
+// TestALegacyPeerIsStillUnderstood: a node that predates the series form sends
+// the original payload and no version at all. Its readings have to end up in
+// the series store all the same, because that is the only place anything is
+// read from any more.
+func TestALegacyPeerIsStillUnderstood(t *testing.T) {
+	old := newNode(t, "11111111-1111-4111-8111-111111111111", "old", false)
+	fresh := newNode(t, "22222222-2222-4222-8222-222222222222", "fresh", false)
+
+	at := model.Now()
+	temp := 55.5
+	third := "33333333-3333-4333-8333-333333333333"
+	latency := 12.5
+
+	old.sync(t, fresh, model.SyncPayload{
+		Metrics: []model.Metric{{
+			Timestamp: at, CpuPercent: 42, CpuTempC: &temp,
+			MemoryPercent: 61, MemoryTotalMb: 8192, MemoryUsedMb: 5000,
+			Disks: []model.Disk{{Name: "C:", TotalGb: 250, UsedGb: 100}},
+		}},
+		Availability: []model.Availability{{
+			ToServerID: third, Timestamp: at, IsAvailable: true, LatencyMs: &latency,
+		}},
+	})
+
+	stored, found, err := fresh.store.ServerByUID(old.uid)
+	if err != nil || !found {
+		t.Fatalf("the old node is not in the register: found=%v err=%v", found, err)
+	}
+	if stored.Protocol != 0 {
+		t.Errorf("recorded protocol %d for a node that sent none, want 0", stored.Protocol)
+	}
+
+	latest, err := fresh.store.LatestMetricSeries(stored.ID)
+	if err != nil || latest == nil {
+		t.Fatalf("the old node's reading did not reach the series store: %+v %v", latest, err)
+	}
+	if latest.CpuPercent != 42 || latest.CpuTempC == nil || *latest.CpuTempC != 55.5 {
+		t.Errorf("reading came back as %+v, want its numbers unchanged", latest)
+	}
+	if len(latest.Disks) != 1 || latest.Disks[0].Name != "C:" {
+		t.Errorf("the drive came back as %+v", latest.Disks)
+	}
+
+	// Its opinion of a third node it can see has to become an edge here too,
+	// even though this node has never heard of that third one.
+	target, err := fresh.store.EnsureServer(third)
+	if err != nil {
+		t.Fatal(err)
+	}
+	points, err := fresh.store.EdgeRaw(stored.ID, target, model.At(time.Now().Add(-time.Hour)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(points) != 1 {
+		t.Fatalf("the old node's check on a third node arrived as %d edges, want 1", len(points))
+	}
+	if points[0].LatencyMs == nil || *points[0].LatencyMs != 12.5 {
+		t.Errorf("latency came back as %v, want 12.5", points[0].LatencyMs)
 	}
 }

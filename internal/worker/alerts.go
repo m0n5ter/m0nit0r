@@ -124,7 +124,7 @@ func (w *Alerts) rankDelay(servers []model.Server) time.Duration {
 // consider decides whether one peer's current state is worth announcing, and
 // announces it.
 func (w *Alerts) consider(ctx context.Context, srv model.Server, delay time.Duration) error {
-	available, since, found, err := w.Store.Streak(w.ServerID, srv.ID)
+	available, since, found, err := w.Store.EdgeStreak(w.ServerID, srv.ID)
 	if err != nil {
 		return err
 	}
