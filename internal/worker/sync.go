@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"log/slog"
+	"net/http"
 	"sync"
 	"time"
 
@@ -178,9 +179,10 @@ func (w *Sync) watchPushOnly(timestamp model.Time) error {
 // else trickle in through that neighbour's reachability reports as nameless
 // rows nothing is ever collected for.
 //
-// A server already known is left alone, apart from one that is only such a
-// nameless row; that is what keeps a peer the operator removed here from being
-// brought back by a neighbour.
+// A server already known is left alone, apart from one carrying no address:
+// either such a nameless row, or a node just added back into the mesh, whose
+// address only its neighbours know. A node the mesh has removed is not among
+// them - its tombstone is what a neighbour's peer list cannot overrule.
 func (w *Sync) learnPeers(replies []*model.SyncReply) {
 	for _, reply := range replies {
 		if reply == nil {
@@ -218,6 +220,20 @@ func advance(mark *model.Time, t model.Time) {
 // back whatever the peer replied with.
 func (w *Sync) push(ctx context.Context, target model.Server, payload model.SyncPayload, timestamp model.Time) *model.SyncReply {
 	res := w.Client.PushSync(ctx, target.URL, payload)
+
+	// The peer says this node was removed from its mesh. That is not an
+	// outage - there is nothing wrong with either end - so it is not recorded
+	// as one; the peer is simply dropped, and with it the rest of the mesh as
+	// each of them answers the same way. Nothing is announced from here: the
+	// decision was somebody else's, and leaving it unrecorded is what lets the
+	// peer's first push back in if this node is ever added again.
+	if res.Status != nil && *res.Status == http.StatusGone {
+		w.Log.Info("peer says this node was removed from its mesh", "peer", target.Name)
+		if err := w.Store.ForgetPeer(target.ID); err != nil {
+			w.Log.Error("forget peer", "peer", target.Name, "err", err)
+		}
+		return nil
+	}
 
 	if err := w.Store.InsertAvailability(w.ServerID, []store.Observation{{
 		ToServerID:  target.ID,
@@ -264,6 +280,17 @@ func (w *Sync) buildPayload() (model.SyncPayload, watermarks, error) {
 		return model.SyncPayload{}, marks, err
 	}
 
+	// Which nodes have been taken out of the mesh, and which have been added
+	// back. Unlike the three streams above this is not a window: it is every
+	// decision this node holds, repeated in full each round, whoever made it.
+	// It is one row per node ever removed, so it costs nothing to resend, and
+	// resending is what carries a removal to a node that was down when it was
+	// made or that the removing node does not push to at all.
+	removals, err := w.Store.Membership()
+	if err != nil {
+		return model.SyncPayload{}, marks, err
+	}
+
 	for _, m := range metrics {
 		advance(&marks.metric, m.Timestamp)
 	}
@@ -284,5 +311,6 @@ func (w *Sync) buildPayload() (model.SyncPayload, watermarks, error) {
 		Metrics:      metrics,
 		Availability: availability,
 		Notices:      notices,
+		Removals:     removals,
 	}, marks, nil
 }

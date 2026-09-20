@@ -629,3 +629,197 @@ func TestOpenAddsTheAlertingColumnToAnExistingRegister(t *testing.T) {
 		t.Error("the row did not take the alerting flag after the column was added")
 	}
 }
+
+// open is a fresh store on a temporary database.
+func open(t *testing.T) *Store {
+	t.Helper()
+
+	s, err := Open(filepath.Join(t.TempDir(), "monitor.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+	return s
+}
+
+// TestMembershipKeepsTheLatestDecision is what lets the same announcements
+// reach a node by several routes, in any order, as often as the rounds repeat
+// them, and still leave every node holding the same answer.
+func TestMembershipKeepsTheLatestDecision(t *testing.T) {
+	const (
+		self = "11111111-1111-4111-8111-111111111111"
+		peer = "22222222-2222-4222-8222-222222222222"
+	)
+	s := open(t)
+
+	if _, err := s.UpsertSelf(self, "self", "Lab", "http://self:5001", false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UpsertPeer(peer, "peer", "Lab", "http://peer:5001", false, model.Now()); err != nil {
+		t.Fatal(err)
+	}
+
+	removed := model.Now()
+	if changed, err := s.SetMembership(peer, true, removed); err != nil || !changed {
+		t.Fatalf("removing the peer: changed=%v err=%v", changed, err)
+	}
+	if peers, err := s.ListPeers(); err != nil || len(peers) != 0 {
+		t.Fatalf("a removed peer is still synced with: %+v err=%v", peers, err)
+	}
+	if gone, err := s.IsRemoved(peer); err != nil || !gone {
+		t.Fatalf("IsRemoved = %v, err=%v, want the removal to be visible to the peer endpoints", gone, err)
+	}
+
+	// An older decision arriving afterwards - a neighbour repeating what it
+	// knew before it heard - must not undo the newer one.
+	stale := model.At(removed.Add(-time.Hour))
+	if changed, err := s.SetMembership(peer, false, stale); err != nil || changed {
+		t.Fatalf("a stale readmission was applied: changed=%v err=%v", changed, err)
+	}
+	if gone, _ := s.IsRemoved(peer); !gone {
+		t.Error("the peer came back on the strength of a decision older than the removal")
+	}
+
+	// The same removal repeated, as every round repeats it, is not a change.
+	if changed, err := s.SetMembership(peer, true, removed); err != nil || changed {
+		t.Fatalf("a repeated removal read as a change: changed=%v err=%v", changed, err)
+	}
+
+	back := model.At(removed.Add(time.Hour))
+	if changed, err := s.SetMembership(peer, false, back); err != nil || !changed {
+		t.Fatalf("adding the peer back: changed=%v err=%v", changed, err)
+	}
+	if gone, _ := s.IsRemoved(peer); gone {
+		t.Error("the peer is still refused after being added back")
+	}
+
+	// A node has no way of being talked out of its own identity.
+	if changed, err := s.SetMembership(self, true, back); err != nil || changed {
+		t.Fatalf("a node removed itself: changed=%v err=%v", changed, err)
+	}
+	if gone, _ := s.IsRemoved(self); gone {
+		t.Fatal("the node removed itself, losing its history and its place in every matrix")
+	}
+
+	// A removal about a node this one has never met is still recorded, or the
+	// mesh would readmit the node through whoever meets it next.
+	const stranger = "33333333-3333-4333-8333-333333333333"
+	if changed, err := s.SetMembership(stranger, true, back); err != nil || !changed {
+		t.Fatalf("removing an unknown node: changed=%v err=%v", changed, err)
+	}
+	if learned, err := s.AddPeerIfUnknown(stranger, "stranger", "Lab", "http://stranger:5001", false); err != nil || learned {
+		t.Fatalf("a neighbour introduced a removed node: learned=%v err=%v", learned, err)
+	}
+
+	// What travels is every decision, whoever made it and however long ago.
+	decisions, err := s.Membership()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(decisions) != 2 {
+		t.Fatalf("%d decisions to publish, want the peer's and the stranger's: %+v", len(decisions), decisions)
+	}
+	for _, d := range decisions {
+		if d.ServerID == peer && (d.Removed || !d.Timestamp.Equal(back.Time)) {
+			t.Errorf("the peer travels as %+v, want a readmission stamped %v", d, back)
+		}
+		if d.ServerID == stranger && !d.Removed {
+			t.Errorf("the stranger travels as %+v, want a removal", d)
+		}
+	}
+}
+
+// legacyServers is the register as builds before membership was recorded wrote
+// it. Those builds took a peer out by clearing its address and nothing else.
+const legacyServers = `
+CREATE TABLE "Servers" (
+    "Id"       INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+    "Uid"      TEXT NOT NULL UNIQUE,
+    "Name"     TEXT NOT NULL,
+    "Location" TEXT NOT NULL,
+    "Url"      TEXT NULL,
+    "IsSelf"   INTEGER NOT NULL,
+    "Alerts"   INTEGER NOT NULL DEFAULT 0,
+    "PushOnly" INTEGER NOT NULL DEFAULT 0,
+    "LastSeen" INTEGER NOT NULL
+);`
+
+// TestLegacyRemovalsSurviveTheUpgrade covers the one thing the new column
+// changes about an existing node: removals that were only ever implied by the
+// shape of a row are written down, so that the listing this build learns peers
+// back into does not undo them - and are left unstamped, so that upgrading a
+// node announces nothing to the rest of the mesh.
+func TestLegacyRemovalsSurviveTheUpgrade(t *testing.T) {
+	const (
+		self      = "11111111-1111-4111-8111-111111111111"
+		dropped   = "22222222-2222-4222-8222-222222222222"
+		unmet     = "33333333-3333-4333-8333-333333333333"
+		reachable = "44444444-4444-4444-8444-444444444444"
+	)
+	path := filepath.Join(t.TempDir(), "monitor.db")
+
+	existing, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := existing.Exec(legacyServers); err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range []struct {
+		uid, name, url string
+		self           bool
+		lastSeen       int64
+	}{
+		{self, "self", "http://self:5001", true, model.Now().DB()},
+		// Taken out on this dashboard: named, once reached, no address left.
+		{dropped, "dropped", "", false, model.Now().DB()},
+		// Never met: standing in for its own name, never reached.
+		{unmet, unmet, "", false, model.Time{}.DB()},
+		{reachable, "reachable", "http://reachable:5001", false, model.Now().DB()},
+	} {
+		var url any
+		if row.url != "" {
+			url = row.url
+		}
+		if _, err := existing.Exec(`
+			INSERT INTO "Servers" ("Uid","Name","Location","Url","IsSelf","LastSeen")
+			VALUES (?,?,'Lab',?,?,?)`, row.uid, row.name, url, row.self, row.lastSeen); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := existing.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	if gone, err := s.IsRemoved(dropped); err != nil || !gone {
+		t.Errorf("the peer this node had dropped reads as present again: gone=%v err=%v", gone, err)
+	}
+	if learned, err := s.AddPeerIfUnknown(dropped, "dropped", "Lab", "http://dropped:5001", false); err != nil || learned {
+		t.Errorf("a neighbour brought back a peer dropped before the upgrade: learned=%v err=%v", learned, err)
+	}
+	// The unmet row is the one that has to stay completable, or the ids a new
+	// neighbour brings with it would never turn into nodes to sync with.
+	if learned, err := s.AddPeerIfUnknown(unmet, "unmet", "Lab", "http://unmet:5001", false); err != nil || !learned {
+		t.Errorf("an unmet node can no longer be introduced: learned=%v err=%v", learned, err)
+	}
+
+	peers, err := s.ListPeers()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(peers) != 2 {
+		t.Errorf("%d peers to sync with, want the reachable one and the newly introduced one: %+v", len(peers), peers)
+	}
+
+	// Nothing is announced: these decisions were made silently, possibly long
+	// ago, and an upgrade is no occasion to broadcast them.
+	if decisions, err := s.Membership(); err != nil || len(decisions) != 0 {
+		t.Errorf("upgrading published %+v, err=%v, want nothing", decisions, err)
+	}
+}

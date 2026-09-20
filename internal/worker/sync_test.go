@@ -2,11 +2,14 @@ package worker
 
 import (
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/m0n5ter/m0nit0r/internal/model"
+	"github.com/m0n5ter/m0nit0r/internal/peer"
 	"github.com/m0n5ter/m0nit0r/internal/store"
 )
 
@@ -116,11 +119,10 @@ func TestLearnPeersAddsOnlyTheUnknown(t *testing.T) {
 	if _, err := s.UpsertSelf(testRoamUID, "roamer", "Car", "", false); err != nil {
 		t.Fatal(err)
 	}
-	removed, err := s.UpsertPeer(testOtherUID, "removed", "Lab", "http://removed:5001", false, model.Now())
-	if err != nil {
+	if _, err := s.UpsertPeer(testOtherUID, "removed", "Lab", "http://removed:5001", false, model.Now()); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.SetPeerURL(removed, ""); err != nil {
+	if _, err := s.SetMembership(testOtherUID, true, model.Now()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -175,5 +177,48 @@ func TestLearnPeersCompletesAPlaceholder(t *testing.T) {
 	}
 	if peers[0].Name != "third" || peers[0].Location != "Roof" || peers[0].URL != "http://third:5001" {
 		t.Errorf("the placeholder was not completed: %+v", peers[0])
+	}
+}
+
+// TestPushToAPeerThatRemovedUsDropsIt: a removed node is not pushed to and not
+// probed, so the refusal of its own push is the only way it is ever told. It
+// has to act on it - and not file it as an outage, since nothing is down.
+func TestPushDroppedByAPeerThatRemovedThisNode(t *testing.T) {
+	s, w, _ := hubWithRoamer(t, time.Now())
+	w.Client = peer.New("")
+
+	gone := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		http.Error(rw, "this server was removed from the mesh", http.StatusGone)
+	}))
+	t.Cleanup(gone.Close)
+
+	target, err := s.UpsertPeer(testOtherUID, "former", "Lab", gone.URL, false, model.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	w.push(t.Context(), model.Server{ID: target, UID: testOtherUID, Name: "former", URL: gone.URL},
+		model.SyncPayload{ServerID: testSelfUID}, model.Now())
+
+	peers, err := s.ListPeers()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range peers {
+		if p.UID == testOtherUID {
+			t.Errorf("still syncing with the peer that turned this node away: %+v", p)
+		}
+	}
+	history, err := s.AvailabilityHistory(w.ServerID, target, model.At(time.Now().Add(-time.Hour)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(history) != 0 {
+		t.Errorf("being removed was recorded as %d outages: %+v", len(history), history)
+	}
+	// The decision was somebody else's, so nothing is announced from here -
+	// and the peer's own first push back in is enough to restore them.
+	if decisions, err := s.Membership(); err != nil || len(decisions) != 0 {
+		t.Errorf("dropping the peer published %+v, err=%v, want nothing", decisions, err)
 	}
 }

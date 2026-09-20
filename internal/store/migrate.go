@@ -3,6 +3,8 @@ package store
 import (
 	"database/sql"
 	"fmt"
+
+	"github.com/m0n5ter/m0nit0r/internal/model"
 )
 
 // epochDays is the Julian day number of 1970-01-01, which is what turns
@@ -156,6 +158,8 @@ func addColumns(db *sql.DB) error {
 	for _, col := range []struct{ table, name, decl string }{
 		{"Servers", "Alerts", `"Alerts" INTEGER NOT NULL DEFAULT 0`},
 		{"Servers", "PushOnly", `"PushOnly" INTEGER NOT NULL DEFAULT 0`},
+		{"Servers", "Removed", `"Removed" INTEGER NOT NULL DEFAULT 0`},
+		{"Servers", "MemberAt", `"MemberAt" INTEGER NOT NULL DEFAULT 0`},
 	} {
 		present, err := hasColumn(db, col.table, col.name)
 		if err != nil {
@@ -167,6 +171,41 @@ func addColumns(db *sql.DB) error {
 		if _, err := db.Exec(`ALTER TABLE "` + col.table + `" ADD COLUMN ` + col.decl); err != nil {
 			return fmt.Errorf("add %s.%s: %w", col.table, col.name, err)
 		}
+		if col.name == "Removed" {
+			if err := markLegacyRemovals(db); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// markLegacyRemovals turns the peers an earlier build had dropped into the
+// tombstones this one keeps them as, and is run once, on the database where the
+// column was just added.
+//
+// That build recorded a removal by clearing the peer's address and nothing
+// else, and told a neighbour's introduction from a removed peer apart by how
+// the row looked: a node nobody had been introduced to yet stood in for its own
+// name and had never been reached, so a row that had a name of its own and a
+// time it was last reached, and no address, was one somebody had taken out.
+// Reading that off the shape of a row is exactly what the tombstone replaces,
+// so the inference is made one final time here and written down.
+//
+// The decisions are left unstamped, which keeps them off the wire. They were
+// never announced when they were made, the nodes they concern may well have
+// been legitimately re-added elsewhere in the months since, and a build being
+// upgraded is no occasion to broadcast a removal nobody has just asked for.
+func markLegacyRemovals(db *sql.DB) error {
+	// The stamp an unmet node is registered with is the zero time, which is a
+	// long way from zero milliseconds - so it is compared against by value
+	// rather than assumed to be falsy.
+	_, err := db.Exec(`
+		UPDATE "Servers" SET "Removed"=1
+		WHERE "IsSelf"=0 AND "PushOnly"=0 AND "Url" IS NULL
+			AND "LastSeen"<>? AND "Name"<>"Uid"`, model.Time{}.DB())
+	if err != nil {
+		return fmt.Errorf("mark legacy removals: %w", err)
 	}
 	return nil
 }

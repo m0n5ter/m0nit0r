@@ -143,8 +143,13 @@ fun PeersScreen(viewModel: PeersViewModel) {
     pendingRemoval?.let { peer ->
         AlertDialog(
             onDismissRequest = { pendingRemoval = null },
-            title = { Text("Stop syncing with ${peer.name}?") },
-            text = { Text("Its collected history stays on this node, but it stops receiving updates until re-added.") },
+            title = { Text("Remove ${peer.name} from the mesh?") },
+            text = {
+                Text(
+                    "Every node drops it, not just this one, and it stops being monitored anywhere. " +
+                        "Collected history is kept until it ages out. Adding it back here lets it rejoin.",
+                )
+            },
             confirmButton = {
                 TextButton(onClick = {
                     viewModel.removePeer(peer.id)

@@ -234,6 +234,9 @@ func (s *Server) handleIntroduce(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
+	if s.refuseRemoved(w, req.ServerID) {
+		return
+	}
 
 	// An introduction without a reachable address tells us nothing worth
 	// storing, so record the caller only when both id and URL are present -
@@ -270,6 +273,20 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Before anything is stored: a node that was taken out of this mesh must
+	// not be able to put itself back into the register simply by going on
+	// pushing. The refusal is also what tells it, since nobody can rely on
+	// reaching it to say so - see refuseRemoved.
+	if s.refuseRemoved(w, payload.ServerID) {
+		return
+	}
+
+	// Ahead of the peer's own data, so that a removal it is carrying about a
+	// third node takes effect in the same request that brings that node's
+	// readings - and so that a removal of a node whose id has never been seen
+	// here has a row to be written on before the readings make a live one.
+	s.applyRemovals(payload)
+
 	peerID, err := s.Store.UpsertPeer(payload.ServerID, payload.ServerName, payload.Location,
 		peer.NormalizeURL(payload.SelfURL), payload.Alerts, model.Now())
 	if err == nil {
@@ -298,6 +315,56 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.replyWithPeers(w, payload.ServerID)
+}
+
+// refuseRemoved rejects a peer-protocol call from a node this mesh has removed,
+// and reports whether it did.
+//
+// The status is the message. A removed node is not pushed to and not probed, so
+// the reply to its own pushes is the only channel left to reach it on, and 410
+// is what its sync worker reads as "this peer is not mine any more" and drops
+// the peer on. Once the removal has travelled the mesh - which it does in the
+// ordinary pushes - every remaining node answers it the same way, and it stops
+// syncing with all of them without anybody having to reach it.
+func (s *Server) refuseRemoved(w http.ResponseWriter, uid string) bool {
+	if uid == "" {
+		return false
+	}
+	removed, err := s.Store.IsRemoved(uid)
+	if err != nil {
+		s.Log.Error("check removed peer", "peer", uid, "err", err)
+		http.Error(w, "failed to check membership", http.StatusInternalServerError)
+		return true
+	}
+	if removed {
+		s.Log.Debug("refused removed peer", "peer", uid)
+		http.Error(w, "this server was removed from the mesh", http.StatusGone)
+		return true
+	}
+	return false
+}
+
+// applyRemovals takes in the membership decisions a peer carried. Failures are
+// logged and not returned: the rest of the payload is worth storing either way,
+// and the next round brings the same list again.
+func (s *Server) applyRemovals(payload model.SyncPayload) {
+	for _, r := range payload.Removals {
+		// A node is not removable from its own database - it would erase its
+		// own history and its place in every matrix - and the decision to
+		// remove the peer that is delivering it was evidently reversed.
+		if r.ServerID == "" || r.ServerID == s.ServerUID || r.ServerID == payload.ServerID {
+			continue
+		}
+		changed, err := s.Store.SetMembership(r.ServerID, r.Removed, r.Timestamp)
+		if err != nil {
+			s.Log.Error("apply removal", "peer", r.ServerID, "err", err)
+			continue
+		}
+		if changed {
+			s.Log.Info("mesh membership changed", "peer", r.ServerID,
+				"removed", r.Removed, "via", payload.ServerName)
+		}
+	}
 }
 
 // replyWithPeers answers a sync with the peers this node pushes to, which is
@@ -702,6 +769,17 @@ func (s *Server) handleAddPeer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Adding a node back is the one thing that lifts a removal, and it has to
+	// happen before the peer is written: the tombstone is what keeps the row
+	// out of every listing, so the address stored below would otherwise be
+	// stored onto a node that stays invisible. The decision travels with this
+	// node's next pushes, and the neighbours that still hold the removal stop
+	// refusing the peer as it reaches them.
+	if _, err := s.Store.SetMembership(identity.ServerID, false, model.Now()); err != nil {
+		s.fail(w, "readmit peer", err)
+		return
+	}
+
 	// LastSeen records when this server observed the peer, so it uses the local
 	// clock rather than the timestamp the peer reported about itself.
 	if _, err := s.Store.UpsertPeer(identity.ServerID, identity.ServerName, identity.Location, url,
@@ -754,6 +832,15 @@ func (s *Server) crossIntroduce(ctx context.Context, existing []model.Server, id
 	wg.Wait()
 }
 
+// handleRemovePeer takes a node out of the mesh - here and, as the decision
+// travels in this node's pushes, everywhere else.
+//
+// Nothing is deleted. The row stays as the record of the removal: it is what
+// stops the node being learned back from a neighbour that has not heard yet,
+// what stops the node itself registering again with its next push, and what
+// there is to tell the other nodes with. Its history stays too, unreadable from
+// the dashboard because the node is no longer listed, and ages out with
+// retention like anything else.
 func (s *Server) handleRemovePeer(w http.ResponseWriter, r *http.Request) {
 	srv, found, err := s.Store.ServerByUID(r.PathValue("id"))
 	if err != nil {
@@ -769,18 +856,11 @@ func (s *Server) handleRemovePeer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Clearing the address stops syncing but keeps the collected history, which
-	// is what the dashboard warns the operator will happen. A push-only peer
-	// has no address to clear; dropping the flag is what stops it being
-	// watched for pushes. Either comes back if the node keeps syncing here.
-	if err := s.Store.SetPeerURL(srv.ID, ""); err != nil {
-		s.fail(w, "clear peer url", err)
+	if _, err := s.Store.SetMembership(srv.UID, true, model.Now()); err != nil {
+		s.fail(w, "remove peer", err)
 		return
 	}
-	if err := s.Store.SetPushOnly(srv.ID, false); err != nil {
-		s.fail(w, "clear push-only", err)
-		return
-	}
+	s.Log.Info("removed peer from mesh", "peer", srv.Name, "uid", srv.UID)
 	w.WriteHeader(http.StatusOK)
 }
 

@@ -1720,7 +1720,9 @@ async function addPeer() {
 }
 
 async function removePeer(id, name) {
-    if (!confirm('Remove peer "' + name + '"?\n\nHistorical data will be kept.')) return;
+    if (!confirm('Remove "' + name + '" from the mesh?\n\nEvery node drops it: it stops being monitored '
+        + 'anywhere, not just here. Collected history is kept until it ages out. '
+        + 'Adding it back here lets it rejoin.')) return;
     const resp = await api('/api/peers/' + encodeURIComponent(id), { method: 'DELETE' });
     if (resp.ok) {
         if (selectedId === id) selectedId = null;

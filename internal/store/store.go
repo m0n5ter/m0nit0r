@@ -30,6 +30,16 @@ CREATE TABLE IF NOT EXISTS "Servers" (
     "IsSelf"   INTEGER NOT NULL,
     "Alerts"   INTEGER NOT NULL DEFAULT 0,
     "PushOnly" INTEGER NOT NULL DEFAULT 0,
+    -- Whether the operator took this node out of the mesh, and when that was
+    -- decided. The row outlives the membership: it is the tombstone that keeps
+    -- a removed node from being learned back from a neighbour or registering
+    -- itself again by pushing here, and MemberAt is what orders one decision
+    -- against another when they meet. A zero MemberAt means no decision has
+    -- ever been announced about this node, so nothing about it is published to
+    -- the mesh - which is also how a removal inherited from a database written
+    -- before this column existed stays local to the node that made it.
+    "Removed"  INTEGER NOT NULL DEFAULT 0,
+    "MemberAt" INTEGER NOT NULL DEFAULT 0,
     "LastSeen" INTEGER NOT NULL
 );
 
@@ -315,19 +325,18 @@ func (s *Store) SetPushOnly(id int64, pushOnly bool) error {
 }
 
 // AddPeerIfUnknown registers a peer that some other node named, and reports
-// whether it was new. A server this node already holds a row for is left
-// exactly as it is - in particular one whose address was cleared when it was
-// removed, which hearing about it second-hand must not undo.
+// whether it was new. A server this node already syncs with is left exactly as
+// it is, and one it removed from the mesh is not brought back by hearing about
+// it second-hand: the tombstone is what a neighbour's introduction cannot
+// overrule, and readmitting the node is what lifts it.
 //
-// The exception is a row EnsureServer put there: an id seen in somebody's
-// reachability report, standing in for its own name and carrying no address.
-// That is not a node anybody chose to keep or to drop, only one this node has
-// not been introduced to yet, so the introduction is allowed to complete it -
-// which is what turns the bare ids a new neighbour brings with it into nodes
-// this one syncs with. The conditions are what distinguish such a row from a
-// removed peer: that one keeps the name it was known by, and the time it was
-// last reached - the unset stamp compared against here being the very one an
-// unmet node is registered with.
+// What the introduction is allowed to complete is a row with no address: either
+// one EnsureServer put there - an id seen in somebody's reachability report,
+// standing in for its own name - or one left behind by a readmission, which
+// clears the tombstone but cannot know the address the node publishes. Both are
+// nodes this one simply has not been introduced to yet, and completing them is
+// what turns the bare ids a new neighbour brings with it into nodes this one
+// syncs with.
 func (s *Store) AddPeerIfUnknown(uid, name, location, url string, alerts bool) (bool, error) {
 	res, err := s.db.Exec(`
 		INSERT INTO "Servers" ("Uid","Name","Location","Url","IsSelf","Alerts","LastSeen")
@@ -338,10 +347,9 @@ func (s *Store) AddPeerIfUnknown(uid, name, location, url string, alerts bool) (
 			"Url"=excluded."Url",
 			"Alerts"=excluded."Alerts"
 		WHERE "Servers"."IsSelf"=0
+			AND "Servers"."Removed"=0
 			AND "Servers"."PushOnly"=0
-			AND "Servers"."Url" IS NULL
-			AND "Servers"."LastSeen"=?6
-			AND "Servers"."Name"="Servers"."Uid"`,
+			AND "Servers"."Url" IS NULL`,
 		uid, name, location, url, alerts, model.Time{}.DB())
 	if err != nil {
 		return false, fmt.Errorf("add peer %s: %w", uid, err)
@@ -353,6 +361,115 @@ func (s *Store) AddPeerIfUnknown(uid, name, location, url string, alerts bool) (
 	return n > 0, nil
 }
 
+// ── Membership ──────────────────────────────────────────────────────────────
+
+// SetMembership records that a node was taken out of the mesh, or added back
+// into it, and reports whether that changed anything here.
+//
+// This is the whole of removal. Dropping the rows would not be: the node would
+// be learned back from the first neighbour that still knew it, or would
+// register itself again with its next push, and there would be nothing left to
+// tell the other nodes with. So the row stays as the record of the decision,
+// carrying the time it was made, and every list of servers passes over it.
+//
+// An announcement about a node this one has never heard of writes the row all
+// the same. A removal has to reach the nodes that were only ever going to meet
+// the removed one later, or the mesh would readmit it through them.
+//
+// The decision is refused when the row already carries a later one, which is
+// what makes the exchange convergent: the same announcements can arrive in any
+// order, by any route, any number of times, and every node ends up holding the
+// most recent decision about each of its neighbours. Self is never removable -
+// a node that could be talked out of its own identity would lose its history
+// and its place in every matrix on a single forged payload.
+func (s *Store) SetMembership(uid string, removed bool, at model.Time) (bool, error) {
+	// Removal also drops whatever made the node reachable or watched, so the
+	// sync worker stops pushing to it and stops recording an outage for the
+	// pushes that are no longer expected. Readmission deliberately restores
+	// neither: the address comes back from the introduction, or from the peer
+	// lists the neighbours answer this node's pushes with.
+	res, err := s.db.Exec(`
+		INSERT INTO "Servers" ("Uid","Name","Location","Url","IsSelf","Alerts","PushOnly","Removed","MemberAt","LastSeen")
+		VALUES (?1,?1,'',NULL,0,0,0,?2,?3,?4)
+		ON CONFLICT("Uid") DO UPDATE SET
+			"Removed"=?2,
+			"MemberAt"=?3,
+			"Url"=CASE WHEN ?2 THEN NULL ELSE "Servers"."Url" END,
+			"PushOnly"=CASE WHEN ?2 THEN 0 ELSE "Servers"."PushOnly" END
+		WHERE "Servers"."IsSelf"=0 AND "Servers"."MemberAt"<?3`,
+		uid, removed, at.DB(), model.Time{}.DB())
+	if err != nil {
+		return false, fmt.Errorf("set membership %s: %w", uid, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("set membership %s: %w", uid, err)
+	}
+	return n > 0, nil
+}
+
+// Membership returns every decision this node holds, to be carried in its
+// pushes. Not only the ones made on it: a removal has to cross the mesh whole,
+// including to the nodes the removing one does not push to and the ones that
+// were down when it happened, so each node repeats what it has been told.
+// Repetition is free here, since applying a decision twice is applying it once.
+//
+// Rows with no decision recorded against them - every ordinary node, and the
+// removals inherited from a database written before they were announced at all
+// - are not published. An unstamped tombstone is one node's own business.
+func (s *Store) Membership() ([]model.Removal, error) {
+	rows, err := s.db.Query(`
+		SELECT "Uid","MemberAt","Removed" FROM "Servers"
+		WHERE "IsSelf"=0 AND "MemberAt">0 ORDER BY "MemberAt"`)
+	if err != nil {
+		return nil, fmt.Errorf("list membership: %w", err)
+	}
+	defer rows.Close()
+
+	out := []model.Removal{}
+	for rows.Next() {
+		var (
+			r  model.Removal
+			at int64
+		)
+		if err := rows.Scan(&r.ServerID, &at, &r.Removed); err != nil {
+			return nil, fmt.Errorf("scan membership: %w", err)
+		}
+		r.Timestamp = model.FromDB(at)
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// IsRemoved reports whether a node was taken out of this mesh, which is what
+// the peer endpoints refuse a caller on.
+func (s *Store) IsRemoved(uid string) (bool, error) {
+	var removed bool
+	err := s.db.QueryRow(`SELECT "Removed" FROM "Servers" WHERE "Uid"=?`, uid).Scan(&removed)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("check removal %s: %w", uid, err)
+	}
+	return removed, nil
+}
+
+// ForgetPeer stops this node syncing with a peer without recording a decision
+// about it. It is what a node does with a peer that answered its push by saying
+// this node is no longer in its mesh: the removal was somebody else's to make,
+// so it is not re-announced from here - and it is left liftable, so that when
+// the operator does add this node back, the first push from that peer is enough
+// to make them neighbours again.
+func (s *Store) ForgetPeer(id int64) error {
+	if err := s.SetPeerURL(id, ""); err != nil {
+		return err
+	}
+	return s.SetPushOnly(id, false)
+}
+
+// ── Servers, continued ──────────────────────────────────────────────────────
+
 // TouchLastSeen records that a server was reachable at t.
 func (s *Store) TouchLastSeen(id int64, t model.Time) error {
 	_, err := s.db.Exec(`UPDATE "Servers" SET "LastSeen"=? WHERE "Id"=?`, t.DB(), id)
@@ -362,7 +479,12 @@ func (s *Store) TouchLastSeen(id int64, t model.Time) error {
 	return nil
 }
 
-const selectServer = `SELECT "Id","Uid","Name","Location",COALESCE("Url",''),"IsSelf","Alerts","PushOnly","LastSeen" FROM "Servers"`
+const selectServer = `SELECT "Id","Uid","Name","Location",COALESCE("Url",''),"IsSelf","Alerts","PushOnly","Removed","LastSeen" FROM "Servers"`
+
+// present is what every listing adds to its own conditions: a removed node is
+// not one of this mesh's servers any more, so it appears in no list, is probed
+// by nothing, alerted on by nothing and drawn nowhere.
+const present = ` WHERE "Removed"=0`
 
 // ServerByUID returns the server published under uid. The bool reports whether
 // it existed, which is how the dashboard and peer endpoints turn the identity
@@ -378,20 +500,20 @@ func (s *Store) ServerByUID(uid string) (model.Server, bool, error) {
 	return srv, true, nil
 }
 
-// ListServers returns every known server, self included.
+// ListServers returns every server still in the mesh, self included.
 func (s *Store) ListServers() ([]model.Server, error) {
-	return s.queryServers(selectServer + ` ORDER BY "IsSelf" DESC, "Name"`)
+	return s.queryServers(selectServer + present + ` ORDER BY "IsSelf" DESC, "Name"`)
 }
 
 // ListPeers returns non-self servers that still have an address configured.
 func (s *Store) ListPeers() ([]model.Server, error) {
-	return s.queryServers(selectServer + ` WHERE "IsSelf"=0 AND "Url" IS NOT NULL AND "Url"<>'' ORDER BY "Name"`)
+	return s.queryServers(selectServer + present + ` AND "IsSelf"=0 AND "Url" IS NOT NULL AND "Url"<>'' ORDER BY "Name"`)
 }
 
 // ListPushOnly returns the peers that push to this node without being reachable
 // from it, which are the ones it can only judge by what arrives.
 func (s *Store) ListPushOnly() ([]model.Server, error) {
-	return s.queryServers(selectServer + ` WHERE "IsSelf"=0 AND "PushOnly"=1 ORDER BY "Name"`)
+	return s.queryServers(selectServer + present + ` AND "IsSelf"=0 AND "PushOnly"=1 ORDER BY "Name"`)
 }
 
 func (s *Store) queryServers(query string, args ...any) ([]model.Server, error) {
@@ -421,7 +543,7 @@ func scanServer(sc scanner) (model.Server, error) {
 		lastSeen int64
 	)
 	if err := sc.Scan(&srv.ID, &srv.UID, &srv.Name, &srv.Location, &srv.URL, &srv.IsSelf,
-		&srv.Alerts, &srv.PushOnly, &lastSeen); err != nil {
+		&srv.Alerts, &srv.PushOnly, &srv.Removed, &lastSeen); err != nil {
 		return model.Server{}, err
 	}
 	srv.LastSeen = model.FromDB(lastSeen)
@@ -740,14 +862,16 @@ func (s *Store) maxTimestamp(query, what string, args ...any) (model.Time, bool,
 }
 
 // AvailabilitySince returns every observation newer than since, from any
-// origin, for the dashboard's matrix.
+// origin, for the dashboard's matrix. Edges touching a node the mesh has
+// removed are left out: the matrix is drawn from the servers that are listed,
+// and an edge to one that is not would be a cell with nowhere to go.
 func (s *Store) AvailabilitySince(since model.Time) ([]AvailabilityRow, error) {
 	rows, err := s.db.Query(`
 		SELECT f."Uid",t."Uid",a."Timestamp",a."IsAvailable",a."LatencyMs",a."HttpStatus"
 		FROM "AvailabilityRecords" a
 		JOIN "Servers" f ON f."Id"=a."FromServerId"
 		JOIN "Servers" t ON t."Id"=a."ToServerId"
-		WHERE a."Timestamp">=?
+		WHERE a."Timestamp">=? AND f."Removed"=0 AND t."Removed"=0
 		ORDER BY a."Timestamp"`, since.DB())
 	if err != nil {
 		return nil, fmt.Errorf("availability since: %w", err)

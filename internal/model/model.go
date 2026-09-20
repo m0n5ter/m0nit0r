@@ -101,6 +101,11 @@ type Snapshot struct {
 // PushOnly marks a node that has no address anybody can reach - a machine on a
 // dynamic IP or behind a NAT it does not control. It pushes to its peers and
 // is never pushed to; its peers judge it by whether its pushes keep arriving.
+//
+// Removed marks a node the operator took out of the mesh. The row stays behind
+// as the record of that decision: it is what keeps the node from being learned
+// back from a neighbour or from registering itself again by pushing here, and
+// it is what travels to the other nodes so they drop it too.
 type Server struct {
 	ID       int64
 	UID      string
@@ -110,6 +115,7 @@ type Server struct {
 	IsSelf   bool
 	Alerts   bool
 	PushOnly bool
+	Removed  bool
 	LastSeen Time
 }
 
@@ -150,6 +156,23 @@ type Notice struct {
 	IsDown     bool   `json:"isDown"`
 }
 
+// Removal is one node's membership in the mesh, as decided by an operator on
+// some dashboard and carried to everybody else.
+//
+// Removed says which way the decision went: true when the node was taken out,
+// false when it was later added back. Both directions have to travel, because
+// a mesh that only ever learns removals could never readmit anything - every
+// neighbour would go on refusing the node on the strength of the old
+// tombstone. Timestamp is what settles the two against each other: the latest
+// decision about a node wins, wherever it was made. Operator actions on one
+// node are minutes or days apart, never milliseconds, so ordering them by wall
+// clock needs no more agreement between the nodes than they already have.
+type Removal struct {
+	ServerID  string `json:"serverId"`
+	Timestamp Time   `json:"timestamp"`
+	Removed   bool   `json:"removed"`
+}
+
 // SyncPayload is the body of POST /api/sync.
 type SyncPayload struct {
 	ServerID     string         `json:"serverId"`
@@ -161,6 +184,14 @@ type SyncPayload struct {
 	Metrics      []Metric       `json:"metrics"`
 	Availability []Availability `json:"availability"`
 	Notices      []Notice       `json:"notices"`
+
+	// Every membership decision this node knows of, not only the ones made on
+	// it and not only what changed since the last round. The list is one row
+	// per node ever removed from this mesh, so resending it in full costs
+	// nothing measurable, and it is what carries a removal across a node that
+	// was down when it was made, or to a neighbour two hops away that the
+	// removing node does not push to itself.
+	Removals []Removal `json:"removals"`
 }
 
 // IntroduceRequest is the body of POST /api/introduce.

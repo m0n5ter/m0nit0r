@@ -474,3 +474,142 @@ func TestDashboardLoginTradesThePasswordForACookie(t *testing.T) {
 		t.Errorf("logout did not clear the cookie: %+v", c)
 	}
 }
+
+// call makes a dashboard API request against a node, the way the browser and
+// the Android app do.
+func (n *node) call(t *testing.T, method, path, body string) *http.Response {
+	t.Helper()
+
+	req, err := http.NewRequestWithContext(t.Context(), method, n.server.URL+path, strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { resp.Body.Close() })
+	return resp
+}
+
+// knows reports whether the node still counts the uid as one of the mesh's
+// servers, which is what the dashboard draws and what the workers act on.
+func (n *node) knows(t *testing.T, uid string) bool {
+	t.Helper()
+
+	servers, err := n.store.ListServers()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, srv := range servers {
+		if srv.UID == uid {
+			return true
+		}
+	}
+	return false
+}
+
+// relay pushes from one node to another carrying the membership decisions the
+// sender holds, which is the part of a sync round this is about.
+func (n *node) relay(t *testing.T, to *node) {
+	t.Helper()
+
+	removals, err := n.store.Membership()
+	if err != nil {
+		t.Fatal(err)
+	}
+	n.sync(t, to, model.SyncPayload{Removals: removals})
+}
+
+// TestRemovalTravelsTheMeshAndTheRemovedNodeIsTurnedAway is the whole of taking
+// a node out. Removing it on one dashboard has to reach the nodes that were not
+// asked - including one the removing node never mentions it to, since it stops
+// naming a removed peer in its replies - and it has to hold against the removed
+// node itself, which knows nothing of the decision and goes on pushing.
+func TestRemovalTravelsTheMeshAndTheRemovedNodeIsTurnedAway(t *testing.T) {
+	hub := newNode(t, "11111111-1111-4111-8111-111111111111", "hub", false)
+	other := newNode(t, "22222222-2222-4222-8222-222222222222", "other", false)
+	victim := newNode(t, "33333333-3333-4333-8333-333333333333", "victim", false)
+
+	for _, pair := range []struct{ of, at *node }{{other, hub}, {victim, hub}, {victim, other}} {
+		if _, err := pair.at.store.UpsertPeer(pair.of.uid, pair.of.uid, "Lab",
+			pair.of.server.URL, false, model.Now()); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if resp := hub.call(t, "DELETE", "/api/peers/"+victim.uid, ""); resp.StatusCode != 200 {
+		t.Fatalf("removing the peer: %s", resp.Status)
+	}
+	if hub.knows(t, victim.uid) {
+		t.Error("the hub still lists the node it was told to remove")
+	}
+
+	// The removed node has no idea and keeps pushing. Its push must not put it
+	// back in the register, and the answer has to be one it can act on.
+	res := peer.New("").PushSync(t.Context(), hub.server.URL, model.SyncPayload{
+		ServerID: victim.uid, ServerName: "victim", SelfURL: victim.server.URL,
+		Metrics: []model.Metric{{Timestamp: model.Now(), CpuPercent: 12}},
+	})
+	if res.Status == nil || *res.Status != http.StatusGone {
+		t.Fatalf("the hub answered the removed node with %v, want 410 so it drops the peer", res.Status)
+	}
+	if hub.knows(t, victim.uid) {
+		t.Error("pushing put the removed node back into the hub's register")
+	}
+
+	// The third node was not asked and is not told directly - the hub never
+	// names a removed peer in a reply. It learns from the decision travelling
+	// in the ordinary sync payload.
+	if !other.knows(t, victim.uid) {
+		t.Fatal("the third node does not know the victim, so there is nothing for the removal to reach")
+	}
+	hub.relay(t, other)
+	if other.knows(t, victim.uid) {
+		t.Error("the removal did not reach the node that was not asked")
+	}
+	if res := peer.New("").PushSync(t.Context(), other.server.URL, model.SyncPayload{
+		ServerID: victim.uid, SelfURL: victim.server.URL,
+	}); res.Status == nil || *res.Status != http.StatusGone {
+		t.Errorf("the third node answered the removed node with %v, want 410", res.Status)
+	}
+
+	// Nor can a neighbour that has not heard yet hand it back: the peer lists
+	// answering a node's pushes are how everything else is learned, so the
+	// removal is only as good as its hold over them.
+	learned, err := other.store.AddPeerIfUnknown(victim.uid, "victim", "Lab", victim.server.URL, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if learned {
+		t.Error("a neighbour's peer list brought the removed node back")
+	}
+
+	// And adding it back has to travel the same way, or the mesh could take a
+	// node out once and never let it in again.
+	if resp := hub.call(t, "POST", "/api/peers", `{"url":"`+victim.server.URL+`"}`); resp.StatusCode != 200 {
+		t.Fatalf("adding the node back: %s", resp.Status)
+	}
+	if !hub.knows(t, victim.uid) {
+		t.Fatal("the node was not added back on the dashboard it was added back on")
+	}
+	hub.relay(t, other)
+	if !other.knows(t, victim.uid) {
+		t.Error("the readmission did not reach the node that still held the removal")
+	}
+	// Readmission clears the decision but cannot know the address; that comes
+	// back from the neighbours, which have to be allowed to supply it again.
+	learned, err = other.store.AddPeerIfUnknown(victim.uid, "victim", "Lab", victim.server.URL, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !learned {
+		t.Error("the readmitted node cannot be learned back from a neighbour, so nothing will ever sync with it")
+	}
+	if res := peer.New("").PushSync(t.Context(), other.server.URL, model.SyncPayload{
+		ServerID: victim.uid, SelfURL: victim.server.URL,
+	}); !res.OK {
+		t.Errorf("the readmitted node is still turned away, status %v", res.Status)
+	}
+}

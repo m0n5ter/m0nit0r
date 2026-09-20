@@ -203,6 +203,31 @@ latency and status code become an availability record. The matrix on the dashboa
 therefore genuinely per-direction — it shows how each node sees each other node, not
 one node's opinion broadcast to the rest.
 
+### Removing a node
+
+Remove a node from any one dashboard and it leaves the whole mesh. The decision travels
+in the ordinary sync payload, which carries every removal each node knows of — so it
+reaches the nodes that were not asked, the ones the removing node does not even push to,
+and the ones that were down at the time, and it keeps reaching them as long as the mesh
+runs. A removed node is not pushed to, not probed, not alerted on and not drawn.
+
+The removal holds against the node itself, which knows nothing of it and goes on pushing:
+its pushes are refused with `410 Gone`, which is also how it finds out. It drops each peer
+that answers that way, so once the decision has crossed the mesh — a round or two — the
+node stops syncing with all of it, without anybody having to reach the node to tell it.
+Stopping the agent first is tidier but not required.
+
+Nothing is deleted. The row stays behind as the record of the decision: it is what keeps
+the node from being learned back from a neighbour that has not heard yet, and what there
+is to tell the other nodes with. Its collected history stays too, out of sight because the
+node is no longer listed, and ages out with retention like anything else.
+
+Adding the node back, from any dashboard, lifts the removal the same way it travelled.
+The node's address comes back with the introduction; its neighbours pick it up again from
+the peer lists their pushes are answered with. A push-only node is the exception: nobody
+can reach it to introduce anything, so after it has dropped its peers it has to be pointed
+at one of them again from its own dashboard.
+
 ## Push-only nodes
 
 A node on a dynamic IP, or behind a NAT whose ports you cannot forward, has no
@@ -220,8 +245,8 @@ Then add any one reachable node as its peer, from its own dashboard or with
 - **It joins the whole mesh from one peer.** This is the same reply every node is
   answered with — the list of peers the receiver pushes to, signed with the shared
   secret — but for a push-only node it is the only way in, since nobody can reach it to
-  introduce anything to it. A peer removed on the push-only node stays removed; hearing
-  about it from a neighbour does not bring it back.
+  introduce anything to it. A peer removed from the mesh stays removed; hearing about it
+  from a neighbour does not bring it back.
 - **The mesh watches its pushes instead of probing it.** Every other node records, each
   sync round, whether that node's pushes are still arriving. It goes down once nothing has
   arrived for three rounds (never less than 30 seconds) — so keep its
@@ -236,8 +261,10 @@ Then add any one reachable node as its peer, from its own dashboard or with
   `ListenAddress: 127.0.0.1` is a sensible default for it.
 
 A node that switches from push-only back to a published address is picked up on its next
-sync. Removing a push-only peer from a dashboard stops it being watched; if it is still
-running, its next push registers it again, as with any peer — stop the agent first.
+sync. Removing a push-only peer works like removing any other — its pushes are refused
+from then on, wherever they go, and it drops the mesh in turn — except that adding it back
+has to be finished from its own dashboard, since nothing can reach it to introduce the
+mesh to it again.
 
 A push-only node arrives from whatever address it happens to have, so nothing about it
 can be pinned to a source address — which is one reason every node leaves its port open
@@ -444,15 +471,15 @@ to write to, so logs go to `monitor.log` beside the executable instead, rotated 
 | GET | `/api/session` | Whether this browser needs to sign in, and whether it has |
 | POST | `/api/login` | Sign in to the dashboard, body `{"password":"…"}`; sets the session cookie |
 | POST | `/api/logout` | Sign out; clears the session cookie |
-| POST | `/api/introduce` | Exchange identities with a peer; records the caller |
-| POST | `/api/sync` | Receive metrics, availability records and alert notices from a peer. The sender is answered with a signed `{"peers":[…]}` naming the nodes this one syncs with |
+| POST | `/api/introduce` | Exchange identities with a peer; records the caller, or answers `410 Gone` if it was removed from the mesh |
+| POST | `/api/sync` | Receive metrics, availability records, alert notices and membership decisions from a peer. The sender is answered with a signed `{"peers":[…]}` naming the nodes this one syncs with, or with `410 Gone` if it was removed from the mesh |
 | GET | `/api/servers` | All servers with their latest metrics |
 | GET | `/api/servers/{id}/metrics?hours=24` | Time-series metrics. Raw samples for an hour; longer windows come back averaged into buckets wide enough to keep the series around 360 points |
 | GET | `/api/availability/matrix` | Availability matrix, last hour |
 | GET | `/api/availability/history/{from}/{to}?hours=24` | Availability history for one edge |
 | GET | `/api/peers` | Configured peers |
-| POST | `/api/peers` | Add a peer by URL, body `{"url":"http://host:5001"}` |
-| DELETE | `/api/peers/{id}` | Stop syncing with a peer, keeping its history |
+| POST | `/api/peers` | Add a peer by URL, body `{"url":"http://host:5001"}`; also adds back a node the mesh had removed |
+| DELETE | `/api/peers/{id}` | Remove a node from the mesh. The decision reaches every node and the removed one is turned away from then on; its history is kept |
 
 ## Android app
 
