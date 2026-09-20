@@ -17,9 +17,7 @@ dist/
 ## Secrets / local config
 appsettings.json
 !appsettings.example.json
-deploy/.secret
-deploy/.telegram
-deploy/.dashboard-password
+deploy/
 
 ## Database
 *.db
@@ -29,3 +27,4 @@ deploy/.dashboard-password
 ## Misc
 server-id.txt
 *.log
+/deploy
