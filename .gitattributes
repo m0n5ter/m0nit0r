@@ -2,3 +2,7 @@
 # normalisation would make those bytes, and the ETags derived from them, differ
 # depending on which platform checked the repository out.
 internal/web/assets/** -text
+
+# The installer is fetched and run on Linux nodes; /bin/sh will not run a
+# script with CRLF line endings, whatever the platform it was checked out on.
+*.sh text eol=lf

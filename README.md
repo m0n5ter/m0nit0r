@@ -237,10 +237,80 @@ source addresses, so `-RestrictFirewall` and a push-only node do not mix: the ad
 pushes from changes. Leave the port open and set `DashboardPassword` instead; `/api/sync`
 stays authenticated by the shared secret either way.
 
+## Installing a node
+
+`install/install.sh` and `install/install.ps1` install the agent on one machine, from
+the outside in: they download the latest GitHub release, check it against the
+`SHA256SUMS` published beside it, install it as a service and start it. No repository
+checkout, no Go toolchain, nothing to copy over by hand.
+
+**Linux**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/m0n5ter/m0nit0r/master/install/install.sh | sudo sh
+```
+
+**Windows** — from an elevated PowerShell, since the service and the firewall rule need it:
+
+```powershell
+irm https://raw.githubusercontent.com/m0n5ter/m0nit0r/master/install/install.ps1 -OutFile install.ps1
+.\install.ps1
+```
+
+On a fresh node it asks for the node's name and location, the address other nodes
+reach it at, the shared secret and the dashboard password. Answer the address with
+nothing and the node is configured push-only, binding loopback. Every answer can be
+given up front instead, which is also the only way to install where there is no
+terminal to ask at:
+
+```bash
+curl -fsSL .../install.sh | sudo sh -s -- \
+    --secret "$SECRET" --password "$PASSWORD" \
+    --name Berlin-1 --location 'Berlin, DE' --url http://1.2.3.4:5001 \
+    --peer http://5.6.7.8:5001
+```
+
+`--peer` (`-Peer`) introduces the new node to the mesh once it is up. One peer is
+enough: the introduction reaches every node already in it, in both directions.
+
+**Updating is the same command.** It downloads the release, replaces the binary and
+restarts the service. `appsettings.json`, `server-id.txt` and `monitor.db` are left
+exactly as they are, so the node keeps its identity, its history and its peers, and a
+node already carrying the release being installed is reported and skipped. Pass
+`--reconfigure` to rewrite the configuration, `--force` to reinstall the same version,
+`--version v1.2.0` to pin an older one, and `--uninstall` to stop and remove the
+service while keeping the directory.
+
+The port is opened in ufw or firewalld when one of them is already running, and in the
+Windows firewall, unless the node is push-only or `--no-firewall` is given. A host
+with no active firewall manager is reported and left alone: enabling one over SSH
+without first admitting SSH is how a remote machine gets locked out for good.
+
+Releases come from `.github/workflows/release.yml`, which cross-compiles
+linux/amd64, linux/arm64, linux/arm and windows/amd64, publishes the checksums and
+attaches both installers, so `releases/latest/download/install.sh` is always the
+current one. Tag a commit to cut one:
+
+```bash
+git tag v1.2.0 && git push origin v1.2.0
+```
+
+The installers read releases anonymously, which needs the repository to be public. Set
+`GITHUB_TOKEN` in the environment (or pass `--token`) and they go through the API with
+it instead, which is what a private repository needs and what keeps a busy network off
+the anonymous rate limit.
+
+Windows nodes get no CPU die temperature from this installer: that needs
+LibreHardwareMonitor, which `deploy/Deploy-M0nit0r.ps1` sets up. The agent falls back
+to the ACPI zone until it is there.
+
 ## Deployment
 
 `deploy/Deploy-M0nit0r.ps1` builds and installs the agent across every node in one
-run. It queries each remote host's architecture and cross-compiles to match, uploads
+run. It is the fleet tool, and it pushes: it builds from this checkout and reaches
+the nodes over SSH, which the installers above do not need and cannot do.
+Use it to roll a change across the mesh from here; use the installers to bring a new
+machine up, or to update one that is not in the inventory. It queries each remote host's architecture and cross-compiles to match, uploads
 the binary and a per-node configuration over SSH, installs the systemd unit or Windows
 service, and restarts it. `server-id.txt` and `monitor.db` are never overwritten, so
 nodes keep their identity and history across deployments.

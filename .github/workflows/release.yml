@@ -1,0 +1,79 @@
+name: Release
+
+# Cross-compiles the agent for every architecture a node might run on and
+# publishes the binaries as a GitHub release, which is what install/install.sh
+# and install/install.ps1 download. The installers are attached too, so
+# releases/latest/download/install.sh is a stable URL for the current one.
+#
+# Tag a commit to cut a release:
+#
+#     git tag v1.2.0 && git push origin v1.2.0
+#
+# A manual run publishes a release named after the tag you give it, which is
+# how a build is re-cut without moving the tag.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to publish (created if it does not exist)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Resolve the tag
+        id: tag
+        run: echo "tag=${{ github.event.inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        run: |
+          set -eu
+          mkdir -p out
+          build() {
+            export GOOS="$1" GOARCH="$2" CGO_ENABLED=0
+            out="out/monitor-$1-$2"
+            if [ "$1" = windows ]; then out="$out.exe"; fi
+            go build -trimpath -ldflags='-s -w' -o "$out" ./cmd/monitor
+            echo "built $out"
+          }
+          build linux amd64
+          build linux arm64
+          build linux arm
+          build windows amd64
+
+      - name: Checksums
+        working-directory: out
+        run: sha256sum monitor-* > SHA256SUMS
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -eu
+          cp install/install.sh install/install.ps1 out/
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" out/* --clobber
+          else
+            gh release create "$TAG" out/* \
+              --title "$TAG" \
+              --generate-notes \
+              --target "$GITHUB_SHA"
+          fi
