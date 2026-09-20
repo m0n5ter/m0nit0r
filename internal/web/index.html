@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="color-scheme" content="dark light" />
-    <title>Dashboard - m0nit0r</title>
+    <title>m0nit0r - Dashboard</title>
     <!-- The stored theme is applied before the first paint; the script below
          re-applies it on load for the icon and the resolved chart colours. -->
     <script>
@@ -1774,6 +1774,9 @@ async function refresh() {
         if (self) {
             chip.textContent = self.name + (self.location ? ' · ' + self.location : '');
             chip.hidden = false;
+            // The tab is how a node is told apart when several dashboards are
+            // open side by side, so the node's own name leads the title.
+            document.title = self.name + ' - m0nit0r - Dashboard';
         }
 
         document.getElementById('banner').classList.remove('show');
