@@ -607,7 +607,7 @@ main { padding: 1.1rem 1.25rem 3rem; display: flex; flex-direction: column; gap:
     <section class="card" aria-label="Reachability">
         <div class="card-header lg">
             <i class="bi bi-diagram-3"></i>Reachability
-            <span class="eyebrow ms-auto">last hour</span>
+            <span class="eyebrow ms-auto" id="matrix-window"></span>
         </div>
         <div class="matrix-wrap" id="matrix-wrap"></div>
     </section>
@@ -836,6 +836,18 @@ function formatRelative(iso) {
     const h = Math.floor(min / 60);
     if (h < 24) return h + 'h ago';
     return Math.floor(h / 24) + 'd ago';
+}
+
+// windowPhrase says how far back the matrix looks, in whatever unit reads
+// naturally at that size. Every place the page mentions the window says it in
+// these words, so none of them can drift away from what the server sends.
+function windowPhrase(secs) {
+    if (!secs) return '';
+    if (secs < 90) return secs + ' seconds';
+    const min = Math.round(secs / 60);
+    if (min < 90) return min + ' minutes';
+    const h = Math.round(min / 60);
+    return h === 1 ? 'hour' : h + ' hours';
 }
 
 // Timestamps arrive without a zone but are always UTC, so the suffix is added
@@ -1272,8 +1284,10 @@ function renderFleet(list, matrix) {
 
 // ── Availability matrix ──────────────────────────────────────────────────────
 
-function renderMatrix(list, matrix) {
+function renderMatrix(list, matrix, windowSeconds) {
     const wrap = document.getElementById('matrix-wrap');
+    const phrase = windowPhrase(windowSeconds);
+    document.getElementById('matrix-window').textContent = phrase ? 'last ' + phrase : '';
 
     if (list.length < 2) {
         wrap.innerHTML = '<div class="empty"><i class="bi bi-diagram-3"></i>' +
@@ -1311,13 +1325,16 @@ function renderMatrix(list, matrix) {
 
             const e = byEdge.get(from.id + '>' + to.id);
             if (!e) {
-                html += '<td class="na' + band + '" title="no checks recorded in the last hour">' +
+                html += '<td class="na' + band + '" title="' + esc(phrase
+                    ? from.name + ' has reported no check of ' + to.name +
+                      ' in the last ' + phrase
+                    : 'no checks recorded') + '">' +
                     '<div class="cell-box">n/a</div></td>';
                 continue;
             }
 
             // A link that is up right now but has been flapping is worth
-            // distinguishing from one that has been solid all hour.
+            // distinguishing from one that has been solid the whole window.
             const cls = !e.isAvailable ? 'down' : e.availabilityPercent < 100 ? 'deg' : 'up';
             // A push-only node cannot be reached, so the edge towards it is not
             // a timed round trip but a record of whether its pushes arrive.
@@ -1753,16 +1770,17 @@ function tickClock() {
 
 async function refresh() {
     try {
-        const [srv, matrix] = await Promise.all([
+        const [srv, view] = await Promise.all([
             getJSON('/api/servers'),
             getJSON('/api/availability/matrix'),
         ]);
 
         servers = srv;
+        const matrix = view.edges;
 
         renderFleet(srv, matrix);
         renderServerCards(srv);
-        renderMatrix(srv, matrix);
+        renderMatrix(srv, matrix, view.windowSeconds);
         await renderPeers();
 
         // An open lightbox keeps following the poll; a closed one has nothing

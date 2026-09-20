@@ -539,7 +539,7 @@ to write to, so logs go to `monitor.log` beside the executable instead, rotated 
 | POST | `/api/sync` | Receive metrics, availability records, alert notices and membership decisions from a peer. The sender is answered with a signed `{"peers":[…]}` naming the nodes this one syncs with, or with `410 Gone` if it was removed from the mesh |
 | GET | `/api/servers` | All servers with their latest metrics |
 | GET | `/api/servers/{id}/metrics?hours=24` | Time-series metrics. Raw readings for an hour; longer windows come back from the [aggregation ladder](#how-history-is-stored), at the finest rung that stays inside the chart's point budget |
-| GET | `/api/availability/matrix` | Availability matrix, last hour |
+| GET | `/api/availability/matrix` | Availability matrix, with the window it covers |
 | GET | `/api/availability/history/{from}/{to}?hours=24` | Availability history for one edge |
 | GET | `/api/peers` | Configured peers |
 | POST | `/api/peers` | Add a peer by URL, body `{"url":"http://host:5001"}`; also adds back a node the mesh had removed |

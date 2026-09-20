@@ -647,6 +647,18 @@ type matrixEntry struct {
 	IsAvailable         bool       `json:"isAvailable"`
 }
 
+// matrixView is the matrix together with the span it covers.
+//
+// The window travels with the edges because the dashboard labels the view with
+// it, and a copy of the number kept in the page is one that goes stale there
+// without anybody noticing - which is how an empty cell came to be explained
+// as "no checks in the last hour" long after the window had shrunk to two
+// minutes.
+type matrixView struct {
+	WindowSeconds int           `json:"windowSeconds"`
+	Edges         []matrixEntry `json:"edges"`
+}
+
 // handleAvailabilityMatrix draws every route in the mesh at once.
 //
 // It reads raw checks rather than the aggregates, and has to: a bucket is not
@@ -682,7 +694,10 @@ func (s *Server) handleAvailabilityMatrix(w http.ResponseWriter, r *http.Request
 		return entries[i].ToServerID < entries[j].ToServerID
 	})
 
-	writeJSON(w, http.StatusOK, entries)
+	writeJSON(w, http.StatusOK, matrixView{
+		WindowSeconds: int(matrixWindow.Seconds()),
+		Edges:         entries,
+	})
 }
 
 // historyEntry is one point on a route's chart.
