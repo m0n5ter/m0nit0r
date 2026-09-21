@@ -621,7 +621,7 @@ func TestSeriesCrossTheWire(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	samples, _, err := sender.store.OwnSamplesSince(sender.id, model.At(base.Add(-time.Hour)), 10000)
+	samples, _, err := sender.store.OwnSamplesSince(sender.id, model.At(base.Add(-time.Hour)), model.Now(), 10000)
 	if err != nil {
 		t.Fatal(err)
 	}

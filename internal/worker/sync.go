@@ -140,7 +140,7 @@ func (w *Sync) round(ctx context.Context) error {
 	sent := make([]seriesMarks, len(peers))
 	payloads := make([]model.SyncPayload, len(peers))
 	for i, p := range peers {
-		payloads[i], sent[i], err = w.forPeer(payload, p)
+		payloads[i], sent[i], err = w.forPeer(payload, p, timestamp)
 		if err != nil {
 			return err
 		}
@@ -195,7 +195,15 @@ type seriesMarks struct {
 }
 
 // forPeer cuts the payload down to what this particular peer is owed.
-func (w *Sync) forPeer(base model.SyncPayload, target model.Server) (model.SyncPayload, seriesMarks, error) {
+//
+// Readings are taken up to the start of the round and no further. The round's
+// own probes are stamped with that instant but not written until the pushes
+// come back, and the metric ticker runs on the same beat as the round, so a
+// reading from a few milliseconds into it is there on every round or on none.
+// Letting it through carried the mark past the probes each time, and they were
+// never sent: the node's metrics arrived everywhere while its row in every
+// other node's matrix stayed empty. Whatever is held back is next round's.
+func (w *Sync) forPeer(base model.SyncPayload, target model.Server, round model.Time) (model.SyncPayload, seriesMarks, error) {
 	payload := base
 	marks := w.peerMarks[target.ID]
 
@@ -216,7 +224,7 @@ func (w *Sync) forPeer(base model.SyncPayload, target model.Server) (model.SyncP
 		marks.bucket = map[series.Level]int64{}
 	}
 
-	samples, high, err := w.Store.OwnSamplesSince(w.ServerID, marks.sample, maxSeriesRows)
+	samples, high, err := w.Store.OwnSamplesSince(w.ServerID, marks.sample, round, maxSeriesRows)
 	if err != nil {
 		return payload, marks, err
 	}

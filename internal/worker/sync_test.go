@@ -222,3 +222,56 @@ func TestPushDroppedByAPeerThatRemovedThisNode(t *testing.T) {
 		t.Errorf("dropping the peer published %+v, err=%v, want nothing", decisions, err)
 	}
 }
+
+// TestRoundProbesReachEveryPeer: a round's probes are stamped with the instant
+// the round began but written only once the pushes come back, after the
+// round's payload has already been cut. A reading taken in between - the metric
+// ticker fires on the same five-second beat as the round, so one lands a few
+// milliseconds after it began on every round or none - must not carry the
+// peer's high-water mark past the probes still to be written, or they are
+// never sent and the node's whole row goes blank on every other dashboard.
+func TestRoundProbesReachEveryPeer(t *testing.T) {
+	s, w, _ := hubWithRoamer(t, time.Now())
+	w.peerMarks = map[int64]seriesMarks{}
+
+	target, err := s.UpsertPeer(testOtherUID, "other", "Lab", "http://other:5001", false, model.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	peerRow := model.Server{ID: target, UID: testOtherUID, Protocol: model.ProtocolVersion}
+
+	round := time.Now().Truncate(time.Second)
+
+	// The metric ticker, a millisecond into the round.
+	if _, err := s.InsertMetrics(w.ServerID, []model.Metric{{
+		Timestamp: model.At(round.Add(time.Millisecond)), CpuPercent: 5,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, sent, err := w.forPeer(model.SyncPayload{}, peerRow, model.At(round))
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.peerMarks[target] = sent
+
+	// The push comes back and the round's probe is recorded, stamped with the
+	// round's own instant.
+	latency := 42.0
+	if err := s.InsertAvailability(w.ServerID, []store.Observation{{
+		ToServerID: target, Timestamp: model.At(round), IsAvailable: true, LatencyMs: &latency,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	next, _, err := w.forPeer(model.SyncPayload{}, peerRow, model.At(round.Add(w.Interval)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, smp := range next.Samples {
+		if smp.Peer == testOtherUID && smp.Timestamp.Equal(round) {
+			return
+		}
+	}
+	t.Fatalf("the probe taken at the start of the round was never offered; next round carried %d samples", len(next.Samples))
+}

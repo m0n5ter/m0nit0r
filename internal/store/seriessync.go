@@ -13,21 +13,27 @@ import (
 // issued it, so the far end of an edge travels as the identity its node
 // publishes, and a drive travels as its name.
 
-// OwnSamplesSince returns this node's own readings from after since, oldest
-// first, in the form a peer is sent them.
+// OwnSamplesSince returns this node's own readings from after since and before
+// until, oldest first, in the form a peer is sent them.
+//
+// The upper bound is what keeps the high-water mark honest. A reading's time is
+// not when it was written: a round's probes are stamped with the instant the
+// round began and written seconds later, once the pushes return. Anything read
+// past that instant would carry the mark over them before they exist, and a
+// reading behind the mark is never offered again.
 //
 // Only a node's own readings are its to forward. Relaying what a peer reported
 // would put the same reading on the wire once per hop, and every node in a
 // mesh already hears from every other.
-func (s *Store) OwnSamplesSince(serverID int64, since model.Time, limit int) ([]model.SampleRow, model.Time, error) {
+func (s *Store) OwnSamplesSince(serverID int64, since, until model.Time, limit int) ([]model.SampleRow, model.Time, error) {
 	rows, err := s.db.Query(`
 		SELECT s."Param", COALESCE(t."Uid",''), COALESCE(v."Name",''), s."Timestamp", s."Value", s."IsOk"
 		FROM "Samples" s
 		LEFT JOIN "Servers" t ON t."Id"=s."Server2"
 		LEFT JOIN "Volumes" v ON v."Id"=s."Volume"
-		WHERE s."Server1"=? AND s."Timestamp">?
+		WHERE s."Server1"=? AND s."Timestamp">? AND s."Timestamp"<?
 		ORDER BY s."Timestamp"
-		LIMIT ?`, serverID, since.DB(), limit)
+		LIMIT ?`, serverID, since.DB(), until.DB(), limit)
 	if err != nil {
 		return nil, since, fmt.Errorf("own samples since: %w", err)
 	}
