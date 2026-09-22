@@ -28,3 +28,8 @@ deploy/
 server-id.txt
 *.log
 /deploy
+
+## Android release signing
+keystore.properties
+*.jks
+*.keystore

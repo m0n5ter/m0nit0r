@@ -47,9 +47,29 @@ cd android
 Or open the `android/` folder directly in Android Studio and run the `app`
 configuration on a device or emulator.
 
-A release build needs your own signing config (`app/build.gradle.kts` ->
-`signingConfigs`); none is set up here since this is a self-hosted tool with
-no store listing.
+### Release builds
+
+Every `v*` tag gets a signed `m0nit0r-<tag>.apk` attached to its GitHub
+release (the `android` job in `.github/workflows/release.yml`). Its
+`versionName` is the tag and its `versionCode` is derived from it
+(`v1.2.3` -> `10203`), so each release installs over the previous one.
+
+Signing reads `M0NIT0R_KEYSTORE_FILE`, `M0NIT0R_KEYSTORE_PASSWORD`,
+`M0NIT0R_KEY_ALIAS` and `M0NIT0R_KEY_PASSWORD` from the environment, falling
+back to a gitignored `android/keystore.properties`:
+
+```properties
+storeFile=/path/to/m0nit0r-release.jks
+storePassword=...
+keyAlias=m0nit0r
+keyPassword=...
+```
+
+With neither, `assembleRelease` produces an unsigned APK. In CI the same
+values come from the `ANDROID_KEYSTORE_BASE64`, `ANDROID_KEYSTORE_PASSWORD`,
+`ANDROID_KEY_ALIAS` and `ANDROID_KEY_PASSWORD` repository secrets. Keep the
+keystore backed up: an APK signed with a different key will not install over
+an existing one.
 
 ### Build and run on an emulator, from the command line
 
