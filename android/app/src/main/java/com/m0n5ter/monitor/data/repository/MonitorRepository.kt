@@ -2,7 +2,7 @@ package com.m0n5ter.monitor.data.repository
 
 import com.m0n5ter.monitor.data.model.AddPeerRequest
 import com.m0n5ter.monitor.data.model.HistoryEntry
-import com.m0n5ter.monitor.data.model.MatrixEntry
+import com.m0n5ter.monitor.data.model.MatrixView
 import com.m0n5ter.monitor.data.model.Metric
 import com.m0n5ter.monitor.data.model.PeerView
 import com.m0n5ter.monitor.data.model.ServerView
@@ -21,7 +21,7 @@ class MonitorRepository(baseUrl: String, password: String?) {
     suspend fun serverMetrics(serverId: String, hours: Int): List<Metric> =
         api.getServerMetrics(serverId, hours)
 
-    suspend fun availabilityMatrix(): List<MatrixEntry> = api.getAvailabilityMatrix()
+    suspend fun availabilityMatrix(): MatrixView = api.getAvailabilityMatrix()
 
     suspend fun availabilityHistory(fromId: String, toId: String, hours: Int): List<HistoryEntry> =
         api.getAvailabilityHistory(fromId, toId, hours)

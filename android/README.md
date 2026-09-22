@@ -13,7 +13,7 @@ whole fleet, because that is exactly what the dashboard's own API returns.
 - **Server detail** - CPU, memory and (where reported) CPU temperature history
   as line charts over 1h/6h/24h/7d, plus per-disk usage and temperature.
 - **Matrix** - the full reachability matrix between every pair of nodes, the
-  same last-hour percentage the dashboard's own matrix computes.
+  same percentage over the same window the dashboard's own matrix shows.
 - **Mesh** - view configured peers, add a new one by URL, or stop syncing with
   one (its history stays; this mirrors `POST/DELETE /api/peers`).
 - **Multiple servers** - save more than one node's address (e.g. a home mesh

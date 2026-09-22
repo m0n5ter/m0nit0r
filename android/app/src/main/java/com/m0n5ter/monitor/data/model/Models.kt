@@ -53,6 +53,13 @@ data class MatrixEntry(
     val isAvailable: Boolean,
 )
 
+/** The matrix together with the span it covers, as `GET /api/availability/matrix` returns it. */
+@Serializable
+data class MatrixView(
+    val windowSeconds: Int = 0,
+    val edges: List<MatrixEntry> = emptyList(),
+)
+
 @Serializable
 data class HistoryEntry(
     val timestamp: String,

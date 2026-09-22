@@ -75,8 +75,10 @@ private fun MatrixGrid(data: MatrixUi) {
     val hScroll = rememberScrollState()
 
     Column(Modifier.fillMaxSize()) {
+        val window = windowPhrase(data.windowSeconds)
         Text(
-            "Rows are the observer, columns are what they see.",
+            "Rows are the observer, columns are what they see." +
+                if (window.isNotEmpty()) " Last $window." else "",
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.padding(16.dp),
@@ -157,4 +159,15 @@ private fun MatrixCell(from: ServerView, to: ServerView, data: MatrixUi) {
             }
         }
     }
+}
+
+// Same wording as the dashboard's windowPhrase, so the app and the page
+// describe the window the server sends in the same words.
+private fun windowPhrase(secs: Int): String {
+    if (secs <= 0) return ""
+    if (secs < 90) return "$secs seconds"
+    val min = Math.round(secs / 60.0).toInt()
+    if (min < 90) return "$min minutes"
+    val h = Math.round(min / 60.0).toInt()
+    return if (h == 1) "hour" else "$h hours"
 }

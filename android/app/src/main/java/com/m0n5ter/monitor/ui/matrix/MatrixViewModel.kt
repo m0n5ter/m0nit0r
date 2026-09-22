@@ -16,6 +16,7 @@ import kotlinx.coroutines.launch
 data class MatrixUi(
     val servers: List<ServerView>,
     val entries: Map<Pair<String, String>, MatrixEntry>,
+    val windowSeconds: Int,
 )
 
 private const val POLL_INTERVAL_MS = 10_000L
@@ -47,8 +48,8 @@ class MatrixViewModel(private val repository: MonitorRepository) : ViewModel() {
         try {
             val servers = repository.servers()
             val matrix = repository.availabilityMatrix()
-            val entries = matrix.associateBy { it.fromServerId to it.toServerId }
-            _state.value = UiState.Success(MatrixUi(servers, entries))
+            val entries = matrix.edges.associateBy { it.fromServerId to it.toServerId }
+            _state.value = UiState.Success(MatrixUi(servers, entries, matrix.windowSeconds))
         } catch (e: Exception) {
             if (!isBackground) _state.value = UiState.Error(e.toUserMessage())
         }
