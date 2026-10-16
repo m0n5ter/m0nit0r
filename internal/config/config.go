@@ -46,6 +46,7 @@ type Telegram struct {
 	BotToken         string `json:"botToken"`
 	ChatID           string `json:"chatId"`
 	DownAfterSeconds int    `json:"downAfterSeconds"`
+	UpAfterSeconds   int    `json:"upAfterSeconds"`
 	RepeatMinutes    int    `json:"repeatMinutes"`
 	StaggerSeconds   int    `json:"staggerSeconds"`
 }
@@ -84,8 +85,12 @@ func Defaults() Options {
 			// a routing hiccup or a service restart passes without a message,
 			// and short enough to still be news.
 			DownAfterSeconds: 120,
-			RepeatMinutes:    60,
-			StaggerSeconds:   60,
+			// Much longer than DownAfter on purpose: a lossy route answers a
+			// check every few minutes, and each of those must not read as
+			// the end of the outage.
+			UpAfterSeconds: 900,
+			RepeatMinutes:  60,
+			StaggerSeconds: 60,
 		},
 	}
 }
@@ -151,6 +156,9 @@ func Load(path string) (Options, error) {
 	opts.Telegram.ChatID = strings.TrimSpace(opts.Telegram.ChatID)
 	if opts.Telegram.DownAfterSeconds <= 0 {
 		opts.Telegram.DownAfterSeconds = 120
+	}
+	if opts.Telegram.UpAfterSeconds <= 0 {
+		opts.Telegram.UpAfterSeconds = 900
 	}
 	if opts.Telegram.RepeatMinutes <= 0 {
 		opts.Telegram.RepeatMinutes = 60

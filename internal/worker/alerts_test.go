@@ -16,6 +16,7 @@ import (
 // The thresholds every case below is written against.
 const (
 	testDownAfter = 2 * time.Minute
+	testUpAfter   = 15 * time.Minute
 	testRepeat    = time.Hour
 	testStagger   = time.Minute
 )
@@ -113,12 +114,39 @@ func TestDecide(t *testing.T) {
 		wantSend:  true,
 		wantDown:  true,
 	}, {
-		name:      "recovery from a reported outage is announced",
+		name:      "recovery from a reported outage is announced once it has held",
 		available: true,
-		since:     ago(20 * time.Second),
-		last:      downNotice(15 * time.Minute),
+		since:     ago(16 * time.Minute),
+		last:      downNotice(40 * time.Minute),
 		announced: true,
 		wantSend:  true,
+	}, {
+		// The case this threshold exists for: a route losing most of its
+		// packets gets a check through every few minutes. Each of those used to
+		// be announced as a recovery, and the next run of failures as a fresh
+		// outage - hundreds of messages a day about one bad link.
+		name:      "a check that gets through a lossy route is not a recovery",
+		available: true,
+		since:     ago(90 * time.Second),
+		last:      downNotice(40 * time.Minute),
+		announced: true,
+	}, {
+		// The same route between its flickers: failing again, for longer than
+		// DownAfter, an hour after it was reported - but not for an hour on
+		// end. It is the outage the chat already heard about.
+		name:      "a flickering outage is not repeated",
+		available: false,
+		since:     ago(10 * time.Minute),
+		last:      downNotice(70 * time.Minute),
+		announced: true,
+	}, {
+		name:      "a flickering outage that turns solid is repeated an hour on",
+		available: false,
+		since:     ago(61 * time.Minute),
+		last:      downNotice(3 * time.Hour),
+		announced: true,
+		wantSend:  true,
+		wantDown:  true,
 	}, {
 		name:      "recovery already announced is not announced again",
 		available: true,
@@ -138,21 +166,21 @@ func TestDecide(t *testing.T) {
 	}, {
 		name:      "the second-ranked node holds off on the recovery",
 		available: true,
-		since:     ago(20 * time.Second),
-		last:      downNotice(15 * time.Minute),
+		since:     ago(15*time.Minute + 30*time.Second),
+		last:      downNotice(40 * time.Minute),
 		announced: true,
 		delay:     testStagger,
 	}, {
 		name:      "the second-ranked node announces the recovery when nobody else has",
 		available: true,
-		since:     ago(90 * time.Second),
-		last:      downNotice(15 * time.Minute),
+		since:     ago(16*time.Minute + 30*time.Second),
+		last:      downNotice(40 * time.Minute),
 		announced: true,
 		delay:     testStagger,
 		wantSend:  true,
 	}}
 
-	w := &Alerts{DownAfter: testDownAfter, Repeat: testRepeat, Stagger: testStagger}
+	w := &Alerts{DownAfter: testDownAfter, UpAfter: testUpAfter, Repeat: testRepeat, Stagger: testStagger}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -276,6 +304,7 @@ func newAlerts(s *store.Store, self int64, to Sender) *Alerts {
 		ServerUID:  "11111111-1111-4111-8111-111111111111",
 		ServerName: "here",
 		DownAfter:  testDownAfter,
+		UpAfter:    testUpAfter,
 		Repeat:     testRepeat,
 		Stagger:    testStagger,
 		Log:        slog.New(slog.DiscardHandler),

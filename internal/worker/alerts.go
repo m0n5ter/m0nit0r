@@ -46,6 +46,7 @@ type Alerts struct {
 	ServerUID  string
 	ServerName string
 	DownAfter  time.Duration
+	UpAfter    time.Duration
 	Repeat     time.Duration
 	Stagger    time.Duration
 	Log        *slog.Logger
@@ -54,7 +55,7 @@ type Alerts struct {
 // Run watches until ctx is cancelled.
 func (w *Alerts) Run(ctx context.Context) {
 	w.Log.Info("telegram alerts started",
-		"downAfter", w.DownAfter, "repeat", w.Repeat, "stagger", w.Stagger)
+		"downAfter", w.DownAfter, "upAfter", w.UpAfter, "repeat", w.Repeat, "stagger", w.Stagger)
 
 	ticker := time.NewTicker(alertInterval)
 	defer ticker.Stop()
@@ -179,12 +180,23 @@ func (w *Alerts) decide(available bool, since model.Time, last store.Notice, ann
 		if elapsed < w.DownAfter+delay {
 			return false, false
 		}
-		// Either nobody has reported this outage, or the last report of it is
-		// old enough to be worth repeating. The repeat window carries the same
-		// stagger as the first message, or every alerting node would come due
-		// for the repeat at the same instant and none would have heard from
-		// the others.
-		if announced && last.IsDown && now.Sub(last.Timestamp.Time) < w.Repeat+delay {
+		if !announced || !last.IsDown {
+			return true, true
+		}
+		// The outage has been reported. It is reported again once it has gone
+		// on unbroken for a repeat window - counted from the report or from the
+		// start of the current run of failures, whichever is later. A route
+		// that keeps flickering back for a check or two is still the outage
+		// that was announced, and a reminder every hour of it would be noise
+		// about something the chat already knows; only a solid outage earns
+		// one. The repeat window carries the same stagger as the first message,
+		// or every alerting node would come due for the repeat at the same
+		// instant and none would have heard from the others.
+		quiet := last.Timestamp.Time
+		if since.After(quiet) {
+			quiet = since.Time
+		}
+		if now.Sub(quiet) < w.Repeat+delay {
 			return false, false
 		}
 		return true, true
@@ -199,7 +211,12 @@ func (w *Alerts) decide(available bool, since model.Time, last store.Notice, ann
 	if !announced || !last.IsDown || !since.After(last.Timestamp.Time) {
 		return false, false
 	}
-	if elapsed < delay {
+	// And only once the route has held for UpAfter. A route that is losing
+	// most of its packets answers a check now and then, and announcing each
+	// of those as a recovery turns one degraded link into a pair of messages
+	// every few minutes, for as long as it lasts. The outage stays announced
+	// until the peer is reachable for long enough to believe it.
+	if elapsed < w.UpAfter+delay {
 		return false, false
 	}
 	return false, true

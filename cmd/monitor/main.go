@@ -217,6 +217,7 @@ func runApp(parent context.Context, log *slog.Logger, opts config.Options, baseD
 			ServerUID:  opts.ServerID,
 			ServerName: opts.ServerName,
 			DownAfter:  time.Duration(opts.Telegram.DownAfterSeconds) * time.Second,
+			UpAfter:    time.Duration(opts.Telegram.UpAfterSeconds) * time.Second,
 			Repeat:     time.Duration(opts.Telegram.RepeatMinutes) * time.Minute,
 			Stagger:    time.Duration(opts.Telegram.StaggerSeconds) * time.Second,
 			Log:        log,

@@ -60,7 +60,8 @@ launches it.
 | `Telegram.BotToken` | empty | Bot token from [@BotFather](https://t.me/BotFather). Empty on both this and `ChatId` disables alerting on this node |
 | `Telegram.ChatId` | empty | Chat to send alerts to — your own user id, or a group/channel id (negative, e.g. `-1001234567890`) |
 | `Telegram.DownAfterSeconds` | `120` | How long a peer has to stay unreachable before it is reported |
-| `Telegram.RepeatMinutes` | `60` | How often an outage that is still going is reported again |
+| `Telegram.UpAfterSeconds` | `900` | How long a reported peer has to stay reachable before its recovery is announced |
+| `Telegram.RepeatMinutes` | `60` | How often an outage that has gone on unbroken is reported again |
 | `Telegram.StaggerSeconds` | `60` | How far apart alerting nodes take their turns. See [Alerting](#alerting) |
 
 Peers are not configured in this file. Add them at runtime from the dashboard, or by
@@ -86,6 +87,13 @@ node's route to it, and is not alerted on.
 An outage is reported once, then again every `RepeatMinutes` for as long as it lasts,
 and once more when it ends. A blip shorter than `DownAfterSeconds` is not reported at
 all, which is what keeps a reboot or a lost sync round out of the chat.
+
+An outage ends when the peer has answered for `UpAfterSeconds` without a break, not at
+the first check that gets through. A route losing most of its packets still answers now
+and then, and reporting each of those as a recovery would turn one bad link into a pair
+of messages every few minutes. For the same reason the hourly repeat is only sent for an
+outage that has been solid for the whole hour: a route that keeps flickering stays
+reported, once, until it settles.
 
 ### More than one alerting node
 
